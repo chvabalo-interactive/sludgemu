@@ -108,6 +108,8 @@ static const char* operand_u32(Translator& t, const RdnaOperand& o, OperandType 
 }
 
 const char* src_u32(Translator& t, const RdnaInst& in, u32 i, OperandType type, u32 part) {
+    if (t.dpp_active && i == 0 && part == 0)
+        return "dpp0_";
     const RdnaOperand& o = in.src[i];
     if (o.kind == OPND_SPECIAL && (o.reg == SRC_VCC_LO || o.reg == SRC_EXEC_LO))
         t.sgpr_used[o.reg] = 1;
@@ -156,7 +158,7 @@ void write_vgpr(Translator& t, const RdnaInst& in, u32 reg, const char* value) {
         else
             value = bits;
     }
-    emit(t, "if (EXEC) %s = %s;", dst, value);
+    emit(t, t.dpp_has_mask ? "if (EXEC && dpp_en_) %s = %s;" : "if (EXEC) %s = %s;", dst, value);
 }
 
 void write_sgpr(Translator& t, const RdnaOperand& dst, u32 part, const char* value) {
@@ -267,6 +269,11 @@ static bool emit_export(Translator& t, const RdnaInst& in) {
         if (target == EXP_POS0) {
             t.position_exported = 1;
             emit(t, "output.position = float4(%s, %s, %s, %s);", c[0], c[1], c[2], c[3]);
+        } else if (target == EXP_POS0 + 1) {
+            t.vs_clip_mask |= e.enable & 0xF;
+            for (u32 i = 0; i < 4; i++)
+                if (e.enable & (1u << i))
+                    emit(t, "output.clip.%c = %s;", "xyzw"[i], c[i]);
         } else if (target >= EXP_PARAM0) {
             u32 n = target - EXP_PARAM0;
             t.out->vs_param_mask |= 1u << n;
@@ -483,6 +490,10 @@ static const char k_preamble[] =
     "9u); else if (e == 0u) bit = m == 0u ? (neg ? 5u : 6u) : (neg ? 4u : 7u); else bit = neg ? 3u : 8u; "
     "return "
     "((c >> bit) & 1u) != 0u; }\n"
+    "bool cmp_class_f16(uint u, uint c) { u &= 0xffffu; bool neg = (u >> 15) != 0u; uint e = (u >> 10) & "
+    "0x1fu; uint m = u & 0x3ffu; uint bit; if (e == 0x1fu) bit = m != 0u ? ((m & 0x200u) ? 1u : 0u) : (neg ? "
+    "2u : 9u); else if (e == 0u) bit = m == 0u ? (neg ? 5u : 6u) : (neg ? 4u : 7u); else bit = neg ? 3u : "
+    "8u; return ((c >> bit) & 1u) != 0u; }\n"
     "float frexp_mant(float f) { float e; float m = frexp(f, e); return m; }\n"
     "int frexp_exp(float f) { float e; frexp(f, e); return (int)e; }\n"
     "float cube_ma(float3 v) { float3 a = abs(v); return 2.0f * (a.z >= a.x && a.z >= a.y ? v.z : a.y >= a.x "
@@ -621,6 +632,8 @@ static void write_declarations(Translator& t, Text& h) {
                       element_hlsl_type(t.vs_fetch_components[i], t.fetch_typed[i], t.fetch_class[i]), i, i);
         h.put("    uint vertex_id : SV_VertexID;\n    uint instance_id : SV_InstanceID;\n};\n");
         h.put("struct Output {\n    float4 position : SV_Position;\n");
+        if (t.vs_clip_mask)
+            h.put("    float4 clip : SV_ClipDistance0;\n");
         for (u32 i = 0; i < 32; i++)
             if (t.out->vs_param_mask & (1u << i))
                 h.put("    float4 p%u : P%u;\n", i, i);

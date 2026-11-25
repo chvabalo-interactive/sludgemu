@@ -74,11 +74,12 @@ static const char* logic_expr(Translator& t, RdnaOp op, const char* a, const cha
     }
 }
 
-// The SAVEEXEC family: the old EXEC to the destination, a new EXEC from the source and the old one.
+// The SAVEEXEC and WREXEC families: SAVEEXEC writes the old EXEC to dst, WREXEC writes the new EXEC.
 static bool emit_saveexec(Translator& t, const RdnaInst& in) {
     const char* e = "s126";
     const char* s = src(t, in, 0);
     const char* value;
+    bool wrexec = false;
     switch (in.op) {
     case OP_S_AND_SAVEEXEC_B64:
     case OP_S_AND_SAVEEXEC_B32:
@@ -120,6 +121,16 @@ static bool emit_saveexec(Translator& t, const RdnaInst& in) {
     case OP_S_ORN1_SAVEEXEC_B32:
         value = fmt(t, "(~%s | %s)", s, e);
         break;
+    case OP_S_ANDN1_WREXEC_B64:
+    case OP_S_ANDN1_WREXEC_B32:
+        value = fmt(t, "(~%s & %s)", s, e);
+        wrexec = true;
+        break;
+    case OP_S_ANDN2_WREXEC_B64:
+    case OP_S_ANDN2_WREXEC_B32:
+        value = fmt(t, "(%s & ~%s)", s, e);
+        wrexec = true;
+        break;
     default:
         translator_fail(t, "unsupported %s", rdna_op_name(in.op));
         return false;
@@ -127,9 +138,10 @@ static bool emit_saveexec(Translator& t, const RdnaInst& in) {
     emit(t, "{ uint old_ = s126; uint new_ = %s;", value);
     t.depth++;
     emit(t, "s126 = new_; s127 = new_;");
-    write_sgpr(t, in.dst[0], 0, "old_");
+    const char* dst_val = wrexec ? "new_" : "old_";
+    write_sgpr(t, in.dst[0], 0, dst_val);
     if (!t.wave32)
-        write_sgpr(t, in.dst[0], 1, "old_");
+        write_sgpr(t, in.dst[0], 1, dst_val);
     t.depth--;
     emit(t, "}");
     set_scc(t, "wave_any(s126)");
@@ -331,6 +343,16 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
     case OP_S_BITSET1_B32:
         emit(t, "{ uint r_ = %s | (1u << (%s & 31u));", sgpr(t, d.reg), src(t, in, 0));
         break;
+    case OP_S_BCNT0_I32_B32:
+    case OP_S_BCNT0_I32_B64:
+        if (result_is_mask(t, in) || in.op == OP_S_BCNT0_I32_B64)
+            emit(t, "{ uint r_ = %s; scc = r_ != 0u;",
+                 result_is_mask(t, in)
+                     ? fmt(t, "wave_count(~%s)", src(t, in, 0))
+                     : fmt(t, "countbits(~%s) + countbits(~%s)", src(t, in, 0), src(t, in, 0, 1)));
+        else
+            emit(t, "{ uint r_ = countbits(~%s); scc = r_ != 0u;", src(t, in, 0));
+        break;
     case OP_S_BCNT1_I32_B32:
     case OP_S_BCNT1_I32_B64:
         if (result_is_mask(t, in) || in.op == OP_S_BCNT1_I32_B64)
@@ -340,6 +362,18 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
                      : fmt(t, "countbits(%s) + countbits(%s)", src(t, in, 0), src(t, in, 0, 1)));
         else
             emit(t, "{ uint r_ = countbits(%s); scc = r_ != 0u;", src(t, in, 0));
+        break;
+    case OP_S_FF0_I32_B32:
+    case OP_S_FF0_I32_B64:
+        if (result_is_mask(t, in))
+            emit(t, "{ uint r_ = wave_first(~%s);", src(t, in, 0));
+        else if (in.op == OP_S_FF0_I32_B64)
+            emit(t,
+                 "{ uint lo_ = ~%s, hi_ = ~%s; uint r_ = lo_ ? firstbitlow(lo_) : hi_ ? 32u + firstbitlow(hi_) "
+                 ": 0xffffffffu;",
+                 src(t, in, 0), src(t, in, 0, 1));
+        else
+            emit(t, "{ uint r_ = firstbitlow(~%s);", src(t, in, 0));
         break;
     case OP_S_FF1_I32_B32:
     case OP_S_FF1_I32_B64:
@@ -357,8 +391,20 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
     case OP_S_FLBIT_I32_B32:
         emit(t, "{ uint r_ = ffbh_u32(%s);", src(t, in, 0));
         break;
+    case OP_S_FLBIT_I32_B64:
+        emit(t,
+             "{ uint lo_ = %s, hi_ = %s; uint r_ = hi_ ? ffbh_u32(hi_) : lo_ ? 32u + ffbh_u32(lo_) : "
+             "0xffffffffu;",
+             src(t, in, 0), src(t, in, 0, 1));
+        break;
     case OP_S_FLBIT_I32:
         emit(t, "{ uint r_ = ffbh_i32((int)%s);", src(t, in, 0));
+        break;
+    case OP_S_FLBIT_I32_I64:
+        emit(t,
+             "{ uint lo_ = %s, hi_ = %s; bool neg_ = (int)hi_ < 0; uint s_ = neg_ ? ~hi_ : hi_, l_ = neg_ ? "
+             "~lo_ : lo_; uint r_ = s_ ? ffbh_u32(s_) : l_ ? 32u + ffbh_u32(l_) : 0xffffffffu;",
+             src(t, in, 0), src(t, in, 0, 1));
         break;
     case OP_S_LSHL_B64:
     case OP_S_LSHR_B64:
@@ -467,8 +513,8 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
     }
     default:
         if ((in.op >= OP_S_AND_SAVEEXEC_B64 && in.op <= OP_S_XNOR_SAVEEXEC_B64) ||
-            (in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ORN1_SAVEEXEC_B32) ||
-            in.op == OP_S_ANDN1_SAVEEXEC_B64 || in.op == OP_S_ORN1_SAVEEXEC_B64)
+            (in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ANDN2_WREXEC_B32) ||
+            (in.op >= OP_S_ANDN1_SAVEEXEC_B64 && in.op <= OP_S_ANDN2_WREXEC_B64))
             return emit_saveexec(t, in);
         translator_fail(t, "unsupported %s", rdna_op_name(in.op));
         return false;
@@ -503,6 +549,22 @@ static const char* h(Translator& t, const RdnaInst& in, u32 i) {
     return v;
 }
 
+static const char* h_bits(Translator& t, const RdnaInst& in, u32 i) {
+    const char* bits = src_u32(t, in, i, TYPE_16);
+    const char* v = (in.op_sel >> i) & 1 ? fmt(t, "((%s >> 16) & 0xffffu)", bits) : fmt(t, "(%s & 0xffffu)", bits);
+    if (in.src[i].abs)
+        v = fmt(t, "(%s & 0x7fffu)", v);
+    if (in.src[i].neg)
+        v = fmt(t, "(%s ^ 0x8000u)", v);
+    return v;
+}
+
+static const char* u16_src(Translator& t, const RdnaInst& in, u32 i, bool is_signed) {
+    const char* bits = src_u32(t, in, i, TYPE_16);
+    const char* lo = (in.op_sel >> i) & 1 ? fmt(t, "(%s >> 16)", bits) : bits;
+    return is_signed ? fmt(t, "((int)(%s << 16) >> 16)", lo) : fmt(t, "(%s & 0xffffu)", lo);
+}
+
 static void vwrite(Translator& t, const RdnaInst& in, const char* value) {
     write_vgpr(t, in, in.dst[0].reg, value);
 }
@@ -521,6 +583,15 @@ static void vhalf(Translator& t, const RdnaInst& in, const char* value) {
         vwrite(t, in, fmt(t, "((%s & 0xffff0000u) | f32tof16(%s))", dst, v));
 }
 
+// A 16-bit integer result: low half, or the high half with op_sel bit 3; the other half is kept.
+static void vhalf_u16(Translator& t, const RdnaInst& in, const char* value) {
+    const char* dst = vgpr(t, in.dst[0].reg);
+    if (in.op_sel & 8)
+        vwrite(t, in, fmt(t, "((%s & 0xffffu) | ((%s & 0xffffu) << 16))", dst, value));
+    else
+        vwrite(t, in, fmt(t, "((%s & 0xffff0000u) | (%s & 0xffffu))", dst, value));
+}
+
 static const char* lane_bit(Translator& t, const RdnaInst& in, u32 i) {
     return fmt(t, "(%s != 0u)", src_u32(t, in, i));
 }
@@ -528,7 +599,9 @@ static const char* lane_bit(Translator& t, const RdnaInst& in, u32 i) {
 // Compares write EXEC && condition to the destination mask (or EXEC itself for CMPX).
 static void emit_compare_result(Translator& t, const RdnaInst& in, const char* condition) {
     bool cmpx = strstr(rdna_op_name(in.op), "_cmpx_") != nullptr;
-    emit(t, "{ uint m_ = mask_of(EXEC && (%s));", condition);
+    emit(t, t.dpp_has_mask ? "{ uint m_ = mask_of(EXEC && dpp_en_ && (%s));"
+                           : "{ uint m_ = mask_of(EXEC && (%s));",
+         condition);
     t.depth++;
     if (cmpx) {
         emit(t, "s126 = m_;");
@@ -553,12 +626,16 @@ static bool emit_compare(Translator& t, const RdnaInst& in) {
         c[i] = cond[i];
     const char* type = strrchr(name, '_') + 1;
     if (strcmp(c, "class") == 0) {
-        if (strcmp(type, "f32") != 0) {
-            translator_fail(t, "unsupported %s", name);
-            return false;
+        if (strcmp(type, "f32") == 0) {
+            emit_compare_result(t, in, fmt(t, "cmp_class(%s, %s)", f(t, in, 0), u(t, in, 1)));
+            return true;
         }
-        emit_compare_result(t, in, fmt(t, "cmp_class(%s, %s)", f(t, in, 0), u(t, in, 1)));
-        return true;
+        if (strcmp(type, "f16") == 0) {
+            emit_compare_result(t, in, fmt(t, "cmp_class_f16(%s, %s)", h_bits(t, in, 0), u(t, in, 1)));
+            return true;
+        }
+        translator_fail(t, "unsupported %s", name);
+        return false;
     }
     const char *a, *b;
     bool is_float = type[0] == 'f';
@@ -634,7 +711,9 @@ static bool emit_compare(Translator& t, const RdnaInst& in) {
 }
 
 static bool emit_vector(Translator& t, const RdnaInst& in) {
-    if (in.has_dpp) {
+    if (in.has_dpp &&
+        (in.op == OP_V_SWAP_B32 || in.op == OP_V_READFIRSTLANE_B32 || in.op == OP_V_READLANE_B32 ||
+         in.op == OP_V_WRITELANE_B32)) {
         translator_fail(t, "DPP on %s", rdna_op_name(in.op));
         return false;
     }
@@ -925,6 +1004,38 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
                fmt(t, "(uint)(((int)(%s << 8) >> 8) * ((int)(%s << 8) >> 8) + (int)%s)", u(t, in, 0),
                    u(t, in, 1), u(t, in, 2)));
         return true;
+    case OP_V_MAD_U32_U16:
+        if (in.clamp)
+            vwrite(t, in,
+                   fmt(t, "(uint)min((uint64_t)%s * %s + %s, 0xffffffffull)", u16_src(t, in, 0, false),
+                       u16_src(t, in, 1, false), u(t, in, 2)));
+        else
+            vwrite(t, in,
+                   fmt(t, "(%s * %s + %s)", u16_src(t, in, 0, false), u16_src(t, in, 1, false), u(t, in, 2)));
+        return true;
+    case OP_V_MAD_I32_I16:
+        if (in.clamp)
+            vwrite(t, in,
+                   fmt(t, "(uint)clamp((int64_t)%s * %s + (int)%s, -2147483648ll, 2147483647ll)",
+                       u16_src(t, in, 0, true), u16_src(t, in, 1, true), u(t, in, 2)));
+        else
+            vwrite(t, in,
+                   fmt(t, "(uint)(%s * %s + (int)%s)", u16_src(t, in, 0, true), u16_src(t, in, 1, true),
+                       u(t, in, 2)));
+        return true;
+    case OP_V_MAD_U16: {
+        const char* expr =
+            fmt(t, "(%s * %s + %s)", u16_src(t, in, 0, false), u16_src(t, in, 1, false),
+                u16_src(t, in, 2, false));
+        vhalf_u16(t, in, in.clamp ? fmt(t, "min(%s, 0xffffu)", expr) : expr);
+        return true;
+    }
+    case OP_V_MAD_I16: {
+        const char* expr = fmt(t, "(%s * %s + %s)", u16_src(t, in, 0, true), u16_src(t, in, 1, true),
+                               u16_src(t, in, 2, true));
+        vhalf_u16(t, in, in.clamp ? fmt(t, "(uint)clamp(%s, -32768, 32767)", expr) : fmt(t, "(uint)%s", expr));
+        return true;
+    }
     case OP_V_MUL_LO_U32:
         vwrite(t, in, fmt(t, "(%s * %s)", u(t, in, 0), u(t, in, 1)));
         return true;
@@ -1132,6 +1243,9 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
     case OP_V_CVT_U16_F16:
         vwrite(t, in, fmt(t, "(f32_to_u32(%s) & 0xffffu)", h(t, in, 0)));
         return true;
+    case OP_V_CVT_I16_F16:
+        vhalf_u16(t, in, fmt(t, "(uint)clamp(f32_to_i32(%s), -32768, 32767)", h(t, in, 0)));
+        return true;
     case OP_V_RCP_F16:
         vhalf(t, in, fmt(t, "rcp(%s)", h(t, in, 0)));
         return true;
@@ -1162,10 +1276,106 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
     case OP_V_RNDNE_F16:
         vhalf(t, in, fmt(t, "round(%s)", h(t, in, 0)));
         return true;
+    case OP_V_SIN_F16:
+        vhalf(t, in, fmt(t, "sin_rev(%s)", h(t, in, 0)));
+        return true;
+    case OP_V_COS_F16:
+        vhalf(t, in, fmt(t, "cos_rev(%s)", h(t, in, 0)));
+        return true;
+    case OP_V_ADD_NC_U16:
+    case OP_V_SUB_NC_U16:
+    case OP_V_MUL_LO_U16:
+    case OP_V_MAX_U16:
+    case OP_V_MIN_U16:
+    case OP_V_LSHLREV_B16:
+    case OP_V_LSHRREV_B16:
+    case OP_V_ADD_NC_I16:
+    case OP_V_SUB_NC_I16:
+    case OP_V_MAX_I16:
+    case OP_V_MIN_I16:
+    case OP_V_ASHRREV_I16: {
+        bool is_signed = in.op == OP_V_ADD_NC_I16 || in.op == OP_V_SUB_NC_I16 || in.op == OP_V_MAX_I16 ||
+                         in.op == OP_V_MIN_I16 || in.op == OP_V_ASHRREV_I16;
+        const char* a = u16_src(t, in, 0, is_signed && in.op != OP_V_ASHRREV_I16);
+        const char* b = u16_src(t, in, 1, is_signed);
+        const char* r = nullptr;
+        switch (in.op) {
+        case OP_V_ADD_NC_U16:
+        case OP_V_ADD_NC_I16:
+            r = fmt(t, "(uint)(%s + %s)", a, b);
+            break;
+        case OP_V_SUB_NC_U16:
+        case OP_V_SUB_NC_I16:
+            r = fmt(t, "(uint)(%s - %s)", a, b);
+            break;
+        case OP_V_MUL_LO_U16:
+            r = fmt(t, "(%s * %s)", a, b);
+            break;
+        case OP_V_MAX_U16:
+        case OP_V_MAX_I16:
+            r = fmt(t, "(uint)max(%s, %s)", a, b);
+            break;
+        case OP_V_MIN_U16:
+        case OP_V_MIN_I16:
+            r = fmt(t, "(uint)min(%s, %s)", a, b);
+            break;
+        case OP_V_LSHLREV_B16:
+            r = fmt(t, "(%s << (%s & 15u))", b, a);
+            break;
+        case OP_V_LSHRREV_B16:
+            r = fmt(t, "(%s >> (%s & 15u))", b, a);
+            break;
+        default:
+            r = fmt(t, "(uint)(%s >> (%s & 15u))", b, a);
+            break;
+        }
+        vhalf_u16(t, in, r);
+        return true;
+    }
+    case OP_V_PERMLANE16_B32:
+    case OP_V_PERMLANEX16_B32: {
+        bool x16 = in.op == OP_V_PERMLANEX16_B32;
+        bool fi = (in.op_sel & 1) != 0;
+        bool bc = (in.op_sel & 2) != 0;
+        emit(t, "{ uint l_ = WaveGetLaneIndex(); uint idx_ = l_ & 15u; uint m_ = idx_ < 8u ? %s : %s;",
+             u(t, in, 2), u(t, in, 1));
+        t.depth++;
+        emit(t, "uint sl_ = (%s) | ((m_ >> ((idx_ & 7u) * 4u)) & 15u);",
+             x16 ? "((l_ & ~15u) ^ 16u)" : "(l_ & ~15u)");
+        if (fi) {
+            emit(t, "uint r_ = WaveReadLaneAt(%s, sl_);", u(t, in, 0));
+        } else {
+            emit(t, "uint r_ = WaveReadLaneAt(EXEC ? 1u : 0u, sl_) != 0u ? WaveReadLaneAt(%s, sl_) : %s;",
+                 u(t, in, 0), bc ? "0u" : vgpr(t, in.dst[0].reg));
+        }
+        vwrite(t, in, "r_");
+        t.depth--;
+        emit(t, "}");
+        return true;
+    }
     case OP_V_PACK_B32_F16: {
         const char* lo = fmt(t, "f32tof16(%s)", h(t, in, 0));
         const char* hi = fmt(t, "f32tof16(%s)", h(t, in, 1));
         vwrite(t, in, fmt(t, "(%s | (%s << 16))", lo, hi));
+        return true;
+    }
+    case OP_V_PK_FMAC_F16: {
+        auto half2 = [&](u32 idx) -> const char* {
+            const char* bits = src_u32(t, in, idx, TYPE_16);
+            if (in.src[idx].kind == OPND_INLINE && in.src[idx].reg >= SRC_HALF)
+                return fmt(t, "(%s | (%s << 16))", bits, bits);
+            return bits;
+        };
+        const char* a = half2(0);
+        const char* b = half2(1);
+        const char* d = vgpr(t, in.dst[0].reg);
+        emit(t, "{ uint a_ = %s, b_ = %s, d_ = %s;", a, b, d);
+        t.depth++;
+        emit(t, "uint lo_ = f32tof16(mad(f16tof32(a_), f16tof32(b_), f16tof32(d_)));");
+        emit(t, "uint hi_ = f32tof16(mad(f16tof32(a_ >> 16), f16tof32(b_ >> 16), f16tof32(d_ >> 16)));");
+        vwrite(t, in, "(lo_ | (hi_ << 16))");
+        t.depth--;
+        emit(t, "}");
         return true;
     }
     case OP_V_SWAP_B32: {
@@ -1202,6 +1412,13 @@ static const char* packed_half(Translator& t, const RdnaInst& in, u32 i, bool hi
     const char* v = sel ? fmt(t, "f16tof32(%s >> 16)", bits) : fmt(t, "f16tof32(%s)", bits);
     bool neg = high ? (in.neg_hi >> i) & 1 : in.src[i].neg;
     return neg ? fmt(t, "(-%s)", v) : v;
+}
+
+static const char* packed_u16(Translator& t, const RdnaInst& in, u32 i, bool high, bool is_signed) {
+    const char* bits = src_u32(t, in, i, TYPE_16);
+    bool sel = high ? (in.op_sel_hi >> i) & 1 : (in.op_sel >> i) & 1;
+    const char* lo = sel ? fmt(t, "(%s >> 16)", bits) : fmt(t, "(%s & 0xffffu)", bits);
+    return is_signed ? fmt(t, "((int)(%s << 16) >> 16)", lo) : lo;
 }
 
 static bool emit_vop3p(Translator& t, const RdnaInst& in) {
@@ -1255,6 +1472,70 @@ static bool emit_vop3p(Translator& t, const RdnaInst& in) {
         vwrite(t, in, fmt(t, "(f32tof16(%s) | (f32tof16(%s) << 16))", r[0], r[1]));
         return true;
     }
+    case OP_V_PK_LSHLREV_B16:
+    case OP_V_PK_LSHRREV_B16:
+    case OP_V_PK_ASHRREV_I16:
+    case OP_V_PK_ADD_I16:
+    case OP_V_PK_SUB_I16:
+    case OP_V_PK_MAX_I16:
+    case OP_V_PK_MIN_I16:
+    case OP_V_PK_ADD_U16:
+    case OP_V_PK_SUB_U16:
+    case OP_V_PK_MAX_U16:
+    case OP_V_PK_MIN_U16:
+    case OP_V_PK_MUL_LO_U16:
+    case OP_V_PK_MAD_I16:
+    case OP_V_PK_MAD_U16: {
+        bool is_signed = in.op == OP_V_PK_ASHRREV_I16 || in.op == OP_V_PK_ADD_I16 ||
+                         in.op == OP_V_PK_SUB_I16 || in.op == OP_V_PK_MAX_I16 || in.op == OP_V_PK_MIN_I16 ||
+                         in.op == OP_V_PK_MAD_I16;
+        const char* r[2];
+        for (u32 hi = 0; hi < 2; hi++) {
+            const char* a = packed_u16(t, in, 0, hi, is_signed && in.op != OP_V_PK_ASHRREV_I16);
+            const char* b = packed_u16(t, in, 1, hi, is_signed);
+            switch (in.op) {
+            case OP_V_PK_LSHLREV_B16:
+                r[hi] = fmt(t, "((%s << (%s & 15u)) & 0xffffu)", b, a);
+                break;
+            case OP_V_PK_LSHRREV_B16:
+                r[hi] = fmt(t, "(%s >> (%s & 15u))", b, a);
+                break;
+            case OP_V_PK_ASHRREV_I16:
+                r[hi] = fmt(t, "((uint)(%s >> (%s & 15u)) & 0xffffu)", b, a);
+                break;
+            case OP_V_PK_ADD_I16:
+            case OP_V_PK_ADD_U16:
+                r[hi] = fmt(t, "(uint)(%s + %s)", a, b);
+                break;
+            case OP_V_PK_SUB_I16:
+            case OP_V_PK_SUB_U16:
+                r[hi] = fmt(t, "(uint)(%s - %s)", a, b);
+                break;
+            case OP_V_PK_MUL_LO_U16:
+                r[hi] = fmt(t, "(%s * %s)", a, b);
+                break;
+            case OP_V_PK_MAX_I16:
+            case OP_V_PK_MAX_U16:
+                r[hi] = fmt(t, "(uint)max(%s, %s)", a, b);
+                break;
+            case OP_V_PK_MIN_I16:
+            case OP_V_PK_MIN_U16:
+                r[hi] = fmt(t, "(uint)min(%s, %s)", a, b);
+                break;
+            default:
+                r[hi] = fmt(t, "(uint)(%s * %s + %s)", a, b, packed_u16(t, in, 2, hi, is_signed));
+                break;
+            }
+            if (in.clamp) {
+                if (is_signed)
+                    r[hi] = fmt(t, "(uint)clamp((int)%s, -32768, 32767)", r[hi]);
+                else
+                    r[hi] = fmt(t, "min(%s, 0xffffu)", r[hi]);
+            }
+        }
+        vwrite(t, in, fmt(t, "((%s & 0xffffu) | ((%s & 0xffffu) << 16))", r[0], r[1]));
+        return true;
+    }
     case OP_V_DOT2_F32_F16: {
         const char* a0 = packed_half(t, in, 0, false);
         const char* a1 = packed_half(t, in, 0, true);
@@ -1269,6 +1550,71 @@ static bool emit_vop3p(Translator& t, const RdnaInst& in) {
     }
 }
 
+static bool begin_dpp(Translator& t, const RdnaInst& in) {
+    const char* v = vgpr(t, in.src[0].reg);
+    u32 c = in.dpp.ctrl;
+    const char* addr = nullptr;
+    bool always_in_bounds = true;
+    if (in.dpp.dpp8) {
+        u32 packed = 0;
+        for (u32 i = 0; i < 8; i++)
+            packed |= (u32)(in.dpp.sel8[i] & 7u) << (3 * i);
+        addr = fmt(t, "uint sl_ = (l_ & ~7u) | ((0x%06xu >> ((l_ & 7u) * 3u)) & 7u); bool b_ = true;", packed);
+    } else if (c <= 0xFF) {
+        addr = fmt(t, "uint sl_ = (l_ & ~3u) | ((0x%02xu >> ((l_ & 3u) * 2u)) & 3u); bool b_ = true;", c);
+    } else if (c >= 0x101 && c <= 0x10F) {
+        u32 k = c - 0x100;
+        always_in_bounds = false;
+        addr = fmt(t, "bool b_ = (l_ & 15u) < %uu; uint sl_ = l_ + %uu;", 16u - k, k);
+    } else if (c >= 0x111 && c <= 0x11F) {
+        u32 k = c - 0x110;
+        always_in_bounds = false;
+        addr = fmt(t, "bool b_ = (l_ & 15u) >= %uu; uint sl_ = l_ - %uu;", k, k);
+    } else if (c >= 0x121 && c <= 0x12F) {
+        u32 k = c - 0x120;
+        addr = fmt(t, "uint sl_ = (l_ & ~15u) | ((l_ + %uu) & 15u); bool b_ = true;", 16u - k);
+    } else if (c == 0x130) {
+        always_in_bounds = false;
+        addr = "bool b_ = (l_ + 1u) < WaveGetLaneCount(); uint sl_ = l_ + 1u;";
+    } else if (c == 0x134) {
+        addr = "uint sl_ = (l_ + 1u) & (WaveGetLaneCount() - 1u); bool b_ = true;";
+    } else if (c == 0x138) {
+        always_in_bounds = false;
+        addr = "bool b_ = l_ > 0u; uint sl_ = l_ - 1u;";
+    } else if (c == 0x13C) {
+        addr = "uint sl_ = (l_ + WaveGetLaneCount() - 1u) & (WaveGetLaneCount() - 1u); bool b_ = true;";
+    } else if (c == 0x140) {
+        addr = "uint sl_ = l_ ^ 15u; bool b_ = true;";
+    } else if (c == 0x141) {
+        addr = "uint sl_ = l_ ^ 7u; bool b_ = true;";
+    } else if (c == 0x142) {
+        always_in_bounds = false;
+        addr = "bool b_ = l_ >= 16u; uint sl_ = (l_ & ~15u) - 1u;";
+    } else if (c == 0x143) {
+        always_in_bounds = false;
+        addr = "bool b_ = l_ >= 32u; uint sl_ = (l_ & ~31u) - 1u;";
+    } else if (c >= 0x150 && c <= 0x15F) {
+        addr = fmt(t, "uint sl_ = (l_ & ~15u) | %uu; bool b_ = true;", c - 0x150);
+    } else if (c >= 0x160 && c <= 0x16F) {
+        addr = fmt(t, "uint sl_ = l_ ^ %uu; bool b_ = true;", c - 0x160);
+    } else {
+        translator_fail(t, "unsupported DPP ctrl 0x%x on %s", c, rdna_op_name(in.op));
+        return false;
+    }
+    emit(t, "{ uint l_ = WaveGetLaneIndex(); %s", addr);
+    t.depth++;
+    const char* src_expr = in.dpp.fetch_inactive ? v : fmt(t, "(EXEC ? %s : 0u)", v);
+    emit(t, "uint dpp0_ = b_ ? WaveReadLaneAt(%s, b_ ? (sl_ & (WaveGetLaneCount() - 1u)) : 0u) : 0u;",
+         src_expr);
+    if (!in.dpp.dpp8 && (in.dpp.row_mask != 0xF || in.dpp.bank_mask != 0xF || (!always_in_bounds && !in.dpp.bound_ctrl))) {
+        emit(t, "bool dpp_en_ = ((0x%xu >> ((l_ >> 4) & 3u)) & 1u) != 0u && ((0x%xu >> ((l_ >> 2) & 3u)) & 1u) != 0u%s;",
+             in.dpp.row_mask, in.dpp.bank_mask, in.dpp.bound_ctrl ? "" : " && b_");
+        t.dpp_has_mask = true;
+    }
+    t.dpp_active = true;
+    return true;
+}
+
 bool emit_alu(Translator& t, const RdnaInst& in) {
     switch (in.enc) {
     case ENC_SOP1:
@@ -1281,7 +1627,15 @@ bool emit_alu(Translator& t, const RdnaInst& in) {
     default:
         break;
     }
-    if (rdna_op_encoding(in.op) == ENC_VOPC)
-        return emit_compare(t, in);
-    return emit_vector(t, in);
+    bool dpp = in.has_dpp;
+    if (dpp && !begin_dpp(t, in))
+        return false;
+    bool ok = rdna_op_encoding(in.op) == ENC_VOPC ? emit_compare(t, in) : emit_vector(t, in);
+    if (dpp) {
+        t.dpp_active = false;
+        t.dpp_has_mask = false;
+        t.depth--;
+        emit(t, "}");
+    }
+    return ok;
 }

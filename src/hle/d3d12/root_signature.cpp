@@ -133,7 +133,7 @@ static void console_layout(const D3D12_ROOT_SIGNATURE_DESC1& desc, ConsoleRootLa
                            p.DescriptorTable.NumDescriptorRanges, SHADER_MAX_TABLE_RANGES);
             for (u32 r = 0; r < p.DescriptorTable.NumDescriptorRanges; r++) {
                 const D3D12_DESCRIPTOR_RANGE1& range = p.DescriptorTable.pDescriptorRanges[r];
-                if (r == SHADER_MAX_TABLE_RANGES) {
+                if (r >= SHADER_MAX_TABLE_RANGES) {
                     // The rest still decides whether this is a sampler table.
                     out.sampler_table |= range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
                     continue;
