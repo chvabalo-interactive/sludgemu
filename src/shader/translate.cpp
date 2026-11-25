@@ -149,7 +149,9 @@ static void set_tag(TagState& s, const RdnaOperand& o, u32 part, Tag t) {
         s.sgpr[reg] = t;
         s.constant_known[reg / 64] &= ~(1ull << (reg % 64));
     } else if (o.kind == OPND_VGPR) {
-        s.vgpr[(o.reg + part) & 255] = t;
+        u32 reg = (o.reg + part) & 255;
+        s.vgpr[reg] = t;
+        s.vgpr_const[reg] = false;
     }
 }
 
@@ -332,9 +334,87 @@ static bool fold_scalar(const TagState& s, const RdnaInst& in, u32* out) {
     }
 }
 
+static const u32 k_const_f32[9] = {0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
+                                   0xc0000000, 0x40800000, 0xc0800000, 0x3e22f983};
+static const u32 k_const_f64_hi[9] = {0x3fe00000, 0xbfe00000, 0x3ff00000, 0xbff00000, 0x40000000,
+                                      0xc0000000, 0x40100000, 0xc0100000, 0x3fc45f30};
+
+// Resolves vector/inline-float/null constants for VGPR offset & spill tracking (scalar folding uses fold_scalar).
+static bool eval_const_u32(const TagState& s, const RdnaOperand& o, OperandType type, u32 part, u32* out) {
+    if (constant_of(s, o, part, out))
+        return true;
+    switch (o.kind) {
+    case OPND_VGPR:
+        if (!s.vgpr_const[(o.reg + part) & 255])
+            return false;
+        *out = s.vgpr_val[(o.reg + part) & 255];
+        return true;
+    case OPND_INLINE:
+        if (o.reg >= SRC_HALF && o.reg - SRC_HALF < 9) {
+            u32 index = o.reg - SRC_HALF;
+            if (type == TYPE_64)
+                *out = part ? k_const_f64_hi[index] : (index == 8 ? 0x6dc9c882u : 0u);
+            else
+                *out = part ? 0u : k_const_f32[index];
+            return true;
+        }
+        return false;
+    case OPND_SPECIAL:
+        if (o.reg == SRC_NULL) {
+            *out = 0u;
+            return true;
+        }
+        return o.reg < 128 && sgpr_constant(s, o.reg + part, out);
+    default:
+        return false;
+    }
+}
+
+static void set_any_constant(TagState& s, const RdnaOperand& o, u32 part, u32 value) {
+    if (o.kind == OPND_SGPR) {
+        set_constant(s, o, part, value);
+    } else if (o.kind == OPND_VGPR) {
+        u32 r = (o.reg + part) & 255;
+        s.vgpr_const[r] = true;
+        s.vgpr_val[r] = value;
+    }
+}
+
+static void clear_spill(const Translator& t, TagState& s, const RdnaOperand& o, u32 part) {
+    if (o.kind != OPND_VGPR)
+        return;
+    u8 slot = t.spill_slot[(o.reg + part) & 255];
+    if (slot == 0xFF)
+        return;
+    memset(s.spill_tag[slot], 0, sizeof(s.spill_tag[slot]));
+    memset(s.spill_desc[slot], 0xFF, sizeof(s.spill_desc[slot]));
+}
+
 static void transfer(const Translator& t, TagState& s, const RdnaInst& in);
 
-void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in) {
+void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx) {
+    if (inst_idx != ~0u && t.xor_swap_role) {
+        u8 role = t.xor_swap_role[inst_idx];
+        if (role == 1) {
+            u32 a = in.dst[0].reg & 127, b = in.src[1].reg & 127;
+            Tag st = s.sgpr[a];
+            s.sgpr[a] = s.sgpr[b];
+            s.sgpr[b] = st;
+            u16 sd = s.descriptor[a];
+            s.descriptor[a] = s.descriptor[b];
+            s.descriptor[b] = sd;
+            u32 sv = s.constant[a];
+            s.constant[a] = s.constant[b];
+            s.constant[b] = sv;
+            u64 ka = (s.constant_known[a / 64] >> (a % 64)) & 1ull;
+            u64 kb = (s.constant_known[b / 64] >> (b % 64)) & 1ull;
+            s.constant_known[a / 64] = (s.constant_known[a / 64] & ~(1ull << (a % 64))) | (kb << (a % 64));
+            s.constant_known[b / 64] = (s.constant_known[b / 64] & ~(1ull << (b % 64))) | (ka << (b % 64));
+            return;
+        }
+        if (role == 2)
+            return;
+    }
     u32 folded;
     bool fold = fold_scalar(s, in, &folded);
     transfer(t, s, in);
@@ -347,9 +427,6 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in) {
     switch (in.op) {
     case OP_S_MOV_B32:
     case OP_S_CMOV_B32:
-    case OP_V_MOV_B32:
-    case OP_V_READFIRSTLANE_B32:
-    case OP_V_READLANE_B32:
         set_tag(s, in.dst[0], 0, tag_of(s, in.src[0]));
         set_descriptor(s, in.dst[0], 0, descriptor_of(s, in.src[0]));
         if (is_exec_or_vcc(in.src[0]))
@@ -357,6 +434,74 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in) {
         if (in.op == OP_S_MOV_B32 && constant_of(s, in.src[0], 0, &value))
             set_constant(s, in.dst[0], 0, value);
         return;
+    case OP_V_MOV_B32:
+    case OP_V_READFIRSTLANE_B32: {
+        bool raw = !in.has_sdwa && !in.has_dpp && !in.src[0].abs && !in.src[0].neg && !in.omod && !in.clamp;
+        u32 cv = 0;
+        clear_spill(t, s, in.dst[0], 0);
+        set_tag(s, in.dst[0], 0, raw ? tag_of(s, in.src[0]) : TAG_NONE);
+        set_descriptor(s, in.dst[0], 0, raw ? descriptor_of(s, in.src[0]) : NO_DESCRIPTOR);
+        if (is_exec_or_vcc(in.src[0]))
+            set_tag(s, in.dst[0], 0, make_tag(TAG_MASK, 0));
+        if (raw && eval_const_u32(s, in.src[0], TYPE_32, 0, &cv))
+            set_any_constant(s, in.dst[0], 0, cv);
+        return;
+    }
+    case OP_S_MOVK_I32:
+        set_tag(s, in.dst[0], 0, TAG_NONE);
+        set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
+        set_constant(s, in.dst[0], 0, (u32)(s32)in.simm16);
+        return;
+    case OP_S_ADDK_I32:
+        set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
+        if (in.dst[0].kind == OPND_SGPR && sgpr_constant(s, in.dst[0].reg, &value))
+            s.constant[in.dst[0].reg & 127] += (u32)(s32)in.simm16;
+        else if (in.dst[0].kind == OPND_SGPR)
+            s.constant_known[(in.dst[0].reg & 127) / 64] &= ~(1ull << ((in.dst[0].reg & 127) % 64));
+        return;
+    case OP_S_GETPC_B64:
+        set_tag(s, in.dst[0], 0, make_tag(TAG_PC, 0));
+        set_tag(s, in.dst[0], 1, TAG_NONE);
+        set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
+        set_descriptor(s, in.dst[0], 1, NO_DESCRIPTOR);
+        set_constant(s, in.dst[0], 0, in.offset + 4);
+        set_constant(s, in.dst[0], 1, 0u);
+        return;
+    case OP_V_READLANE_B32: {
+        Tag rt = TAG_NONE;
+        u32 rd = NO_DESCRIPTOR;
+        u32 lane = 0;
+        if (in.src[0].kind == OPND_VGPR) {
+            u8 slot = t.spill_slot[in.src[0].reg & 255];
+            if (slot != 0xFF && eval_const_u32(s, in.src[1], TYPE_32, 0, &lane)) {
+                lane &= t.wave32 ? 31u : 63u;
+                rt = s.spill_tag[slot][lane];
+                rd = s.spill_desc[slot][lane];
+            } else {
+                rt = tag_of(s, in.src[0]);
+            }
+        }
+        set_tag(s, in.dst[0], 0, rt);
+        set_descriptor(s, in.dst[0], 0, rd);
+        return;
+    }
+    case OP_V_WRITELANE_B32: {
+        if (in.dst[0].kind == OPND_VGPR) {
+            u32 r = in.dst[0].reg & 255;
+            u8 slot = t.spill_slot[r];
+            u32 lane = 0;
+            if (slot != 0xFF && eval_const_u32(s, in.src[1], TYPE_32, 0, &lane)) {
+                lane &= t.wave32 ? 31u : 63u;
+                s.spill_tag[slot][lane] = tag_of(s, in.src[0]);
+                s.spill_desc[slot][lane] = (u16)descriptor_of(s, in.src[0]);
+            } else {
+                clear_spill(t, s, in.dst[0], 0);
+            }
+            s.vgpr[r] = TAG_NONE;
+            s.vgpr_const[r] = false;
+        }
+        return;
+    }
     case OP_S_MOV_B64:
     case OP_S_CMOV_B64: {
         u32 values[2];
@@ -371,11 +516,18 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in) {
         }
         return;
     }
-    case OP_S_MOVK_I32:
-        set_tag(s, in.dst[0], 0, TAG_NONE);
-        set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
-        set_constant(s, in.dst[0], 0, (u32)(s32)in.simm16);
+    case OP_S_BFM_B64: {
+        u32 a = 0, b = 0;
+        bool ok = eval_const_u32(s, in.src[0], TYPE_32, 0, &a) && eval_const_u32(s, in.src[1], TYPE_32, 0, &b);
+        u64 v = ok ? ((((u64)1 << (a & 63u)) - 1ull) << (b & 63u)) : 0ull;
+        for (u32 i = 0; i < 2; i++) {
+            set_tag(s, in.dst[0], i, TAG_NONE);
+            set_descriptor(s, in.dst[0], i, NO_DESCRIPTOR);
+            if (ok)
+                set_constant(s, in.dst[0], i, (u32)(v >> (32 * i)));
+        }
         return;
+    }
     case OP_S_ADD_U32:
     case OP_S_ADD_I32:
     case OP_S_OR_B32:
@@ -387,10 +539,12 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in) {
     case OP_S_LSHL4_ADD_U32:
     case OP_S_ADDC_U32:
     case OP_S_SUB_U32:
+    case OP_S_SUB_I32:
     case OP_V_ADD_NC_U32:
     case OP_V_OR_B32:
     case OP_V_LSHL_ADD_U32:
     case OP_V_ADD3_U32: {
+        clear_spill(t, s, in.dst[0], 0);
         Tag a = tag_of(s, in.src[0]), b = tag_of(s, in.src[1]);
         if (tag_kind(a) == TAG_MASK || tag_kind(b) == TAG_MASK) {
             set_tag(s, in.dst[0], 0,
@@ -399,6 +553,24 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in) {
         }
         set_tag(s, in.dst[0], 0, carried(a, b));
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
+        // Track constant VGPR arithmetic (used for MIMG texel offsets); scalar folding uses fold_scalar.
+        if ((in.op == OP_V_ADD_NC_U32 || in.op == OP_V_OR_B32) && !in.has_sdwa && !in.has_dpp) {
+            u32 va = 0, vb = 0;
+            if (eval_const_u32(s, in.src[0], TYPE_32, 0, &va) && eval_const_u32(s, in.src[1], TYPE_32, 0, &vb))
+                set_any_constant(s, in.dst[0], 0, in.op == OP_V_ADD_NC_U32 ? va + vb : va | vb);
+        }
+        return;
+    }
+    case OP_S_PACK_LH_B32_B16:
+    case OP_S_PACK_HH_B32_B16: {
+        set_tag(s, in.dst[0], 0, TAG_NONE);
+        set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
+        u32 va = 0, vb = 0;
+        if (eval_const_u32(s, in.src[0], TYPE_32, 0, &va) && eval_const_u32(s, in.src[1], TYPE_32, 0, &vb)) {
+            u32 r = in.op == OP_S_PACK_LH_B32_B16 ? ((va & 0xffffu) | (vb & 0xffff0000u))
+                                                    : ((va >> 16) | (vb & 0xffff0000u));
+            set_constant(s, in.dst[0], 0, r);
+        }
         return;
     }
     case OP_S_AND_B64:
@@ -412,6 +584,7 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in) {
     case OP_S_NOT_B64:
     case OP_S_WQM_B64:
     case OP_S_CSELECT_B64:
+    case OP_S_BITREPLICATE_B64_B32:
     case OP_S_ANDN2_B32:
     case OP_S_ORN2_B32:
     case OP_S_XOR_B32:
@@ -419,10 +592,13 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in) {
     case OP_S_CSELECT_B32:
     case OP_S_WQM_B32: {
         bool mask = mask_source(s, in.src[0]) || (in.num_src > 1 && mask_source(s, in.src[1])) ||
-                    is_exec_or_vcc(in.dst[0]) || in.op == OP_S_WQM_B64 || in.op == OP_S_WQM_B32;
+                    is_exec_or_vcc(in.dst[0]) || in.op == OP_S_WQM_B64 || in.op == OP_S_WQM_B32 ||
+                    in.op == OP_S_BITREPLICATE_B64_B32;
         u32 parts = in.dst[0].count;
-        for (u32 i = 0; i < parts; i++)
+        for (u32 i = 0; i < parts; i++) {
             set_tag(s, in.dst[0], i, mask ? make_tag(TAG_MASK, 0) : TAG_NONE);
+            set_descriptor(s, in.dst[0], i, NO_DESCRIPTOR);
+        }
         return;
     }
     case OP_S_LOAD_DWORD:
@@ -463,17 +639,19 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in) {
             continue;
         bool mask = base == ENC_VOPC || (d == 1 && in.enc == ENC_VOP3) ||
                     (in.op >= OP_S_AND_SAVEEXEC_B64 && in.op <= OP_S_XNOR_SAVEEXEC_B64) ||
-                    (in.op >= OP_S_ANDN1_SAVEEXEC_B64 && in.op <= OP_S_ANDN2_WREXEC_B32) ||
+                    (in.op >= OP_S_ANDN1_SAVEEXEC_B64 && in.op <= OP_S_ANDN2_WREXEC_B64) ||
+                    (in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ANDN2_WREXEC_B32) ||
                     (base == ENC_VOP2 && d == 1);
-        for (u32 i = 0; i < dst.count; i++) {
+        u32 count = (mask && t.wave32) ? 1 : dst.count;
+        for (u32 i = 0; i < count; i++) {
+            clear_spill(t, s, dst, i);
             set_tag(s, dst, i, mask ? make_tag(TAG_MASK, 0) : TAG_NONE);
             set_descriptor(s, dst, i, NO_DESCRIPTOR);
         }
     }
-    (void)t;
 }
 
-static bool tags_merge(TagState& into, const TagState& from) {
+static bool tags_merge(const Translator& t, TagState& into, const TagState& from) {
     bool changed = false;
     for (u32 i = 0; i < 128; i++)
         if (into.sgpr[i] != from.sgpr[i] && into.sgpr[i] != TAG_NONE) {
@@ -501,12 +679,31 @@ static bool tags_merge(TagState& into, const TagState& from) {
             changed = true;
         }
     }
+    for (u32 i = 0; i < 256; i++)
+        if (into.vgpr_const[i] && (!from.vgpr_const[i] || into.vgpr_val[i] != from.vgpr_val[i])) {
+            into.vgpr_const[i] = false;
+            changed = true;
+        }
+    for (u32 slot = 0; slot < t.spill_vgpr_count; slot++)
+        for (u32 lane = 0; lane < 64; lane++) {
+            if (into.spill_tag[slot][lane] != from.spill_tag[slot][lane] &&
+                into.spill_tag[slot][lane] != TAG_NONE) {
+                into.spill_tag[slot][lane] = TAG_NONE;
+                changed = true;
+            }
+            if (into.spill_desc[slot][lane] != from.spill_desc[slot][lane] &&
+                into.spill_desc[slot][lane] != NO_DESCRIPTOR) {
+                into.spill_desc[slot][lane] = NO_DESCRIPTOR;
+                changed = true;
+            }
+        }
     return changed;
 }
 
 static void tags_entry(const ShaderInfo& info, TagState& s) {
     memset(&s, 0, sizeof(s));
     memset(s.descriptor, 0xFF, sizeof(s.descriptor));
+    memset(s.spill_desc, 0xFF, sizeof(s.spill_desc));
     for (u32 i = 0; i < info.parameter_count; i++) {
         const UserDataParameter& p = info.parameters[i];
         switch (p.kind) {
@@ -540,8 +737,52 @@ static void tags_entry(const ShaderInfo& info, TagState& s) {
     s.sgpr[SRC_VCC_LO] = s.sgpr[SRC_VCC_HI] = make_tag(TAG_MASK, 0);
 }
 
+static bool is_sgpr_xor_pair(const RdnaInst& in, u32* dst, u32* s0, u32* s1) {
+    if (in.op != OP_S_XOR_B32 || in.dst[0].kind != OPND_SGPR || in.src[0].kind != OPND_SGPR ||
+        in.src[1].kind != OPND_SGPR)
+        return false;
+    *dst = in.dst[0].reg & 127;
+    *s0 = in.src[0].reg & 127;
+    *s1 = in.src[1].reg & 127;
+    return true;
+}
+
 static bool analyze_tags(Translator& t) {
     Program& p = t.program;
+    memset(t.spill_slot, 0xFF, sizeof(t.spill_slot));
+    t.spill_vgpr_count = 0;
+    for (u32 i = 0; i < p.count; i++) {
+        const RdnaInst& in = p.insts[i];
+        if (in.op != OP_V_WRITELANE_B32 || in.dst[0].kind != OPND_VGPR)
+            continue;
+        u32 r = in.dst[0].reg & 255;
+        if (t.spill_slot[r] == 0xFF && t.spill_vgpr_count < SHADER_MAX_SPILL_VGPRS) {
+            t.spill_slot[r] = t.spill_vgpr_count;
+            t.spill_vgprs[t.spill_vgpr_count++] = (u8)r;
+        }
+    }
+    t.xor_swap_role = (u8*)calloc(p.count + 1, 1);
+    if (!t.xor_swap_role)
+        return false;
+    for (u32 b = 0; b < p.block_count; b++) {
+        for (u32 i = p.blocks[b].first; i + 2 < p.blocks[b].end; i++) {
+            u32 d0, a0, b0, d1, a1, b1, d2, a2, b2;
+            if (!is_sgpr_xor_pair(p.insts[i], &d0, &a0, &b0) ||
+                !is_sgpr_xor_pair(p.insts[i + 1], &d1, &a1, &b1) ||
+                !is_sgpr_xor_pair(p.insts[i + 2], &d2, &a2, &b2))
+                continue;
+            if (a0 == b0 || d0 != a0 || d2 != a0 || d1 != b0)
+                continue;
+            if (!((a1 == a0 && b1 == b0) || (a1 == b0 && b1 == a0)))
+                continue;
+            if (!((a2 == a0 && b2 == b0) || (a2 == b0 && b2 == a0)))
+                continue;
+            t.xor_swap_role[i] = 1;
+            t.xor_swap_role[i + 1] = 2;
+            t.xor_swap_role[i + 2] = 2;
+            i += 2;
+        }
+    }
     t.block_entry = (TagState*)calloc(p.block_count, sizeof(TagState));
     bool* reached = (bool*)calloc(p.block_count, 1);
     if (!t.block_entry || !reached) {
@@ -558,7 +799,7 @@ static bool analyze_tags(Translator& t) {
                 continue;
             TagState s = t.block_entry[b];
             for (u32 i = p.blocks[b].first; i < p.blocks[b].end; i++)
-                tags_transfer(t, s, p.insts[i]);
+                tags_transfer(t, s, p.insts[i], i);
             for (u32 k = 0; k < 2; k++) {
                 s32 n = p.blocks[b].next[k];
                 if (n < 0)
@@ -567,7 +808,7 @@ static bool analyze_tags(Translator& t) {
                     t.block_entry[n] = s;
                     reached[n] = true;
                     changed = true;
-                } else if (tags_merge(t.block_entry[n], s)) {
+                } else if (tags_merge(t, t.block_entry[n], s)) {
                     changed = true;
                 }
             }
@@ -594,6 +835,7 @@ static void release(Translator& t) {
     free(t.program.blocks);
     free(t.program.block_of);
     free(t.block_entry);
+    free(t.xor_swap_role);
     t.body.release();
 }
 
@@ -605,8 +847,14 @@ bool shader_translate(const void* code, u32 size, const ShaderInfo& info, Transl
     Translator t = {};
     t.info = &info;
     t.out = out;
+    t.code = (const u8*)code;
+    t.code_size = size;
     bool ok = decode_program(code, size, t.program, out->error, sizeof(out->error)) &&
-              build_blocks(t.program, out->error, sizeof(out->error)) && analyze_tags(t);
+              build_blocks(t.program, out->error, sizeof(out->error));
+    if (ok) {
+        detect_wave_size(t);
+        ok = analyze_tags(t);
+    }
     if (ok) {
         emit_program(t);
         ok = !t.failed && !t.body.failed && !out->hlsl.failed;

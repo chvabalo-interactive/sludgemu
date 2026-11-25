@@ -376,7 +376,7 @@ static void emit_block(Translator& t, u32 b) {
     for (u32 i = blk.first; i < blk.end && !t.failed; i++) {
         const RdnaInst& in = t.program.insts[i];
         emit_instruction(t, in);
-        tags_transfer(t, t.tags, in);
+        tags_transfer(t, t.tags, in, i);
     }
 }
 
@@ -614,6 +614,18 @@ static void write_declarations(Translator& t, Text& h) {
         else
             h.put("ByteAddressBuffer g_root%u : register(t%u, space100);\n", i, p.root_register);
     }
+    for (u32 i = 0; i < t.pc_pool_count; i++) {
+        const PcPool& p = t.pc_pools[i];
+        h.put("static const uint g_pc_%u[%u] = {", i, p.dwords);
+        for (u32 w = 0; w < p.dwords; w++) {
+            u32 v = 0;
+            u32 off = p.base_off + w * 4;
+            if (off + 4 <= t.code_size)
+                memcpy(&v, t.code + off, 4);
+            h.put("%s0x%08xu", w ? ", " : "", v);
+        }
+        h.put("};\n");
+    }
     if (t.needs_descriptor_info)
         h.put("ByteAddressBuffer g_descriptor_info : register(t0, space101);\n");
     for (u32 i = 0; i < t.out->sampler_count; i++)
@@ -708,21 +720,48 @@ static void write_declarations(Translator& t, Text& h) {
     }
 }
 
-static void detect_wave_size(Translator& t) {
-    // Wave32 code works on EXEC_LO alone with 32-bit mask instructions.
+static bool is_exec64_operand(const RdnaOperand& o) {
+    return o.kind == OPND_SPECIAL && ((o.reg == SRC_EXEC_LO && o.count == 2) || o.reg == SRC_EXEC_HI);
+}
+
+static bool is_exec32_operand(const RdnaOperand& o) {
+    return o.kind == OPND_SPECIAL && o.reg == SRC_EXEC_LO && o.count == 1;
+}
+
+void detect_wave_size(Translator& t) {
+    bool has_exec64 = false;
+    bool has_exec32 = false;
     for (u32 i = 0; i < t.program.count; i++) {
         const RdnaInst& in = t.program.insts[i];
-        if ((in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ANDN2_WREXEC_B32) ||
-            (in.dst[0].kind == OPND_SPECIAL && in.dst[0].reg == SRC_EXEC_LO && in.dst[0].count == 1 &&
-             in.enc == ENC_SOP1 && in.op == OP_S_MOV_B32)) {
-            t.wave32 = true;
-            return;
+        if ((in.op >= OP_S_AND_SAVEEXEC_B64 && in.op <= OP_S_XNOR_SAVEEXEC_B64) ||
+            (in.op >= OP_S_ANDN1_SAVEEXEC_B64 && in.op <= OP_S_ANDN2_WREXEC_B64) || in.op == OP_S_WQM_B64)
+            has_exec64 = true;
+        if ((in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ANDN2_WREXEC_B32) || in.op == OP_S_WQM_B32)
+            has_exec32 = true;
+        RdnaEncoding base = rdna_op_encoding(in.op);
+        if (base == ENC_SOP1 || base == ENC_SOP2 || base == ENC_SOPC || base == ENC_SOPK) {
+            for (u32 d = 0; d < 2; d++) {
+                if (is_exec64_operand(in.dst[d]))
+                    has_exec64 = true;
+                else if (is_exec32_operand(in.dst[d]))
+                    has_exec32 = true;
+            }
+            for (u32 s = 0; s < in.num_src; s++) {
+                if (is_exec64_operand(in.src[s]))
+                    has_exec64 = true;
+                else if (is_exec32_operand(in.src[s]))
+                    has_exec32 = true;
+            }
         }
+        // Wave64 requires even-aligned SGPR pairs for VOPC / VOP3 carry-out masks; odd SGPRs prove Wave32.
+        if ((base == ENC_VOPC && in.dst[0].kind == OPND_SGPR && (in.dst[0].reg & 1u)) ||
+            (in.enc == ENC_VOP3 && in.dst[1].kind == OPND_SGPR && (in.dst[1].reg & 1u)))
+            has_exec32 = true;
     }
+    t.wave32 = !has_exec64 && has_exec32;
 }
 
 void emit_program(Translator& t) {
-    detect_wave_size(t);
     if (t.info->stage == SHADER_PIXEL)
         layout_ps_inputs(t);
     t.depth = 1;

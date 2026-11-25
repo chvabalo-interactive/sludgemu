@@ -31,6 +31,7 @@ enum TagKind : u16 {
     TAG_ROOT_HI,  // the high dword of a root descriptor (maybe with stride bits); payload: parameter
     TAG_VB_TABLE, // the vertex buffer table address
     TAG_VB_DESC,  // a vertex buffer descriptor dword; payload: slot
+    TAG_PC,       // code-relative constant data offset (s_getpc_b64 + offset)
 };
 
 enum : u16 {
@@ -48,6 +49,8 @@ inline u32 tag_payload(Tag t) {
     return t & 0xFFF;
 }
 
+#define SHADER_MAX_SPILL_VGPRS 16
+
 struct TagState {
     Tag sgpr[128];
     Tag vgpr[256];
@@ -57,6 +60,12 @@ struct TagState {
     // SGPRs holding a value known at translation time (moved from constants).
     u32 constant[128];
     u64 constant_known[2];
+    // Constant 32-bit values carried in vector registers (for MIMG texel offsets).
+    u32 vgpr_val[256];
+    bool vgpr_const[256];
+    // Scalar tags and descriptors spilled to lanes of tracked VGPRs via v_writelane_b32.
+    Tag spill_tag[SHADER_MAX_SPILL_VGPRS][64];
+    u16 spill_desc[SHADER_MAX_SPILL_VGPRS][64];
 };
 
 inline bool sgpr_constant(const TagState& s, u32 reg, u32* value) {
@@ -81,11 +90,21 @@ enum Interpolation : u8 {
     INTERP_FLAT,
 };
 
+#define SHADER_MAX_PC_POOLS 16
+
+struct PcPool {
+    u32 base_off;
+    u32 dwords;
+};
+
 struct Translator {
     const ShaderInfo* info;
     TranslatedShader* out;
+    const u8* code;
+    u32 code_size;
     Program program;
     TagState* block_entry; // tags at each block's start
+    u8* xor_swap_role;     // per-instruction: 1 = start of 3-xor swap, 2 = swap continuation
     TagState tags;         // tags before the instruction being emitted
     Text body;             // the program's statements; declarations are written around them
     u32 depth;             // indentation of emitted statements
@@ -110,6 +129,11 @@ struct Translator {
     bool dpp_has_mask;
     u64 root_used;       // root descriptor parameters read
     u32 sampler_compare; // inline samplers used for comparisons, by index
+    PcPool pc_pools[SHADER_MAX_PC_POOLS];
+    u32 pc_pool_count;
+    u8 spill_vgprs[SHADER_MAX_SPILL_VGPRS];
+    u8 spill_vgpr_count;
+    u8 spill_slot[256];
 
     // Scratch strings for operand expressions (a ring: an expression stays valid for a while).
     char ring[32][320];
@@ -124,7 +148,8 @@ enum OperandType : u8 {
 };
 
 void translator_fail(Translator& t, const char* format, ...);
-void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in);
+void detect_wave_size(Translator& t);
+void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx = ~0u);
 void emit_program(Translator& t);
 
 // Formatting into the scratch ring.

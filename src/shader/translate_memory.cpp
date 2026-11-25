@@ -54,6 +54,33 @@ static TableRangeKind heap_kind(const Translator& t, u32 reg, TableRangeKind fal
     return kind;
 }
 
+static s32 register_pc_pool(Translator& t, u32 rsrc_reg) {
+    u32 base_off = 0;
+    if (!sgpr_constant(t.tags, rsrc_reg, &base_off))
+        return -1;
+    if (base_off >= t.code_size)
+        return -1;
+    u32 avail = (t.code_size - base_off) / 4u;
+    u32 dwords = avail;
+    u32 bytes = 0;
+    if (sgpr_constant(t.tags, rsrc_reg + 2, &bytes) && bytes > 0 && (bytes + 3u) / 4u <= avail)
+        dwords = (bytes + 3u) / 4u;
+    if (!dwords)
+        return -1;
+    for (u32 i = 0; i < t.pc_pool_count; i++) {
+        if (t.pc_pools[i].base_off == base_off) {
+            if (dwords > t.pc_pools[i].dwords)
+                t.pc_pools[i].dwords = dwords;
+            return (s32)i;
+        }
+    }
+    if (t.pc_pool_count >= SHADER_MAX_PC_POOLS)
+        return -1;
+    u32 idx = t.pc_pool_count++;
+    t.pc_pools[idx] = {base_off, dwords};
+    return (s32)idx;
+}
+
 static void write_loaded(Translator& t, const RdnaInst& in, u32 dwords, const char* value) {
     static const char k_comp[4] = {'x', 'y', 'z', 'w'};
     for (u32 i = 0; i < dwords; i++)
@@ -135,6 +162,18 @@ static bool emit_scalar_memory(Translator& t, const RdnaInst& in) {
         t.depth--;
         emit(t, "}");
         return true;
+    }
+    if (buffer && tag_kind(lo) == TAG_PC) {
+        s32 pid = register_pc_pool(t, base);
+        if (pid >= 0) {
+            emit(t, "{ uint wi_ = (0x%xu + %s) >> 2;", (u32)in.mem.offset, soffset(t, in, 1));
+            t.depth++;
+            for (u32 i = 0; i < dwords; i++)
+                write_sgpr(t, in.dst[0], i, fmt(t, "g_pc_%d[wi_ + %uu]", pid, i));
+            t.depth--;
+            emit(t, "}");
+            return true;
+        }
     }
     translator_fail(t, "%s at 0x%x from an address the translator cannot place", rdna_op_name(in.op),
                     in.offset);
@@ -804,6 +843,22 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
         emit(t, "}");
         return true;
     }
+    if (!store && !atomic && !format && tag_kind(lo) == TAG_PC) {
+        s32 pid = register_pc_pool(t, rsrc);
+        if (pid >= 0) {
+            emit(t, "{ uint wi_ = (%s * ((%s >> 16) & 0x3fffu) + %s) >> 2;", index, sgpr(t, rsrc + 1), offset);
+            t.depth++;
+            if (dwords == 1) {
+                write_loaded(t, in, 1, fmt(t, "g_pc_%d[wi_]", pid));
+            } else {
+                for (u32 i = 0; i < dwords; i++)
+                    write_vgpr(t, in, in.dst[0].reg + i, fmt(t, "g_pc_%d[wi_ + %uu]", pid, i));
+            }
+            t.depth--;
+            emit(t, "}");
+            return true;
+        }
+    }
     translator_fail(t, "%s at 0x%x through a descriptor the translator cannot place", rdna_op_name(in.op),
                     in.offset);
     return false;
@@ -979,10 +1034,6 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         translator_fail(t, "cube sampling at 0x%x", in.offset);
         return false;
     }
-    if (form.offset) {
-        translator_fail(t, "%s with texel offsets at 0x%x", rdna_op_name(in.op), in.offset);
-        return false;
-    }
     u32 rsrc = in.src[1].reg;
     Tag tag = sgpr_tag(t, rsrc);
     if (tag_kind(tag) != TAG_HEAP || (tag_payload(tag) & 1) != HEAP_RESOURCES) {
@@ -990,11 +1041,12 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
                         in.offset);
         return false;
     }
-    // Address components in order: bias and comparison reference, then gradients, coordinates, LOD
-    // (or mip, or sample index) and clamp. With 16-bit addresses, the components after the bias and
-    // reference are packed two to a register (low half first).
+    // Address components in order: optional texel offset dword (_o), bias and comparison reference,
+    // then gradients, coordinates, LOD (or mip, or sample index) and clamp. With 16-bit addresses,
+    // the components after the offset, bias and reference are packed two to a register (low half first).
     u32 components = rdna_image_address_count(in.op, m.dim);
-    u32 unpacked = (form.bias ? 1 : 0) + (form.compare ? 1 : 0);
+    u32 coord_base = form.offset ? 1u : 0u;
+    u32 unpacked = coord_base + (form.bias ? 1 : 0) + (form.compare ? 1 : 0);
     u32 registers = m.a16 ? unpacked + (components - unpacked + 1) / 2 : components;
     if (components > 16) {
         translator_fail(t, "too many image address registers");
@@ -1003,11 +1055,26 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     u32 regs[16];
     for (u32 i = 0; i < registers; i++)
         regs[i] = m.nsa_count && i > 0 ? m.nsa_addr[i - 1] : in.src[0].reg + i;
+    const char* offset_expr = nullptr;
+    if (form.offset) {
+        if (!t.tags.vgpr_const[regs[0] & 255]) {
+            translator_fail(t, "%s at 0x%x with non-constant texel offsets", rdna_op_name(in.op), in.offset);
+            return false;
+        }
+        u32 ov = t.tags.vgpr_val[regs[0] & 255];
+        s32 ox = (s32)((ov & 0x3Fu) << 26) >> 26;
+        s32 oy = (s32)(((ov >> 8) & 0x3Fu) << 26) >> 26;
+        s32 oz = (s32)(((ov >> 16) & 0x3Fu) << 26) >> 26;
+        u32 odim = k_dim_grads[m.dim];
+        offset_expr = odim == 1   ? fmt(t, "%d", ox)
+                      : odim == 2 ? fmt(t, "int2(%d, %d)", ox, oy)
+                                  : fmt(t, "int3(%d, %d, %d)", ox, oy, oz);
+    }
     ImageAddress addr = {};
     memcpy(addr.regs, regs, sizeof(regs));
     addr.unpacked = unpacked;
     addr.a16 = m.a16;
-    u32 at = 0;
+    u32 at = coord_base;
     s32 bias_at = -1, compare_at = -1, lod_at = -1, clamp_at = -1, grad_at = -1;
     if (form.bias)
         bias_at = (s32)at++;
@@ -1090,9 +1157,12 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
             static const char* const k_gather[4] = {"GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha"};
             u32 c = m.dmask & 2 ? 1 : m.dmask & 4 ? 2 : m.dmask & 8 ? 3 : 0;
             if (form.compare)
-                value = fmt(t, "tex_.GatherCmpRed(smp_, %s, %s)", uv, address_value(t, addr, compare_at));
+                value = offset_expr ? fmt(t, "tex_.GatherCmpRed(smp_, %s, %s, %s)", uv,
+                                          address_value(t, addr, compare_at), offset_expr)
+                                    : fmt(t, "tex_.GatherCmpRed(smp_, %s, %s)", uv, address_value(t, addr, compare_at));
             else
-                value = fmt(t, "tex_.%s(smp_, %s)", k_gather[c], uv);
+                value = offset_expr ? fmt(t, "tex_.%s(smp_, %s, %s)", k_gather[c], uv, offset_expr)
+                                    : fmt(t, "tex_.%s(smp_, %s)", k_gather[c], uv);
             if (form.lod || form.bias || form.grad || form.clamp) {
                 translator_fail(t, "%s variant at 0x%x", rdna_op_name(in.op), in.offset);
                 return false;
@@ -1100,28 +1170,44 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         } else if (form.compare) {
             const char* ref = address_value(t, addr, compare_at);
             if (form.lod_zero || (!form.lod && !implicit_lod_ok))
-                value = fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s).xxxx", uv, ref);
-            else if (form.lod)
+                value = offset_expr ? fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s, %s).xxxx", uv, ref, offset_expr)
+                                    : fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s).xxxx", uv, ref);
+            else if (form.lod && !offset_expr)
                 value = fmt(t, "tex_.SampleCmpLevel(smp_, %s, %s, %s).xxxx", uv, ref,
                             address_value(t, addr, lod_at));
-            else if (!form.bias && !form.grad && !form.clamp)
-                value = fmt(t, "tex_.SampleCmp(smp_, %s, %s).xxxx", uv, ref);
+            else if (!form.lod && !form.bias && !form.grad && !form.clamp)
+                value = offset_expr ? fmt(t, "tex_.SampleCmp(smp_, %s, %s, %s).xxxx", uv, ref, offset_expr)
+                                    : fmt(t, "tex_.SampleCmp(smp_, %s, %s).xxxx", uv, ref);
         } else if (form.lod_zero || (!form.lod && !form.grad && !implicit_lod_ok)) {
             // Without usable derivatives the LOD is the bias alone (see implicit_lod_ok).
-            value = form.bias && !form.lod_zero
-                        ? fmt(t, "tex_.SampleLevel(smp_, %s, %s)", uv, address_value(t, addr, bias_at))
-                        : fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f)", uv);
+            if (form.bias && !form.lod_zero) {
+                const char* b = address_value(t, addr, bias_at);
+                value = offset_expr ? fmt(t, "tex_.SampleLevel(smp_, %s, %s, %s)", uv, b, offset_expr)
+                                    : fmt(t, "tex_.SampleLevel(smp_, %s, %s)", uv, b);
+            } else {
+                value = offset_expr ? fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f, %s)", uv, offset_expr)
+                                    : fmt(t, "tex_.SampleLevel(smp_, %s, 0.0f)", uv);
+            }
         } else if (form.lod) {
-            value = fmt(t, "tex_.SampleLevel(smp_, %s, %s)", uv, address_value(t, addr, lod_at));
+            const char* l = address_value(t, addr, lod_at);
+            value = offset_expr ? fmt(t, "tex_.SampleLevel(smp_, %s, %s, %s)", uv, l, offset_expr)
+                                : fmt(t, "tex_.SampleLevel(smp_, %s, %s)", uv, l);
         } else if (form.bias && !form.clamp) {
-            value = fmt(t, "tex_.SampleBias(smp_, %s, %s)", uv, address_value(t, addr, bias_at));
+            const char* b = address_value(t, addr, bias_at);
+            value = offset_expr ? fmt(t, "tex_.SampleBias(smp_, %s, %s, %s)", uv, b, offset_expr)
+                                : fmt(t, "tex_.SampleBias(smp_, %s, %s)", uv, b);
         } else if (form.grad && !form.clamp) {
-            value =
-                fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s)", uv, address_vector(t, addr, true, grad_at, grads),
-                    address_vector(t, addr, true, grad_at + grads, grads));
+            const char* ddx = address_vector(t, addr, true, grad_at, grads);
+            const char* ddy = address_vector(t, addr, true, grad_at + grads, grads);
+            value = offset_expr ? fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s, %s)", uv, ddx, ddy, offset_expr)
+                                : fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s)", uv, ddx, ddy);
         } else if (!form.bias && !form.grad) {
-            value = form.clamp ? fmt(t, "tex_.Sample(smp_, %s, 0, %s)", uv, address_value(t, addr, clamp_at))
-                               : fmt(t, "tex_.Sample(smp_, %s)", uv);
+            if (form.clamp)
+                value = fmt(t, "tex_.Sample(smp_, %s, %s, %s)", uv, offset_expr ? offset_expr : "0",
+                            address_value(t, addr, clamp_at));
+            else
+                value = offset_expr ? fmt(t, "tex_.Sample(smp_, %s, %s)", uv, offset_expr)
+                                    : fmt(t, "tex_.Sample(smp_, %s)", uv);
         }
         if (!value) {
             translator_fail(t, "%s variant at 0x%x", rdna_op_name(in.op), in.offset);
