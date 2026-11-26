@@ -268,14 +268,18 @@ static bool emit_interpolation(Translator& t, const RdnaInst& in) {
         translator_fail(t, "v_interp_mov_f32 from a vertex other than P0");
         return false;
     }
-    t.attribute_modes[in.attr & 31] |= (u8)(1u << mode);
-    t.out->ps_attribute_mask |= 1u << (in.attr & 31);
+    u32 attr = in.attr & 31;
+    u32 slot = (mode == INTERP_FLAT && t.info->flat_remap[attr]) ? (u32)(t.info->flat_remap[attr] - 1) : attr;
+    if (slot >= 32)
+        slot = attr;
+    t.attribute_modes[slot] |= (u8)(1u << mode);
+    t.out->ps_attribute_mask |= 1u << slot;
     // The P1 step is folded into P2: only the final value is observable.
     if (in.op == OP_V_INTERP_P1_F32)
         return true;
     // Read through a per-mode name the declarations define (see write_attribute_declarations).
     write_vgpr(t, in, in.dst[0].reg,
-               fmt(t, "asuint(attr%u_%s.%c)", in.attr & 31, k_mode_names[mode], "xyzw"[in.attr_chan & 3]));
+               fmt(t, "asuint(attr%u_%s.%c)", slot, k_mode_names[mode], "xyzw"[in.attr_chan & 3]));
     return true;
 }
 
@@ -306,8 +310,19 @@ static bool emit_export(Translator& t, const RdnaInst& in) {
                     emit(t, "output.clip.%c = %s;", "xyzw"[i], c[i]);
         } else if (target >= EXP_PARAM0) {
             u32 n = target - EXP_PARAM0;
+            if (n >= 32) {
+                translator_fail(t, "vertex export to param%u", n);
+                return false;
+            }
             t.out->vs_param_mask |= 1u << n;
             emit(t, "output.p%u = float4(%s, %s, %s, %s);", n, c[0], c[1], c[2], c[3]);
+            if (t.info->flat_remap[n]) {
+                u32 d = t.info->flat_remap[n] - 1;
+                if (d < 32) {
+                    t.out->vs_param_mask |= 1u << d;
+                    emit(t, "output.p%u = output.p%u;", d, n);
+                }
+            }
         } else if (target > EXP_POS0 && target < EXP_POS0 + 5) {
             translator_fail(t, "vertex export to pos%u (clip distances, point size)", target - EXP_POS0);
             return false;
@@ -487,9 +502,8 @@ static const char k_preamble[] =
     // The first clear bit of a console mask `width` bits wide: lanes the desktop wave lacks count as clear.
     "uint wave_first_zero(uint m, uint width) { uint4 b = WaveActiveBallot(m != 0u); uint lo = ~b.x, hi = "
     "width > 32u ? ~b.y : 0u; return lo ? firstbitlow(lo) : hi ? 32u + firstbitlow(hi) : 0xffffffffu; }\n"
-    "uint read_first(uint v, uint m) { uint lane = wave_first(m); return WaveReadLaneAt(v, lane == "
-    "0xffffffffu ? "
-    "0u : lane); }\n"
+    "uint read_first(uint v, uint m) { uint lane = WaveActiveMin(m != 0u ? WaveGetLaneIndex() : 0xffffffffu); "
+    "return WaveActiveBitOr(WaveGetLaneIndex() == (lane == 0xffffffffu ? 0u : lane) ? v : 0u); }\n"
     "float mul_legacy(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }\n"
     "uint f32_to_u32(float f) { return f != f ? 0u : f >= 4294967040.0f ? 0xffffffffu : f <= 0.0f ? 0u : "
     "(uint)f; }\n"
@@ -598,8 +612,10 @@ static bool write_attribute_declarations(Translator& t, Text& h) {
     u8 interpolated_modes = 0; // modes mixed attributes need barycentrics for
     for (u32 i = 0; i < 32; i++) {
         u8 modes = t.attribute_modes[i];
-        if (modes & (modes - 1))
+        if (modes & (modes - 1)) {
+            t.out->ps_mixed_mask |= 1u << i;
             interpolated_modes |= (u8)(modes & ~(1u << INTERP_FLAT));
+        }
     }
     if (interpolated_modes & (interpolated_modes - 1)) {
         translator_fail(t, "flat and several interpolated reads of the same attributes");
@@ -635,7 +651,7 @@ static bool write_attribute_declarations(Translator& t, Text& h) {
             if (!mixed)
                 h.put("#define attr%u_%s input.p%u\n", i, k_mode_names[m], i);
             else if (m == INTERP_FLAT)
-                h.put("#define attr%u_flat GetAttributeAtVertex(input.p%u, 0)\n", i, i);
+                h.put("#define attr%u_flat input.p%u\n", i, i);
             else
                 h.put("#define attr%u_%s (GetAttributeAtVertex(input.p%u, 0) * input.barycentrics.x + "
                       "GetAttributeAtVertex(input.p%u, 1) * input.barycentrics.y + "
