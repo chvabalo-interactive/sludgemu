@@ -62,6 +62,7 @@ void shader_program_hurry(ShaderProgram* p) {
 // --- compiler ----------------------------------------------------------------------------------------
 
 static DxcCreateInstanceProc g_dxc_create;
+static ShaderTarget g_target; // what the device runs, for the translator
 
 // Each worker has its own compiler: DXC compiler objects are not thread safe.
 struct Worker {
@@ -117,7 +118,12 @@ static void build_program(Worker& w, ShaderProgram* p) {
         return;
     TranslatedShader t = {};
     u32 state = PROGRAM_FAILED;
-    if (!shader_translate(p->code, p->code_size, p->info, &t)) {
+    bool translated = shader_translate(p->code, p->code_size, p->info, g_target, &t);
+    // The pipeline's wave size (unverified) against what the code proves, where both tell; the code wins.
+    if (p->info.wave_size && t.code_wave_size && t.code_wave_size != p->info.wave_size)
+        LOG_W("gpu", "shader %016llx: launched as wave%u, but its code is wave%u", (unsigned long long)p->key,
+              p->info.wave_size, t.code_wave_size);
+    if (!translated) {
         LOG_W("gpu", "shader %016llx: translation failed: %s", (unsigned long long)p->key, t.error);
         dump(p, t.hlsl.data, t.error);
     } else {
@@ -307,8 +313,9 @@ static u64 hash_bytes(const void* data, usize size, u64 h) {
     return h;
 }
 
-bool shader_programs_init() {
+bool shader_programs_init(const ShaderTarget& target) {
     rdna_init();
+    g_target = target;
     HMODULE dxc = LoadLibraryW(L"dxcompiler.dll");
     g_dxc_create = dxc ? (DxcCreateInstanceProc)GetProcAddress(dxc, "DxcCreateInstance") : nullptr;
     if (!g_dxc_create) {

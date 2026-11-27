@@ -4,11 +4,26 @@
 //
 // - Every register becomes a 32-bit HLSL variable of the same name. Each desktop thread runs the
 //   console program for one console lane; scalar registers hold the same value in every thread.
-// - Lane masks (EXEC, VCC, compare results) hold, in each thread, all ones or zero in both halves:
-//   that lane's bit, broadcast. Bitwise mask operations then work unchanged, and the operations
-//   that look at the whole mask (branches on EXECZ/VCCZ, bit counts) use wave intrinsics.
+// - Lane masks (EXEC, compare results) hold, in each thread, all ones or zero: that lane's bit,
+//   broadcast. Bitwise mask operations then work unchanged, and the operations that look at the
+//   whole mask (branches on EXECZ/VCCZ, bit counts) use wave intrinsics.
 // - Scalar branches are uniform, so desktop waves stay converged; vector instructions only write
 //   lanes whose EXEC bit is set.
+//
+// Compute programs run with console waves mapped exactly onto desktop waves, so that cross-lane
+// operations and whole-mask queries see the console wave and nothing else:
+// - The desktop wave size is pinned to 32 ([WaveSize]). A wave32 program runs one console lane per
+//   desktop thread; a wave64 program runs two, console lanes L and L + 32 in desktop lane L: every
+//   vector register has a variable per half (v<n>_0, v<n>_1) and vector instructions are emitted once
+//   per half. Desktop groups are whole desktop waves, each one console wave (numbered at the start);
+//   the console thread IDs are computed from the console wave and lane.
+// - Mask dword h (exec_lo/exec_hi, vcc_lo/vcc_hi, ...) belongs to half h: in desktop lane L it holds
+//   bit L of that dword, broadcast. 32-bit mask operations then work dword by dword unchanged.
+// - Which registers hold masks is tracked statically (written by compares, carries, saveexec, moves
+//   and bitwise operations of masks; EXEC always). Other values are plain bits, the same in every
+//   thread: they are converted to the broadcast form where used as a mask (and when written to EXEC),
+//   and masks are converted to bits (with ballots) where used as data. A register that holds a mask
+//   on one path and data on another fails translation where a conversion would depend on it.
 // - User data (the console's user SGPRs) comes from a desktop root constant block holding the same
 //   values, except that descriptor tables hold byte offsets into the desktop descriptor heaps:
 //   console code computes descriptor addresses with its own arithmetic, and the address of a loaded
@@ -78,6 +93,9 @@ struct ShaderInfo {
     ShaderStage stage;
     u8 user_sgprs; // user SGPR count; system SGPRs follow
     u8 parameter_count;
+    // Compute shaders: the wave size the pipeline launches with (32 or 64), 0 if unknown. (Here so that
+    // it fills what used to be padding: dumps of older builds load with 0.)
+    u8 wave_size;
     UserDataParameter parameters[SHADER_MAX_ROOT_PARAMETERS];
     // Directly indexed heaps: the user SGPR holding the heap's base (the translated program's value
     // is 0, the start of the desktop heap), or NO_HEAP_SGPR.
@@ -146,9 +164,19 @@ struct TranslatedShader {
     // Per root parameter: descriptor tables' slots the program loads from (one past the last), which
     // can be more than the root signature declares; TABLE_REACH_UNKNOWN if not all at known places.
     u16 table_reach[SHADER_MAX_ROOT_PARAMETERS];
+    // The wave size the code itself proves (32 or 64; 0 if it doesn't tell). ShaderInfo::wave_size
+    // decides only where the code doesn't.
+    u8 code_wave_size;
     char error[160]; // why translation failed
 };
 
-// Translates `code` (RDNA 2 instructions, `size` bytes). Returns false with `out->error` set if the
-// program uses something the translator does not handle.
-bool shader_translate(const void* code, u32 size, const ShaderInfo& info, TranslatedShader* out);
+// What the desktop device runs: the wave sizes (lanes) it may launch compute waves with.
+struct ShaderTarget {
+    u8 wave_min;
+    u8 wave_max;
+};
+
+// Translates `code` (RDNA 2 instructions, `size` bytes) for `target`. Returns false with `out->error`
+// set if the program uses something the translator does not handle.
+bool shader_translate(const void* code, u32 size, const ShaderInfo& info, const ShaderTarget& target,
+                      TranslatedShader* out);

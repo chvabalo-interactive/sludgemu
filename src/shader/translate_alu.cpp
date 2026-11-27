@@ -28,8 +28,11 @@ static void write64(Translator& t, const RdnaOperand& dst, const char* value) {
     emit(t, "}");
 }
 
-// The result register's SCC for logical operations: masks count lanes across the wave.
+// The result register's SCC for logical operations: masks count lanes across the wave. (Without exact
+// lanes; with them, masks read as data are their bits, see translate.h.)
 static bool result_is_mask(const Translator& t, const RdnaInst& in) {
+    if (t.exact)
+        return false;
     const RdnaOperand& d = in.dst[0];
     if (d.kind == OPND_SPECIAL && (d.reg == SRC_EXEC_LO || d.reg == SRC_VCC_LO))
         return true;
@@ -74,64 +77,106 @@ static const char* logic_expr(Translator& t, RdnaOp op, const char* a, const cha
     }
 }
 
-// The SAVEEXEC and WREXEC families: SAVEEXEC writes the old EXEC to dst, WREXEC writes the new EXEC.
-static bool emit_saveexec(Translator& t, const RdnaInst& in) {
-    const char* e = "s126";
-    const char* s = src(t, in, 0);
-    const char* value;
-    bool wrexec = false;
-    switch (in.op) {
+static bool is_exec_dword(u32 reg) {
+    reg &= 127;
+    return reg == SRC_EXEC_LO || reg == SRC_EXEC_HI;
+}
+
+static bool writes_exec_dword(const RdnaOperand& d) {
+    if (d.kind != OPND_SPECIAL)
+        return false;
+    for (u32 k = 0; k < (d.count ? d.count : 1u); k++)
+        if (is_exec_dword(d.reg + k))
+            return true;
+    return false;
+}
+
+// Exact lanes: whether a scalar source holds a mask (constants are data).
+static bool source_is_mask(Translator& t, const RdnaInst& in, u32 i, u32 part = 0) {
+    const RdnaOperand& o = in.src[i];
+    if (o.kind == OPND_SGPR || (o.kind == OPND_SPECIAL && o.reg < 128 && o.reg != SRC_NULL))
+        return sgpr_is_mask(t, o.reg + part);
+    return false;
+}
+
+// The new EXEC of a SAVEEXEC or WREXEC operation from source `s` and EXEC `e` (one dword).
+static const char* saveexec_value(Translator& t, RdnaOp op, const char* s, const char* e, bool* wrexec) {
+    *wrexec = false;
+    switch (op) {
     case OP_S_AND_SAVEEXEC_B64:
     case OP_S_AND_SAVEEXEC_B32:
-        value = fmt(t, "(%s & %s)", s, e);
-        break;
+        return fmt(t, "(%s & %s)", s, e);
     case OP_S_OR_SAVEEXEC_B64:
     case OP_S_OR_SAVEEXEC_B32:
-        value = fmt(t, "(%s | %s)", s, e);
-        break;
+        return fmt(t, "(%s | %s)", s, e);
     case OP_S_XOR_SAVEEXEC_B64:
     case OP_S_XOR_SAVEEXEC_B32:
-        value = fmt(t, "(%s ^ %s)", s, e);
-        break;
+        return fmt(t, "(%s ^ %s)", s, e);
     case OP_S_ANDN2_SAVEEXEC_B64:
     case OP_S_ANDN2_SAVEEXEC_B32:
-        value = fmt(t, "(%s & ~%s)", s, e);
-        break;
+        return fmt(t, "(%s & ~%s)", s, e);
     case OP_S_ORN2_SAVEEXEC_B64:
     case OP_S_ORN2_SAVEEXEC_B32:
-        value = fmt(t, "(%s | ~%s)", s, e);
-        break;
+        return fmt(t, "(%s | ~%s)", s, e);
     case OP_S_NAND_SAVEEXEC_B64:
     case OP_S_NAND_SAVEEXEC_B32:
-        value = fmt(t, "~(%s & %s)", s, e);
-        break;
+        return fmt(t, "~(%s & %s)", s, e);
     case OP_S_NOR_SAVEEXEC_B64:
     case OP_S_NOR_SAVEEXEC_B32:
-        value = fmt(t, "~(%s | %s)", s, e);
-        break;
+        return fmt(t, "~(%s | %s)", s, e);
     case OP_S_XNOR_SAVEEXEC_B64:
     case OP_S_XNOR_SAVEEXEC_B32:
-        value = fmt(t, "~(%s ^ %s)", s, e);
-        break;
+        return fmt(t, "~(%s ^ %s)", s, e);
     case OP_S_ANDN1_SAVEEXEC_B64:
     case OP_S_ANDN1_SAVEEXEC_B32:
-        value = fmt(t, "(~%s & %s)", s, e);
-        break;
+        return fmt(t, "(~%s & %s)", s, e);
     case OP_S_ORN1_SAVEEXEC_B64:
     case OP_S_ORN1_SAVEEXEC_B32:
-        value = fmt(t, "(~%s | %s)", s, e);
-        break;
+        return fmt(t, "(~%s | %s)", s, e);
     case OP_S_ANDN1_WREXEC_B64:
     case OP_S_ANDN1_WREXEC_B32:
-        value = fmt(t, "(~%s & %s)", s, e);
-        wrexec = true;
-        break;
+        *wrexec = true;
+        return fmt(t, "(~%s & %s)", s, e);
     case OP_S_ANDN2_WREXEC_B64:
     case OP_S_ANDN2_WREXEC_B32:
-        value = fmt(t, "(%s & ~%s)", s, e);
-        wrexec = true;
-        break;
+        *wrexec = true;
+        return fmt(t, "(%s & ~%s)", s, e);
     default:
+        return nullptr;
+    }
+}
+
+// Two lanes per thread: EXEC dword by dword, each in its half.
+static bool emit_saveexec_halves(Translator& t, const RdnaInst& in) {
+    if (in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ANDN2_WREXEC_B32) {
+        translator_fail(t, "%s in a wave64 program at 0x%x", rdna_op_name(in.op), in.offset);
+        return false;
+    }
+    bool wrexec = false;
+    const char* n0 = saveexec_value(t, in.op, mask_operand(t, in, 0, 0), "s126", &wrexec);
+    const char* n1 = saveexec_value(t, in.op, mask_operand(t, in, 0, 1), "s127", &wrexec);
+    if (!n0 || !n1) {
+        translator_fail(t, "unsupported %s", rdna_op_name(in.op));
+        return false;
+    }
+    emit(t, "{ uint old0_ = s126, old1_ = s127; uint new0_ = %s, new1_ = %s;", n0, n1);
+    t.depth++;
+    emit(t, "s126 = new0_; s127 = new1_;");
+    write_sgpr(t, in.dst[0], 0, wrexec ? "new0_" : "old0_");
+    write_sgpr(t, in.dst[0], 1, wrexec ? "new1_" : "old1_");
+    t.depth--;
+    emit(t, "}");
+    set_scc(t, "mask_any(s126, s127)");
+    return true;
+}
+
+// The SAVEEXEC and WREXEC families: SAVEEXEC writes the old EXEC to dst, WREXEC writes the new EXEC.
+static bool emit_saveexec(Translator& t, const RdnaInst& in) {
+    if (t.lanes == 2)
+        return emit_saveexec_halves(t, in);
+    bool wrexec = false;
+    const char* value = saveexec_value(t, in.op, mask_operand(t, in, 0, 0), "s126", &wrexec);
+    if (!value) {
         translator_fail(t, "unsupported %s", rdna_op_name(in.op));
         return false;
     }
@@ -148,34 +193,112 @@ static bool emit_saveexec(Translator& t, const RdnaInst& in) {
     return true;
 }
 
+// A moved scalar dword. With exact lanes it keeps its form (mask or data, the tags follow), except
+// into EXEC, which only holds masks.
+static const char* moved(Translator& t, const RdnaInst& in, u32 part) {
+    if (!t.exact)
+        return src(t, in, 0, part);
+    if (is_exec_dword(in.dst[0].reg + part) && in.dst[0].kind == OPND_SPECIAL)
+        return mask_operand(t, in, 0, part);
+    return raw_operand(t, in, 0, part);
+}
+
+// A conditional move's dword: both outcomes must have one form.
+static const char* moved_if(Translator& t, const RdnaInst& in, u32 part) {
+    if (t.exact && !(in.dst[0].kind == OPND_SPECIAL && is_exec_dword(in.dst[0].reg + part)) &&
+        sgpr_is_mask(t, in.dst[0].reg + part) != source_is_mask(t, in, 0, part)) {
+        translator_fail(t, "%s at 0x%x moves a lane mask over data or back", rdna_op_name(in.op), in.offset);
+        return "0u";
+    }
+    return moved(t, in, part);
+}
+
+// Exact lanes: SCC of a mask result (one or two dwords): any lane set.
+static const char* mask_scc(Translator& t, const char* lo, const char* hi) {
+    return hi && t.lanes == 2 ? fmt(t, "mask_any(%s, %s)", lo, hi) : fmt(t, "wave_any(%s)", lo);
+}
+
+// Exact lanes: whether a bitwise operation works on masks. It does if a source is one, or it writes
+// EXEC; data sources are then converted to masks (bitwise operations work on either form alike).
+static bool bitwise_on_masks(Translator& t, const RdnaInst& in) {
+    if (writes_exec_dword(in.dst[0]))
+        return true;
+    for (u32 i = 0; i < in.num_src; i++)
+        if (source_is_mask(t, in, i))
+            return true;
+    return false;
+}
+
+static bool emit_scalar_op(Translator& t, const RdnaInst& in);
+
 static bool emit_scalar(Translator& t, const RdnaInst& in) {
+    // Exact lanes: results that are data (anything but moves, bitwise operations and selects, which
+    // handle masks themselves) are converted where written to EXEC.
+    bool forms = false;
+    switch (in.op) {
+    case OP_S_MOV_B32:
+    case OP_S_MOV_B64:
+    case OP_S_CMOV_B32:
+    case OP_S_CMOV_B64:
+    case OP_S_NOT_B32:
+    case OP_S_NOT_B64:
+    case OP_S_WQM_B32:
+    case OP_S_WQM_B64:
+    case OP_S_CSELECT_B32:
+    case OP_S_CSELECT_B64:
+        forms = true;
+        break;
+    default:
+        forms = (in.op >= OP_S_AND_B32 && in.op <= OP_S_XNOR_B64) ||
+                (in.op >= OP_S_AND_SAVEEXEC_B64 && in.op <= OP_S_XNOR_SAVEEXEC_B64) ||
+                (in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ANDN2_WREXEC_B32) ||
+                (in.op >= OP_S_ANDN1_SAVEEXEC_B64 && in.op <= OP_S_ANDN2_WREXEC_B64);
+        break;
+    }
+    t.exec_bits = t.exact && !forms;
+    bool ok = emit_scalar_op(t, in);
+    t.exec_bits = false;
+    return ok;
+}
+
+static bool emit_scalar_op(Translator& t, const RdnaInst& in) {
     const RdnaOperand& d = in.dst[0];
     switch (in.op) {
     case OP_S_MOV_B32:
-        write_sgpr(t, d, 0, src(t, in, 0));
+        write_sgpr(t, d, 0, moved(t, in, 0));
         return true;
     case OP_S_MOV_B64:
-        write_sgpr(t, d, 0, src(t, in, 0));
-        write_sgpr(t, d, 1, src(t, in, 0, 1));
+        write_sgpr(t, d, 0, moved(t, in, 0));
+        write_sgpr(t, d, 1, moved(t, in, 1));
         return true;
     case OP_S_CMOV_B32:
         t.scc_used = true;
-        emit(t, "if (scc) %s = %s;", sgpr(t, d.reg), src(t, in, 0));
+        emit(t, "if (scc) %s = %s;", sgpr(t, d.reg), moved_if(t, in, 0));
         return true;
     case OP_S_CMOV_B64:
         t.scc_used = true;
-        emit(t, "if (scc) { %s = %s; %s = %s; }", sgpr(t, d.reg), src(t, in, 0), sgpr(t, d.reg + 1),
-             src(t, in, 0, 1));
+        emit(t, "if (scc) { %s = %s; %s = %s; }", sgpr(t, d.reg), moved_if(t, in, 0), sgpr(t, d.reg + 1),
+             moved_if(t, in, 1));
         return true;
     case OP_S_MOVK_I32:
         write_sgpr(t, d, 0, fmt(t, "0x%08xu", (u32)in.simm16));
         return true;
-    case OP_S_CMOVK_I32:
+    case OP_S_CMOVK_I32: {
         t.scc_used = true;
-        emit(t, "if (scc) %s = 0x%08xu;", sgpr(t, d.reg), (u32)in.simm16);
+        const char* k = fmt(t, "0x%08xu", (u32)in.simm16);
+        if (t.exec_bits && d.kind == OPND_SPECIAL && is_exec_dword(d.reg))
+            k = lane_mask_of(t, k);
+        emit(t, "if (scc) %s = %s;", sgpr(t, d.reg), k);
         return true;
+    }
     case OP_S_NOT_B32:
     case OP_S_NOT_B64: {
+        if (t.exact && bitwise_on_masks(t, in)) {
+            for (u32 i = 0; i < d.count; i++)
+                write_sgpr(t, d, i, fmt(t, "~%s", mask_operand(t, in, 0, i)));
+            set_scc(t, mask_scc(t, sgpr(t, d.reg), d.count == 2 ? sgpr(t, d.reg + 1) : nullptr));
+            return true;
+        }
         bool mask = result_is_mask(t, in);
         for (u32 i = 0; i < d.count; i++)
             write_sgpr(t, d, i, fmt(t, "~%s", src(t, in, 0, i)));
@@ -185,8 +308,11 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
     case OP_S_WQM_B32:
     case OP_S_WQM_B64:
         for (u32 i = 0; i < d.count; i++)
-            write_sgpr(t, d, i, fmt(t, "quad_any(%s)", src(t, in, 0, i)));
-        set_scc(t, fmt(t, "wave_any(%s)", sgpr(t, d.reg)));
+            write_sgpr(t, d, i, fmt(t, "quad_any(%s)", mask_operand(t, in, 0, i)));
+        if (t.exact)
+            set_scc(t, mask_scc(t, sgpr(t, d.reg), d.count == 2 ? sgpr(t, d.reg + 1) : nullptr));
+        else
+            set_scc(t, fmt(t, "wave_any(%s)", sgpr(t, d.reg)));
         return true;
     case OP_S_AND_B32:
     case OP_S_OR_B32:
@@ -204,14 +330,19 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
     case OP_S_NAND_B64:
     case OP_S_NOR_B64:
     case OP_S_XNOR_B64: {
+        bool exact_mask = t.exact && bitwise_on_masks(t, in);
         bool mask = result_is_mask(t, in);
         emit(t, "{");
         t.depth++;
         for (u32 i = 0; i < d.count; i++)
-            emit(t, "uint r%u_ = %s;", i, logic_expr(t, in.op, src(t, in, 0, i), src(t, in, 1, i)));
+            emit(t, "uint r%u_ = %s;", i,
+                 exact_mask ? logic_expr(t, in.op, mask_operand(t, in, 0, i), mask_operand(t, in, 1, i))
+                            : logic_expr(t, in.op, src(t, in, 0, i), src(t, in, 1, i)));
         for (u32 i = 0; i < d.count; i++)
             write_sgpr(t, d, i, fmt(t, "r%u_", i));
-        if (mask)
+        if (exact_mask)
+            set_scc(t, mask_scc(t, "r0_", d.count == 2 ? "r1_" : nullptr));
+        else if (mask)
             set_scc(t, "wave_any(r0_)");
         else
             set_scc(t, d.count == 2 ? "(r0_ | r1_) != 0u" : "r0_ != 0u");
@@ -220,17 +351,21 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
         return true;
     }
     case OP_S_CSELECT_B32:
-    case OP_S_CSELECT_B64:
+    case OP_S_CSELECT_B64: {
+        bool exact_mask = t.exact && bitwise_on_masks(t, in);
         t.scc_used = true;
         emit(t, "{");
         t.depth++;
         for (u32 i = 0; i < d.count; i++)
-            emit(t, "uint r%u_ = scc ? %s : %s;", i, src(t, in, 0, i), src(t, in, 1, i));
+            emit(t, "uint r%u_ = scc ? %s : %s;", i,
+                 exact_mask ? mask_operand(t, in, 0, i) : src(t, in, 0, i),
+                 exact_mask ? mask_operand(t, in, 1, i) : src(t, in, 1, i));
         for (u32 i = 0; i < d.count; i++)
             write_sgpr(t, d, i, fmt(t, "r%u_", i));
         t.depth--;
         emit(t, "}");
         return true;
+    }
     case OP_S_ADD_U32:
         emit(t, "{ uint a_ = %s, b_ = %s, r_ = a_ + b_; scc = r_ < a_;", src(t, in, 0), src(t, in, 1));
         break;
@@ -436,10 +571,19 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
         set_scc(t, fmt(t, "(%s | %s) != 0u", sgpr(t, d.reg), sgpr(t, d.reg + 1)));
         return true;
     }
-    case OP_S_BFM_B64:
+    case OP_S_BFM_B64: {
+        // Constant masks written to EXEC (lanes 0-31 and the like) are folded, mask form and all.
+        u32 width, shift;
+        if (t.exec_bits && literal_value(src(t, in, 0), &width) && literal_value(src(t, in, 1), &shift)) {
+            u64 bits = (((u64)1 << (width & 63)) - 1) << (shift & 63);
+            write_sgpr(t, d, 0, fmt(t, "0x%08xu", (u32)bits));
+            write_sgpr(t, d, 1, fmt(t, "0x%08xu", (u32)(bits >> 32)));
+            return true;
+        }
         write64(t, d,
                 fmt(t, "((((uint64_t)1 << (%s & 63u)) - 1) << (%s & 63u))", src(t, in, 0), src(t, in, 1)));
         return true;
+    }
     case OP_S_BITREPLICATE_B64_B32: {
         // Each bit of the source twice: used to widen wave32 masks.
         emit(t,
@@ -513,7 +657,8 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
         return true;
     case OP_S_CMP_EQ_U64:
     case OP_S_CMP_LG_U64: {
-        bool mask = in.src[0].kind == OPND_SGPR && tag_kind(t.tags.sgpr[in.src[0].reg & 127]) == TAG_MASK;
+        bool mask =
+            !t.exact && in.src[0].kind == OPND_SGPR && tag_kind(t.tags.sgpr[in.src[0].reg & 127]) == TAG_MASK;
         if (mask && in.src[1].kind == OPND_INLINE && in.src[1].reg == SRC_ZERO)
             set_scc(t, fmt(t, "%swave_any(%s)", in.op == OP_S_CMP_EQ_U64 ? "!" : "", src(t, in, 0)));
         else
@@ -611,27 +756,40 @@ static void vhalf_u16(Translator& t, const RdnaInst& in, const char* value) {
         vwrite(t, in, fmt(t, "((%s & 0xffff0000u) | (%s & 0xffffu))", dst, value));
 }
 
+// This lane's bit of a mask operand (with two lanes per thread, of the half's dword).
 static const char* lane_bit(Translator& t, const RdnaInst& in, u32 i) {
+    if (t.exact)
+        return fmt(t, "(%s != 0u)", mask_operand(t, in, i, lane_mask_part(t)));
     return fmt(t, "(%s != 0u)", src_u32(t, in, i));
+}
+
+// A lane mask result of a per-lane instruction (compare, carry): with exact lanes the lanes being
+// emitted write their own dword, else every dword of the mask.
+static void write_lane_mask(Translator& t, const RdnaOperand& dst, const char* value) {
+    if (t.exact) {
+        write_sgpr(t, dst, lane_mask_part(t), value);
+        return;
+    }
+    write_sgpr(t, dst, 0, value);
+    if (!t.wave32)
+        write_sgpr(t, dst, 1, value);
 }
 
 // Compares write EXEC && condition to the destination mask (or EXEC itself for CMPX).
 static void emit_compare_result(Translator& t, const RdnaInst& in, const char* condition) {
     bool cmpx = strstr(rdna_op_name(in.op), "_cmpx_") != nullptr;
     emit(t,
-         t.dpp_has_mask ? "{ uint m_ = mask_of(EXEC && dpp_en_ && (%s));"
-                        : "{ uint m_ = mask_of(EXEC && (%s));",
-         condition);
+         t.dpp_has_mask ? "{ uint m_ = mask_of(%s && dpp_en_ && (%s));" : "{ uint m_ = mask_of(%s && (%s));",
+         exec_cond(t), condition);
     t.depth++;
-    if (cmpx) {
+    if (cmpx && t.exact) {
+        emit(t, "s%u = m_;", SRC_EXEC_LO + lane_mask_part(t));
+    } else if (cmpx) {
         emit(t, "s126 = m_;");
         if (!t.wave32)
             emit(t, "s127 = m_;");
     } else {
-        RdnaOperand dst = in.dst[0];
-        write_sgpr(t, dst, 0, "m_");
-        if (!t.wave32)
-            write_sgpr(t, dst, 1, "m_");
+        write_lane_mask(t, in.dst[0], "m_");
     }
     t.depth--;
     emit(t, "}");
@@ -730,11 +888,11 @@ static bool emit_compare(Translator& t, const RdnaInst& in) {
     return true;
 }
 
-// Access to one particular lane. Where desktop waves are 32 wide (the desktop wave size is not known
-// here), a wave64 program's wave spans two of them and either half may name a lane of the other, so
-// this is only exact for wave32 programs; wave64 ones fail until that is emulated.
+// Access to one particular lane. Without exact lanes (graphics) the desktop wave size is not known, and
+// where desktop waves are 32 wide a wave64 program's wave spans two of them: either half may name a
+// lane of the other, so this is only exact for wave32 programs.
 static bool lane_in_desktop_wave(Translator& t, const RdnaInst& in) {
-    if (!t.wave32) {
+    if (!t.exact && !t.wave32) {
         translator_fail(t, "%s in a wave64 program at 0x%x", rdna_op_name(in.op), in.offset);
         return false;
     }
@@ -763,19 +921,54 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
             vwrite(t, in, fmt(t, "(%s ? %s : %s)", lane_bit(t, in, 2), u(t, in, 1), u(t, in, 0)));
         return true;
     case OP_V_READFIRSTLANE_B32:
-        write_sgpr(t, in.dst[0], 0, fmt(t, "read_first(%s, s126)", u(t, in, 0)));
+        t.exec_bits = t.exact; // data, also when written to EXEC
+        if (t.lanes == 2 && in.src[0].kind == OPND_VGPR) {
+            // The first lane of the console wave's EXEC (lane 0 if none).
+            emit(t, "{ uint b0_ = mask_bits(s126), b1_ = mask_bits(s127); uint f_ = b0_ != 0u ? "
+                    "firstbitlow(b0_) : "
+                    "b1_ != 0u ? 32u + firstbitlow(b1_) : 0u;");
+            t.depth++;
+            write_sgpr(t, in.dst[0], 0,
+                       fmt(t, "WaveReadLaneAt(f_ < 32u ? %s : %s, f_ & 31u)", vgpr_half(t, in.src[0].reg, 0),
+                           vgpr_half(t, in.src[0].reg, 1)));
+            t.depth--;
+            emit(t, "}");
+        } else if (t.exact && in.src[0].kind != OPND_VGPR) {
+            write_sgpr(t, in.dst[0], 0, u(t, in, 0)); // the same in every lane
+        } else {
+            write_sgpr(t, in.dst[0], 0, fmt(t, "read_first(%s, s126)", u(t, in, 0)));
+        }
+        t.exec_bits = false;
         return true;
     case OP_V_READLANE_B32: {
-        // Spill VGPRs (see find_spill_vgprs) keep one variable per lane.
+        // Spill VGPRs (see find_spill_vgprs) keep one variable per lane, in the form it was written in.
         u32 lane;
         u8 slot = in.src[0].kind == OPND_VGPR ? t.spill_slot[in.src[0].reg & 255] : 0xFF;
         if (slot != 0xFF && constant_lane(t, in.src[1], &lane)) {
+            t.exec_bits = t.exact && tag_kind(t.tags.spill_tag[slot][lane]) != TAG_MASK;
             write_sgpr(t, in.dst[0], 0, fmt(t, "spill%u_%u", slot, lane));
+            t.exec_bits = false;
             return true;
         }
         if (!lane_in_desktop_wave(t, in))
             return false;
-        write_sgpr(t, in.dst[0], 0, fmt(t, "WaveReadLaneAt(%s, %s & 31u)", u(t, in, 0), u(t, in, 1)));
+        t.exec_bits = t.exact;
+        if (t.lanes == 2 && in.src[0].kind == OPND_VGPR) {
+            // The lane is the same in every thread: so is the half it is in.
+            u32 r = in.src[0].reg;
+            if (constant_lane(t, in.src[1], &lane)) {
+                write_sgpr(t, in.dst[0], 0,
+                           fmt(t, "WaveReadLaneAt(%s, %uu)", vgpr_half(t, r, lane >> 5), lane & 31u));
+            } else {
+                const char* n = u(t, in, 1);
+                write_sgpr(t, in.dst[0], 0,
+                           fmt(t, "WaveReadLaneAt((%s & 32u) != 0u ? %s : %s, %s & 31u)", n,
+                               vgpr_half(t, r, 1), vgpr_half(t, r, 0), n));
+            }
+        } else {
+            write_sgpr(t, in.dst[0], 0, fmt(t, "WaveReadLaneAt(%s, %s & 31u)", u(t, in, 0), u(t, in, 1)));
+        }
+        t.exec_bits = false;
         return true;
     }
     case OP_V_WRITELANE_B32: {
@@ -783,21 +976,50 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
         u32 lane;
         u8 slot = in.dst[0].kind == OPND_VGPR ? t.spill_slot[in.dst[0].reg & 255] : 0xFF;
         if (slot != 0xFF && constant_lane(t, in.src[1], &lane)) {
-            emit(t, "spill%u_%u = %s;", slot, lane, u(t, in, 0));
+            emit(t, "spill%u_%u = %s;", slot, lane, raw_operand(t, in, 0, 0));
             return true;
         }
         if (!lane_in_desktop_wave(t, in))
             return false;
-        emit(t, "if (WaveGetLaneIndex() == (%s & 31u)) %s = %s;", u(t, in, 1), vgpr(t, in.dst[0].reg),
-             u(t, in, 0));
+        if (!t.exact) {
+            emit(t, "if (WaveGetLaneIndex() == (%s & 31u)) %s = %s;", u(t, in, 1), vgpr(t, in.dst[0].reg),
+                 u(t, in, 0));
+            return true;
+        }
+        // The value first: reading a mask's bits takes the whole wave.
+        u32 r = in.dst[0].reg;
+        if (t.lanes == 1)
+            emit(t, "{ uint x_ = %s; if (WaveGetLaneIndex() == (%s & 31u)) %s = x_; }", u(t, in, 0),
+                 u(t, in, 1), vgpr(t, r));
+        else if (constant_lane(t, in.src[1], &lane))
+            emit(t, "{ uint x_ = %s; if (WaveGetLaneIndex() == %uu) %s = x_; }", u(t, in, 0), lane & 31u,
+                 vgpr_half(t, r, lane >> 5));
+        else
+            emit(t,
+                 "{ uint x_ = %s, n_ = %s & 63u; if (WaveGetLaneIndex() == (n_ & 31u)) { if (n_ < 32u) %s = "
+                 "x_; "
+                 "else %s = x_; } }",
+                 u(t, in, 0), u(t, in, 1), vgpr_half(t, r, 0), vgpr_half(t, r, 1));
         return true;
     }
     case OP_V_MBCNT_LO_U32_B32:
     case OP_V_MBCNT_HI_U32_B32: {
-        // Lanes below this one in the mask. With an all-ones mask, the lane index; otherwise the
-        // whole count happens in the LO step (it sees every lane of the desktop wave).
         bool all = in.src[0].kind == OPND_INLINE && in.src[0].reg == SRC_INT_MAX + 1; // -1
         bool lo = in.op == OP_V_MBCNT_LO_U32_B32;
+        if (t.exact) {
+            // Set bits of the mask (data: a mask operand reads as its bits) in the console lanes below
+            // this one: LO counts lanes 0-31, HI lanes 32-63. The second half's lanes have all of 0-31
+            // below them.
+            const char* below =
+                all ? "WaveGetLaneIndex()"
+                    : fmt(t, "countbits(%s & ((1u << WaveGetLaneIndex()) - 1u))", u(t, in, 0));
+            const char* whole = all ? "32u" : fmt(t, "countbits(%s)", u(t, in, 0));
+            const char* count = lo ? (t.half ? whole : below) : (t.half ? below : nullptr);
+            vwrite(t, in, count ? fmt(t, "(%s + %s)", count, u(t, in, 1)) : u(t, in, 1));
+            return true;
+        }
+        // Lanes below this one in the mask. With an all-ones mask, the lane index; otherwise the
+        // whole count happens in the LO step (it sees every lane of the desktop wave).
         if (all)
             vwrite(t, in,
                    lo ? fmt(t, "(min(WaveGetLaneIndex(), 32u) + %s)", u(t, in, 1))
@@ -908,9 +1130,7 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
     case OP_V_DIV_SCALE_F32:
         // Division is done exactly in DIV_FIXUP; scaling is the identity and never flags.
         vwrite(t, in, u(t, in, 0));
-        write_sgpr(t, in.dst[1], 0, "0u");
-        if (!t.wave32)
-            write_sgpr(t, in.dst[1], 1, "0u");
+        write_lane_mask(t, in.dst[1], "0u");
         return true;
     case OP_V_DIV_FMAS_F32:
         vfloat(t, in, fmt(t, "mad(%s, %s, %s)", f(t, in, 0), f(t, in, 1), f(t, in, 2)));
@@ -1224,7 +1444,7 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
         const char* b = u(t, in, rev ? 0 : 1);
         const char* c = carry_in ? fmt(t, "(%s ? 1u : 0u)", lane_bit(t, in, 2)) : "0u";
         // Lanes DPP leaves unwritten produce no carry either.
-        const char* enabled = t.dpp_has_mask ? "EXEC && dpp_en_" : "EXEC";
+        const char* enabled = t.dpp_has_mask ? fmt(t, "%s && dpp_en_", exec_cond(t)) : exec_cond(t);
         emit(t, "{ uint64_t w_ = (uint64_t)%s %c %s %c %s; uint carry_ = mask_of(%s && (w_ >> 32) != 0u);", a,
              sub || rev ? '-' : '+', b, sub || rev ? '-' : '+', c, enabled);
         t.depth++;
@@ -1232,9 +1452,7 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
         RdnaOperand carry = in.dst[1];
         if (carry.kind == OPND_NONE)
             carry = in.dst[0], carry.kind = OPND_SPECIAL, carry.reg = SRC_VCC_LO;
-        write_sgpr(t, carry, 0, "carry_");
-        if (!t.wave32)
-            write_sgpr(t, carry, 1, "carry_");
+        write_lane_mask(t, carry, "carry_");
         t.depth--;
         emit(t, "}");
         return true;
@@ -1245,9 +1463,7 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
         t.depth++;
         write_vgpr(t, in, in.dst[0].reg, "(uint)w_");
         write_vgpr(t, in, in.dst[0].reg + 1, "(uint)(w_ >> 32)");
-        write_sgpr(t, in.dst[1], 0, "0u");
-        if (!t.wave32)
-            write_sgpr(t, in.dst[1], 1, "0u");
+        write_lane_mask(t, in.dst[1], "0u");
         t.depth--;
         emit(t, "}");
         return true;
@@ -1401,9 +1617,8 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
             emit(t, "uint r_ = WaveReadLaneAt(%s, sl_);", u(t, in, 0));
         } else {
             // Both reads run in every lane: a lane may only be read while it takes part in the read.
-            emit(t,
-                 "uint v_ = WaveReadLaneAt(%s, sl_); bool act_ = WaveReadLaneAt(EXEC ? 1u : 0u, sl_) != 0u;",
-                 u(t, in, 0));
+            emit(t, "uint v_ = WaveReadLaneAt(%s, sl_); bool act_ = WaveReadLaneAt(%s ? 1u : 0u, sl_) != 0u;",
+                 u(t, in, 0), exec_cond(t));
             emit(t, "uint r_ = act_ ? v_ : %s;", bc ? "0u" : vgpr(t, in.dst[0].reg));
         }
         vwrite(t, in, "r_");
@@ -1433,7 +1648,7 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
     case OP_V_SWAP_B32: {
         const char* a = vgpr(t, in.dst[0].reg);
         const char* b = vgpr(t, in.src[0].reg);
-        emit(t, "if (EXEC) { uint x_ = %s; %s = %s; %s = x_; }", a, a, b, b);
+        emit(t, "if (%s) { uint x_ = %s; %s = %s; %s = x_; }", exec_cond(t), a, a, b, b);
         return true;
     }
     default:
@@ -1638,10 +1853,11 @@ static bool begin_dpp(Translator& t, const RdnaInst& in) {
         translator_fail(t, "unsupported DPP ctrl 0x%x on %s", c, rdna_op_name(in.op));
         return false;
     }
-    // Rows are 16 lanes. A wave64 program on a 32-wide desktop wave has its upper rows in another
-    // desktop wave, where they would count as rows 0 and 1: row masks treating the halves differently
-    // can't be honored then (the desktop wave size is not known here).
-    if (!t.wave32 && ((in.dpp.row_mask ^ (in.dpp.row_mask >> 2)) & 3u) != 0) {
+    // Rows are 16 lanes. Without exact lanes a wave64 program on a 32-wide desktop wave has its upper
+    // rows in another desktop wave, where they would count as rows 0 and 1: row masks treating the
+    // halves differently can't be honored then (the desktop wave size is not known). With two lanes per
+    // thread, the second half's rows are 2 and 3.
+    if (!t.exact && !t.wave32 && ((in.dpp.row_mask ^ (in.dpp.row_mask >> 2)) & 3u) != 0) {
         translator_fail(t, "DPP row_mask 0x%x splits wave64 halves at 0x%x", in.dpp.row_mask, in.offset);
         return false;
     }
@@ -1650,22 +1866,24 @@ static bool begin_dpp(Translator& t, const RdnaInst& in) {
     // Without FI, inactive source lanes are invalid sources: they read 0 with BOUND_CTRL (and in DPP8)
     // and leave the destination unwritten otherwise, like source lanes out of the row.
     bool check_source = !in.dpp.dpp8 && !in.dpp.fetch_inactive && !in.dpp.bound_ctrl;
-    const char* src_expr = in.dpp.fetch_inactive ? v : fmt(t, "(EXEC ? %s : 0u)", v);
+    const char* src_expr = in.dpp.fetch_inactive ? v : fmt(t, "(%s ? %s : 0u)", exec_cond(t), v);
     // The reads run in every lane (a lane may only be read while it takes part); bounds apply after.
-    emit(t, "uint dpp0_ = WaveReadLaneAt(%s, sl_ & (WaveGetLaneCount() - 1u));", src_expr);
+    // Rows never cross a 32-lane half, so with exact lanes the source is in the desktop wave.
+    const char* wrap = t.exact ? "31u" : "(WaveGetLaneCount() - 1u)";
+    emit(t, "uint dpp0_ = WaveReadLaneAt(%s, sl_ & %s);", src_expr, wrap);
     if (check_source)
-        emit(t, "bool sa_ = WaveReadLaneAt(EXEC ? 1u : 0u, sl_ & (WaveGetLaneCount() - 1u)) != 0u;");
+        emit(t, "bool sa_ = WaveReadLaneAt(%s ? 1u : 0u, sl_ & %s) != 0u;", exec_cond(t), wrap);
     if (!always_in_bounds)
         emit(t, "dpp0_ = b_ ? dpp0_ : 0u;");
     bool bounds_disable = !always_in_bounds && !in.dpp.bound_ctrl;
     if (!in.dpp.dpp8 &&
         (in.dpp.row_mask != 0xF || in.dpp.bank_mask != 0xF || bounds_disable || check_source)) {
         emit(t,
-             "bool dpp_en_ = ((0x%xu >> ((l_ >> 4) & 3u)) & 1u) != 0u && ((0x%xu >> ((l_ >> 2) & 3u)) & 1u) "
+             "bool dpp_en_ = ((0x%xu >> %s) & 1u) != 0u && ((0x%xu >> ((l_ >> 2) & 3u)) & 1u) "
              "!= "
              "0u%s%s;",
-             in.dpp.row_mask, in.dpp.bank_mask, bounds_disable ? " && b_" : "",
-             check_source ? " && sa_" : "");
+             in.dpp.row_mask, t.half ? "((l_ >> 4) + 2u)" : "((l_ >> 4) & 3u)", in.dpp.bank_mask,
+             bounds_disable ? " && b_" : "", check_source ? " && sa_" : "");
         t.dpp_has_mask = true;
     }
     t.dpp_active = true;
