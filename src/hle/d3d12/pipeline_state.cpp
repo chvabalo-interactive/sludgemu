@@ -793,7 +793,7 @@ static PipelineVariant* find_variant(ConsolePipelineState* pso, const PipelineOu
 }
 
 // The variant for `key`: an existing one, or a new one being built (`*added`: the caller builds it,
-// `builder` being the background worker that does, or 0). nullptr (logged once) when the pipeline has
+// `builder` being the background job that does, or 0). nullptr (logged once) when the pipeline has
 // no room for more.
 static PipelineVariant* add_variant(ConsolePipelineState* pso, const PipelineOutputs& key, u32 builder,
                                     bool* added) {
@@ -862,7 +862,7 @@ static void variant_job(void* context) {
 }
 
 static bool wait_variant(PipelineVariant* v) {
-    // One built ahead is made at background priority (urgent jobs run at normal priority already).
+    // One built ahead is made at background speed (urgent jobs run at full speed already).
     if (v->builder)
         gpu_job_hurry(v->builder);
     for (;;) {
@@ -1109,16 +1109,11 @@ struct PrepareJob {
 static void prepare_job(void* context) {
     PrepareJob* job = (PrepareJob*)context;
     ConsolePipelineState* pso = job->pso;
-    // The programs were queued before this job, in the same lane, so workers have started them (or
-    // finished). One still pending was requested first by another thread that hadn't queued it yet:
-    // the job goes to the back of the lane rather than wait for work it might be holding up.
-    for (u32 i = 0; i < 2; i++) {
-        if (pso->programs[i] && !shader_program_wait_started(pso->programs[i])) {
-            if (gpu_job_queue_background(prepare_job, job))
-                return;
-            break; // queue full: draws make the variants
-        }
-    }
+    // Runs again once a program not built yet is (its build may wait for memory, or come last as one of
+    // the costliest).
+    for (u32 i = 0; i < 2; i++)
+        if (pso->programs[i] && shader_program_then(pso->programs[i], prepare_job, job))
+            return;
     if (programs_ready(pso) && desktop_signature_exists(pso)) {
         u32 worker = gpu_job_worker();
         for (u32 i = 0; i < job->count; i++) {
