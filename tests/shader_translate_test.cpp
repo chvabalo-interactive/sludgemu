@@ -126,6 +126,11 @@ enum : u32 {
     MIMG_ATOMIC_SMIN = 20,
     MIMG_ATOMIC_UMAX = 23,
     MIMG_ATOMIC_INC = 27,
+    MIMG_GATHER4_L = 68,
+    MIMG_GATHER4_B = 69,
+    MIMG_GATHER4_LZ = 71,
+    MIMG_GATHER4_C_L = 76,
+    MIMG_GATHER4_L_O = 84,
     MUBUF_LOAD_DWORD = 12,
     MUBUF_STORE_DWORD = 28,
     MUBUF_ATOMIC_ADD = 50,
@@ -972,6 +977,79 @@ static void test_image_atomics() {
     }
 }
 
+// --- gathers from a picked mip -------------------------------------------------------------------------
+
+static void test_gathers_at_a_mip() {
+    ShaderInfo info = compute_info();
+    // Border addressing, linear filters and mips, LOD bias +1, LOD 0.5..4.
+    const u32 biased[4] = {0x1B6, 0x00400080, 0x08500100, 0};
+    {
+        // An explicit LOD through a constant sampler: its bias and clamps pick the mip here, the taps go
+        // through a point-filtered copy without them.
+        Asm a = {};
+        load_descriptors(a, false);
+        constant_sampler(a, 20, biased);
+        a.mimg_full(MIMG_GATHER4_L, 4, 0, 8, 20, 0x2, 1, false);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(g_out.sampler_count == 1);
+        const InlineSampler& s = g_out.samplers[0];
+        CHECK(s.filter == 0 && s.max_anisotropy == 1 && s.mip_bias == 0.0f && s.min_lod == 0.0f);
+        CHECK(s.max_lod > 1e38f && s.address[0] == 4 && s.address[1] == 4 && !s.unnormalized);
+        CHECK(hlsl_has("float l_ = clamp(asfloat(v2) + 1.0f, 0.5f, 4.0f);"));
+        CHECK(hlsl_has("tex_.GetDimensions(m_, w_, h_, n_);"));
+        CHECK(hlsl_has(
+            "float2 b_ = floor(float2(asfloat(v0), asfloat(v1)) * sz_ - 0.5f) + float2(0.5f, 0.5f);"));
+        CHECK(hlsl_has("float4 t0_ = tex_.SampleLevel(smp_, ((b_ + float2(0, 1)) / sz_), (float)m_);"));
+        CHECK(hlsl_has("float4 t3_ = tex_.SampleLevel(smp_, ((b_ + float2(0, 0)) / sz_), (float)m_);"));
+        CHECK(hlsl_has("float4 r_ = float4(t0_.y, t1_.y, t2_.y, t3_.y);"));
+        CHECK(!hlsl_has("Gather"));
+    }
+    {
+        // Offsets in the whole console range, from a heap sampler, in an array.
+        Asm a = {};
+        load_descriptors(a, true);
+        a.vop1(VOP1_MOV_B32, 0, LIT);
+        a.put(0x2C | 0x05 << 8); // x -20, y +5
+        a.mimg_full(MIMG_GATHER4_L_O, 4, 0, 8, 16, 0x1, 5, false);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("SamplerState smp_ = SamplerDescriptorHeap[s16 >> 4];"));
+        CHECK(hlsl_has("float l_ = asfloat(v4);"));
+        CHECK(hlsl_has("tex_.GetDimensions(0u, w_, h_, e_, n_);"));
+        CHECK(hlsl_has("+ float2(-19.5f, 5.5f);"));
+        CHECK(hlsl_has("tex_.SampleLevel(smp_, float3((b_ + float2(1, 1)) / sz_, asfloat(v3)), (float)m_);"));
+    }
+    {
+        // An implicit LOD comes from the coordinates' derivatives, plus the bias.
+        Asm a = {};
+        load_descriptors(a, true);
+        a.mimg_full(MIMG_GATHER4_B, 4, 0, 8, 16, 0x1, 1, false);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("float l_ = tex_.CalculateLevelOfDetailUnclamped(smp_, float2(asfloat(v1), "
+                       "asfloat(v2))) + asfloat(v0);"));
+    }
+    {
+        // Gathers from the first mip stay desktop gathers.
+        Asm a = {};
+        load_descriptors(a, true);
+        a.mimg_full(MIMG_GATHER4_LZ, 4, 0, 8, 16, 0x1, 1, false);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("tex_.GatherRed(smp_, float2(asfloat(v0), asfloat(v1)))"));
+    }
+    {
+        // Comparing at a picked mip has no desktop form here yet.
+        Asm a = {};
+        load_descriptors(a, true);
+        a.mimg_full(MIMG_GATHER4_C_L, 4, 0, 8, 16, 0x1, 1, false);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("comparing gather"));
+    }
+}
+
 // --- descriptor shadow records -------------------------------------------------------------------------
 
 // What the runtime writes into the shadow for a slot, read back the way translated programs read it.
@@ -1037,6 +1115,7 @@ void test_shader_translate() {
     test_descriptor_values();
     test_long_branches();
     test_image_atomics();
+    test_gathers_at_a_mip();
     test_descriptor_shadow_records();
     g_out.hlsl.release();
 }

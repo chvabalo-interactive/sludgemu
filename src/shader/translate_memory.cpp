@@ -1232,14 +1232,7 @@ static bool decode_sampler(const u32 w[4], bool compare, InlineSampler* out, con
 
 // The program's inline sampler for a descriptor, added on first use; -1 (failed) if impossible. A
 // descriptor used both with and without comparison makes two samplers (their filters differ).
-static s32 inline_sampler(Translator& t, const RdnaInst& in, const u32 words[4], bool compare) {
-    InlineSampler s;
-    const char* why = nullptr;
-    if (!decode_sampler(words, compare, &s, &why)) {
-        translator_fail(t, "%s at 0x%x with a constant sampler using %s", rdna_op_name(in.op), in.offset,
-                        why);
-        return -1;
-    }
+static s32 add_inline_sampler(Translator& t, const InlineSampler& s, bool compare) {
     TranslatedShader& out = *t.out;
     u32 i = 0;
     while (i < out.sampler_count && memcmp(&out.samplers[i], &s, sizeof(s)) != 0)
@@ -1254,6 +1247,17 @@ static s32 inline_sampler(Translator& t, const RdnaInst& in, const u32 words[4],
             t.sampler_compare |= 1u << i;
     }
     return (s32)i;
+}
+
+static s32 inline_sampler(Translator& t, const RdnaInst& in, const u32 words[4], bool compare) {
+    InlineSampler s;
+    const char* why = nullptr;
+    if (!decode_sampler(words, compare, &s, &why)) {
+        translator_fail(t, "%s at 0x%x with a constant sampler using %s", rdna_op_name(in.op), in.offset,
+                        why);
+        return -1;
+    }
+    return add_inline_sampler(t, s, compare);
 }
 
 // The sampler of a sampling instruction as `smp_`: a static sampler for a descriptor made of constants,
@@ -1412,6 +1416,114 @@ static bool emit_image_size(Translator& t, const RdnaInst& in, bool read_write) 
         translator_fail(t, "resource info of dimension %u", in.mem.dim);
         return false;
     }
+}
+
+// Implicit LOD needs derivatives. Compute groups whose shape desktop can't take them in (1D groups not a
+// multiple of 4 threads, other groups with odd X or Y) have lone lanes in their quads on console too:
+// zero derivatives, so the LOD is the bias alone.
+static bool implicit_lod_usable(const Translator& t) {
+    if (t.info->stage != SHADER_COMPUTE)
+        return true;
+    const u16* n = t.info->threads;
+    bool one_d = n[1] == 1 && n[2] == 1;
+    return one_d ? n[0] % 4 == 0 : n[0] % 2 == 0 && n[1] % 2 == 0;
+}
+
+// A finite float as an HLSL literal.
+static const char* float_literal(Translator& t, f32 value) {
+    char digits[32];
+    snprintf(digits, sizeof(digits), "%.9g", value);
+    bool point = strpbrk(digits, ".e") != nullptr;
+    return fmt(t, "%s%sf", digits, point ? "" : ".0");
+}
+
+// A gather that picks a mip (an explicit LOD, an implicit one, a bias or a clamp), as `tex_` is declared.
+// Desktop gathers read the view's most detailed mip only, and no shader model has one that takes a LOD:
+// four point samples at the centres of the 2x2 texels the console gathers from that mip, which keep the
+// sampler's address modes and border. Returns the result's expression, or nullptr (failed).
+static const char* emit_gather_at_mip(Translator& t, const RdnaInst& in, const ImageForm& form,
+                                      const ImageAddress& addr, u32 coord_at, s32 lod_at, s32 bias_at,
+                                      s32 clamp_at, const s32 texel_offset[3]) {
+    const RdnaMemory& m = in.mem;
+    if (form.compare) {
+        translator_fail(t, "%s at 0x%x: a comparing gather from a mip it picks", rdna_op_name(in.op),
+                        in.offset);
+        return nullptr;
+    }
+    if (m.dim != DIM_2D && m.dim != DIM_2D_ARRAY) {
+        translator_fail(t, "%s at 0x%x of dimension %u", rdna_op_name(in.op), in.offset, m.dim);
+        return nullptr;
+    }
+    bool array = m.dim == DIM_2D_ARRAY;
+    // A sampler made of constants applies its bias and LOD clamps here, to pick the mip whose size the
+    // taps are placed by; the taps go through a copy without them (and without filtering), so that they
+    // read exactly that mip's texels. A heap sampler is used as it is: exact unless it biases or clamps
+    // the LOD itself, which translated code can't see.
+    u32 samp = in.src[2].reg;
+    DescriptorOrigin origin = descriptor_origin(t, samp, 4, HEAP_SAMPLERS);
+    InlineSampler constant = {};
+    if (origin == ORIGIN_CONSTANT) {
+        u32 words[4];
+        for (u32 i = 0; i < 4; i++)
+            sgpr_constant(t.tags, samp + i, &words[i]);
+        const char* why = nullptr;
+        if (!decode_sampler(words, false, &constant, &why)) {
+            translator_fail(t, "%s at 0x%x with a constant sampler using %s", rdna_op_name(in.op), in.offset,
+                            why);
+            return nullptr;
+        }
+        InlineSampler tap = constant;
+        tap.filter = 0; // point min, mag and mip filters, no min/max reduction
+        tap.max_anisotropy = 1;
+        tap.mip_bias = 0.0f;
+        tap.min_lod = 0.0f;
+        tap.max_lod = 3.402823466e+38f;
+        tap.unnormalized = false; // taps are placed in normalized coordinates
+        s32 index = add_inline_sampler(t, tap, false);
+        if (index < 0)
+            return nullptr;
+        emit(t, "SamplerState smp_ = g_sampler%d;", index);
+    } else if (origin == ORIGIN_HEAP) {
+        emit(t, "SamplerState smp_ = SamplerDescriptorHeap[%s >> 4]; // its LOD bias and clamps aren't seen",
+             sgpr(t, samp));
+    } else {
+        translator_fail(t, "%s at 0x%x with a sampler %s", rdna_op_name(in.op), in.offset,
+                        origin_text(origin));
+        return nullptr;
+    }
+    const char* uv = address_vector(t, addr, true, coord_at, 2);
+    const char* level;
+    if (form.lod) {
+        level = address_value(t, addr, lod_at);
+    } else {
+        level =
+            implicit_lod_usable(t) ? fmt(t, "tex_.CalculateLevelOfDetailUnclamped(smp_, %s)", uv) : "0.0f";
+        if (form.bias)
+            level = fmt(t, "%s + %s", level, address_value(t, addr, bias_at));
+    }
+    if (origin == ORIGIN_CONSTANT)
+        level = fmt(t, "clamp(%s + %s, %s, %s)", level, float_literal(t, constant.mip_bias),
+                    float_literal(t, constant.min_lod), float_literal(t, constant.max_lod));
+    if (form.clamp)
+        level = fmt(t, "max(%s, %s)", level, address_value(t, addr, clamp_at));
+    const char* elements = array ? "e_, " : "";
+    emit(t, "float l_ = %s;", level);
+    emit(t, "uint w_, h_, e_, n_; tex_.GetDimensions(0u, w_, h_, %sn_);", elements);
+    emit(t, "uint m_ = (uint)clamp(floor(l_ + 0.5f), 0.0f, (float)(max(n_, 1u) - 1u));");
+    emit(t, "tex_.GetDimensions(m_, w_, h_, %sn_);", elements);
+    emit(t, "float2 sz_ = float2(w_, h_);");
+    // The top-left texel of the footprint (texel coordinates of its centre); unnormalized coordinates
+    // are in texels already, and keep to mip 0 (see decode_sampler).
+    emit(t, "float2 b_ = floor(%s - 0.5f) + float2(%.1ff, %.1ff);",
+         constant.unnormalized ? uv : fmt(t, "%s * sz_", uv), texel_offset[0] + 0.5f, texel_offset[1] + 0.5f);
+    const char* slice = array ? fmt(t, ", %s", address_value(t, addr, coord_at + 2)) : "";
+    // Gather order: (0, 1), (1, 1), (1, 0), (0, 0) from the top-left texel.
+    static const u32 k_corner[4][2] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
+    for (u32 i = 0; i < 4; i++)
+        emit(t, "float4 t%u_ = tex_.SampleLevel(smp_, %s((b_ + float2(%u, %u)) / sz_%s), (float)m_);", i,
+             array ? "float3" : "", k_corner[i][0], k_corner[i][1], slice);
+    char c = "xyzw"[m.dmask & 2 ? 1 : m.dmask & 4 ? 2 : m.dmask & 8 ? 3 : 0];
+    return fmt(t, "float4(t0_.%c, t1_.%c, t2_.%c, t3_.%c)", c, c, c, c);
 }
 
 // An image atomic through a read-write view of 32- or 64-bit integer texels (`coords` uint components
@@ -1605,13 +1717,13 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     // Texel offsets: 6-bit signed fields at bits 0, 8 and 16 of a register whose value is known. Kept
     // out of the scratch ring (", offsets" or empty), since many expressions are formatted after it.
     char offset_arg[48] = {};
+    s32 o[3] = {0, 0, 0};
     if (form.offset) {
         u32 value;
         if (!vgpr_constant(t.tags, addr.regs[offset_at], &value)) {
             translator_fail(t, "%s at 0x%x with non-constant texel offsets", rdna_op_name(in.op), in.offset);
             return false;
         }
-        s32 o[3];
         for (u32 i = 0; i < 3; i++)
             o[i] = (s32)(((value >> (8 * i)) & 0x3Fu) << 26) >> 26;
         // Desktop sampling takes offsets in [-8, 7] only; gathers take the whole console range.
@@ -1662,19 +1774,15 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
             emit(t, "%s<float4> tex_ = ResourceDescriptorHeap[%s];", k_texture_types[m.dim], resource);
         }
         const char* value = nullptr;
-        if (form.sample || form.gather) {
+        if (form.gather && !form.lod_zero) {
+            value = emit_gather_at_mip(t, in, form, addr, coord_at, lod_at, bias_at, clamp_at, o);
+            if (!value)
+                return false;
+        } else if (form.sample || form.gather) {
             if (!emit_sampler(t, in, form.compare))
                 return false;
             const char* uv = address_vector(t, addr, true, coord_at, coords);
-            // Implicit LOD needs derivatives. Compute groups whose shape desktop can't take them in (1D
-            // groups not a multiple of 4 threads, other groups with odd X or Y) have lone lanes in their
-            // quads on console too: zero derivatives, so the LOD is the bias alone.
-            bool implicit_lod_ok = true;
-            if (t.info->stage == SHADER_COMPUTE) {
-                const u16* n = t.info->threads;
-                bool one_d = n[1] == 1 && n[2] == 1;
-                implicit_lod_ok = one_d ? n[0] % 4 == 0 : n[0] % 2 == 0 && n[1] % 2 == 0;
-            }
+            bool implicit_lod_ok = implicit_lod_usable(t);
             if (form.gather) {
                 static const char* const k_gather[4] = {"GatherRed", "GatherGreen", "GatherBlue",
                                                         "GatherAlpha"};
