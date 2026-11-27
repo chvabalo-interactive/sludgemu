@@ -3,6 +3,7 @@
 // swaps) and that what it can't place fails instead of translating wrong.
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "hle/d3d12/descriptor_shadow.h"
@@ -51,6 +52,11 @@ struct Asm {
     // Sampling and loads: 2D, `dmask` components.
     void mimg(u32 op, u32 vdata, u32 vaddr, u32 srsrc, u32 ssamp, u32 dmask) {
         put(0xF0000000u | (op & 0x7F) << 18 | dmask << 8 | 1u << 3 | (op >> 7));
+        put((ssamp / 4) << 21 | (srsrc / 4) << 16 | vdata << 8 | vaddr);
+    }
+    // Any MIMG access of dimension `dim`, with the glc bit.
+    void mimg_full(u32 op, u32 vdata, u32 vaddr, u32 srsrc, u32 ssamp, u32 dmask, u32 dim, bool glc) {
+        put(0xF0000000u | (op & 0x7F) << 18 | (glc ? 1u : 0u) << 13 | dmask << 8 | dim << 3 | (op >> 7));
         put((ssamp / 4) << 21 | (srsrc / 4) << 16 | vdata << 8 | vaddr);
     }
     void vop3(u32 op, u32 vdst, u32 s0, u32 s1, u32 s2 = 0) {
@@ -114,6 +120,12 @@ enum : u32 {
     SOP1_GETPC_B64 = 31,
     SOP1_SETPC_B64 = 32,
     SMEM_LOAD_DWORDX2 = 1,
+    MIMG_ATOMIC_CMPSWAP = 16,
+    MIMG_ATOMIC_ADD = 17,
+    MIMG_ATOMIC_SUB = 18,
+    MIMG_ATOMIC_SMIN = 20,
+    MIMG_ATOMIC_UMAX = 23,
+    MIMG_ATOMIC_INC = 27,
     MUBUF_LOAD_DWORD = 12,
     MUBUF_STORE_DWORD = 28,
     MUBUF_ATOMIC_ADD = 50,
@@ -177,8 +189,25 @@ static void sample(Asm& a, u32 ssamp) {
 
 static TranslatedShader g_out;
 
+// With SLUDGE_TEST_HLSL=<dir>, each translation's HLSL is also written there (<n>_cs.hlsl), to check
+// that the desktop compiler takes it.
 static bool translate(const Asm& a, const ShaderInfo& info) {
-    return shader_translate(a.w, a.n * 4, info, &g_out);
+    static u32 count = 0;
+    bool ok = shader_translate(a.w, a.n * 4, info, &g_out);
+    const char* dir = getenv("SLUDGE_TEST_HLSL");
+    if (ok && dir) {
+        char path[300];
+        snprintf(path, sizeof(path), "%s\\test%03u_%s.hlsl", dir, count++,
+                 info.stage == SHADER_PIXEL    ? "ps"
+                 : info.stage == SHADER_VERTEX ? "vs"
+                                               : "cs");
+        FILE* f = fopen(path, "w");
+        if (f) {
+            fputs(g_out.hlsl.data, f);
+            fclose(f);
+        }
+    }
+    return ok;
 }
 
 static bool error_has(const char* text) {
@@ -866,6 +895,83 @@ static void test_long_branches() {
     }
 }
 
+// --- image atomics -------------------------------------------------------------------------------------
+
+static void test_image_atomics() {
+    ShaderInfo info = compute_info();
+    {
+        // 32-bit, no old value wanted.
+        Asm a = {};
+        load_descriptors(a, false);
+        a.mimg_full(MIMG_ATOMIC_UMAX, 4, 0, 8, 0, 0x1, 1, false);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("{ RWTexture2D<uint> tex_ = ResourceDescriptorHeap[s8 >> 5];"));
+        CHECK(hlsl_has("uint2 at_ = uint2(v0, v1);"));
+        CHECK(hlsl_has("if (EXEC) InterlockedMax(tex_[at_], v4);"));
+        CHECK(!hlsl_has("if (EXEC) v4 = "));
+        CHECK(!g_out.uses_int64_atomics);
+    }
+    {
+        // 64-bit with the old value back (two registers each).
+        Asm a = {};
+        load_descriptors(a, false);
+        a.mimg_full(MIMG_ATOMIC_UMAX, 4, 0, 8, 0, 0x3, 1, true);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("RWTexture2D<uint64_t> tex_"));
+        CHECK(hlsl_has("if (EXEC) InterlockedMax(tex_[at_], ((uint64_t)v5 << 32 | v4), o_);"));
+        CHECK(hlsl_has("if (EXEC) v4 = (uint)o_;"));
+        CHECK(hlsl_has("if (EXEC) v5 = (uint)((uint64_t)o_ >> 32);"));
+        CHECK(g_out.uses_int64_atomics);
+    }
+    {
+        // Compare-swap: the value, then what the texel is compared with.
+        Asm a = {};
+        load_descriptors(a, false);
+        a.mimg_full(MIMG_ATOMIC_CMPSWAP, 4, 0, 8, 0, 0x3, 1, true);
+        a.mimg_full(MIMG_ATOMIC_CMPSWAP, 8, 0, 8, 0, 0xF, 1, false);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("if (EXEC) InterlockedCompareExchange(tex_[at_], v5, v4, o_);"));
+        CHECK(hlsl_has("if (EXEC) v4 = (uint)o_;"));
+        CHECK(!hlsl_has("if (EXEC) v5 = "));
+        CHECK(hlsl_has("if (EXEC) InterlockedCompareStore(tex_[at_], ((uint64_t)v11 << 32 | v10), "
+                       "((uint64_t)v9 << 32 | v8));"));
+    }
+    {
+        // Signed minimum through a view of signed texels; subtraction as an add of the negation.
+        Asm a = {};
+        load_descriptors(a, false);
+        a.mimg_full(MIMG_ATOMIC_SMIN, 4, 0, 8, 0, 0x1, 1, false);
+        a.mimg_full(MIMG_ATOMIC_SUB, 5, 0, 8, 0, 0x1, 1, false);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("RWTexture2D<int> tex_"));
+        CHECK(hlsl_has("InterlockedMin(tex_[at_], (int)v4);"));
+        CHECK(hlsl_has("InterlockedAdd(tex_[at_], (uint)0 - v5);"));
+    }
+    {
+        // Increment: a compare-exchange loop starting from a guess.
+        Asm a = {};
+        load_descriptors(a, false);
+        a.mimg_full(MIMG_ATOMIC_INC, 4, 0, 8, 0, 0x1, 1, true);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("InterlockedCompareExchange(tex_[at_], c_, c_ >= v4 ? 0u : c_ + 1u, p_);"));
+        CHECK(hlsl_has("if (EXEC) v4 = (uint)o_;"));
+    }
+    {
+        // Three dwords are no texel width.
+        Asm a = {};
+        load_descriptors(a, false);
+        a.mimg_full(MIMG_ATOMIC_ADD, 4, 0, 8, 0, 0x7, 1, false);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("with dmask 0x7"));
+    }
+}
+
 // --- descriptor shadow records -------------------------------------------------------------------------
 
 // What the runtime writes into the shadow for a slot, read back the way translated programs read it.
@@ -930,6 +1036,7 @@ void test_shader_translate() {
     test_view_kinds();
     test_descriptor_values();
     test_long_branches();
+    test_image_atomics();
     test_descriptor_shadow_records();
     g_out.hlsl.release();
 }

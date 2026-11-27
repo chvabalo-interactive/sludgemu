@@ -162,6 +162,7 @@ struct TranslatedShader {
     u32 ps_target_mask;      // pixel shaders: render targets written
     bool ps_writes_depth;
     bool ps_discards;
+    bool uses_int64_atomics; // 64-bit atomics on typed views of the descriptor heap (an optional feature)
     // Vertex shaders: the desktop input format of each element read (raw fetches read dwords).
     u32 element_format[SHADER_MAX_VERTEX_ELEMENTS];
     u32 sampler_count;

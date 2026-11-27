@@ -22,6 +22,8 @@ const GpuOptions& gpu_options();
 // adapter exists.
 ID3D12Device13* gpu_device();
 IDXGIFactory6* gpu_factory();
+// Whether the device does 64-bit atomics on typed views in the descriptor heap (after gpu_device()).
+bool gpu_int64_image_atomics();
 
 // The adapter's memory as the OS accounts it to this process: `local` is the GPU's own (VRAM),
 // `shared` system memory it uses. Budgets are what the OS lets the process keep resident.

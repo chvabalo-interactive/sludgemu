@@ -1322,6 +1322,15 @@ static ImageForm image_form(RdnaOp op) {
 static const char* const k_texture_types[8] = {"Texture1D",   "Texture2D",       "Texture3D",
                                                "TextureCube", "Texture1DArray",  "Texture2DArray",
                                                "Texture2DMS", "Texture2DMSArray"};
+// Read-write views by dimension: a cube's is an array of its faces; multisampled images have none.
+static const char* const k_rw_texture_types[8] = {"RWTexture1D",
+                                                  "RWTexture2D",
+                                                  "RWTexture3D",
+                                                  "RWTexture2DArray",
+                                                  "RWTexture1DArray",
+                                                  "RWTexture2DArray",
+                                                  "",
+                                                  ""};
 static const u8 k_dim_coords[8] = {1, 2, 3, 3, 2, 3, 2, 3};
 static const u8 k_dim_grads[8] = {1, 2, 3, 3, 1, 2, 2, 2};
 
@@ -1403,6 +1412,110 @@ static bool emit_image_size(Translator& t, const RdnaInst& in, bool read_write) 
         translator_fail(t, "resource info of dimension %u", in.mem.dim);
         return false;
     }
+}
+
+// An image atomic through a read-write view of 32- or 64-bit integer texels (`coords` uint components
+// of `addr` from `coord_at`). The data registers hold one value, or for a compare-swap the value and
+// then what the texel is compared with; dmask has a bit per dword of it. With glc the texel's old value
+// comes back in the first registers.
+static bool emit_image_atomic(Translator& t, const RdnaInst& in, const ImageAddress& addr, u32 coord_at,
+                              u32 coords, const char* resource) {
+    const RdnaMemory& m = in.mem;
+    bool cmpswap = in.op == OP_IMAGE_ATOMIC_CMPSWAP;
+    u32 data_dwords = m.dmask == 0x1 ? 1 : m.dmask == 0x3 ? 2 : m.dmask == 0xF ? 4 : 0;
+    u32 dwords = cmpswap ? data_dwords / 2 : data_dwords; // per value
+    if ((dwords != 1 && dwords != 2) || m.d16 || !k_rw_texture_types[m.dim][0]) {
+        translator_fail(t, "%s at 0x%x with dmask 0x%x%s, dimension %u", rdna_op_name(in.op), in.offset,
+                        m.dmask, m.d16 ? " (16-bit)" : "", m.dim);
+        return false;
+    }
+    bool wide = dwords == 2;
+    bool is_signed = in.op == OP_IMAGE_ATOMIC_SMIN || in.op == OP_IMAGE_ATOMIC_SMAX;
+    bool inc_dec = in.op == OP_IMAGE_ATOMIC_INC || in.op == OP_IMAGE_ATOMIC_DEC;
+    if (wide && inc_dec) {
+        translator_fail(t, "64-bit %s at 0x%x", rdna_op_name(in.op), in.offset);
+        return false;
+    }
+    // Typed atomics take their signedness from the view's element type.
+    const char* type = wide ? (is_signed ? "int64_t" : "uint64_t") : (is_signed ? "int" : "uint");
+    u32 data = in.dst[0].reg;
+    const char* value =
+        wide ? fmt(t, "((uint64_t)%s << 32 | %s)", vgpr(t, data + 1), vgpr(t, data)) : vgpr(t, data);
+    if (is_signed)
+        value = fmt(t, "(%s)%s", type, value);
+    if (wide)
+        t.out->uses_int64_atomics = true;
+    bool returns = m.glc;
+    emit(t, "{ %s<%s> tex_ = ResourceDescriptorHeap[%s];", k_rw_texture_types[m.dim], type, resource);
+    t.depth++;
+    emit(t, "uint%s at_ = %s;", coords > 1 ? fmt(t, "%u", coords) : "",
+         address_vector(t, addr, false, coord_at, coords));
+    emit(t, "%s o_ = 0;", type);
+    if (cmpswap) {
+        const char* compare = wide ? fmt(t, "((uint64_t)%s << 32 | %s)", vgpr(t, data + 3), vgpr(t, data + 2))
+                                   : vgpr(t, data + 1);
+        if (returns)
+            emit(t, "if (EXEC) InterlockedCompareExchange(tex_[at_], %s, %s, o_);", compare, value);
+        else
+            emit(t, "if (EXEC) InterlockedCompareStore(tex_[at_], %s, %s);", compare, value);
+    } else if (inc_dec) {
+        // No typed atomic does these: a compare-exchange loop, which needs no typed load to start from
+        // (the first exchange returns the texel unless it already holds the guess).
+        const char* next = in.op == OP_IMAGE_ATOMIC_INC
+                               ? fmt(t, "c_ >= %s ? 0u : c_ + 1u", value)
+                               : fmt(t, "(c_ == 0u || c_ > %s) ? %s : c_ - 1u", value, value);
+        emit(t,
+             "if (EXEC) { uint c_ = 0u, p_; [allow_uav_condition] for (;;) { "
+             "InterlockedCompareExchange(tex_[at_], c_, %s, p_); if (p_ == c_) break; c_ = p_; } o_ = c_; }",
+             next);
+    } else {
+        const char* fn = nullptr;
+        switch (in.op) {
+        case OP_IMAGE_ATOMIC_SWAP:
+            fn = "InterlockedExchange";
+            break;
+        case OP_IMAGE_ATOMIC_ADD:
+            fn = "InterlockedAdd";
+            break;
+        case OP_IMAGE_ATOMIC_SUB:
+            fn = "InterlockedAdd";
+            value = fmt(t, "(%s)0 - %s", type, value);
+            break;
+        case OP_IMAGE_ATOMIC_SMIN:
+        case OP_IMAGE_ATOMIC_UMIN:
+            fn = "InterlockedMin";
+            break;
+        case OP_IMAGE_ATOMIC_SMAX:
+        case OP_IMAGE_ATOMIC_UMAX:
+            fn = "InterlockedMax";
+            break;
+        case OP_IMAGE_ATOMIC_AND:
+            fn = "InterlockedAnd";
+            break;
+        case OP_IMAGE_ATOMIC_OR:
+            fn = "InterlockedOr";
+            break;
+        case OP_IMAGE_ATOMIC_XOR:
+            fn = "InterlockedXor";
+            break;
+        default:
+            translator_fail(t, "unsupported %s", rdna_op_name(in.op));
+            return false;
+        }
+        // The exchange always returns the old value.
+        if (returns || in.op == OP_IMAGE_ATOMIC_SWAP)
+            emit(t, "if (EXEC) %s(tex_[at_], %s, o_);", fn, value);
+        else
+            emit(t, "if (EXEC) %s(tex_[at_], %s);", fn, value);
+    }
+    if (returns) {
+        write_vgpr(t, in, data, "(uint)o_");
+        if (wide)
+            write_vgpr(t, in, data + 1, "(uint)((uint64_t)o_ >> 32)");
+    }
+    t.depth--;
+    emit(t, "}");
+    return true;
 }
 
 static bool emit_image(Translator& t, const RdnaInst& in) {
@@ -1522,14 +1635,7 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     ViewAccess access;
     if (!view_access(t, in, rsrc, form.store || is_image_atomic(in.op), sampled, &access))
         return false;
-    static const char* const k_rw[8] = {"RWTexture1D",
-                                        "RWTexture2D",
-                                        "RWTexture3D",
-                                        "RWTexture2DArray",
-                                        "RWTexture1DArray",
-                                        "RWTexture2DArray",
-                                        "",
-                                        ""};
+    const char* const* k_rw = k_rw_texture_types;
     if (access == VIEW_BY_SHADOW && !k_rw[m.dim][0])
         access = VIEW_READ_ONLY; // no read-write views of multisampled images
     // Loads and size queries work through either kind of view: with the shadow's kind deciding, both are
@@ -1538,6 +1644,8 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     bool resinfo = in.op == OP_IMAGE_GET_RESINFO;
     char resource[64];
     snprintf(resource, sizeof(resource), "%s >> 5", sgpr(t, rsrc));
+    if (is_image_atomic(in.op)) // always through a read-write view (see view_access)
+        return emit_image_atomic(t, in, addr, coord_at, coords, resource);
     emit(t, "{");
     t.depth++;
     if (by_shadow)

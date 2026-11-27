@@ -120,6 +120,11 @@ static void build_program(Worker& w, ShaderProgram* p) {
     if (!shader_translate(p->code, p->code_size, p->info, &t)) {
         LOG_W("gpu", "shader %016llx: translation failed: %s", (unsigned long long)p->key, t.error);
         dump(p, t.hlsl.data, t.error);
+    } else if (t.uses_int64_atomics && !gpu_int64_image_atomics()) {
+        // The pipeline would fail to create (or worse); the adapter's lack was logged at startup.
+        LOG_W("gpu", "shader %016llx: needs 64-bit atomics on typed views, which the adapter lacks",
+              (unsigned long long)p->key);
+        dump(p, t.hlsl.data, "needs 64-bit atomics on typed views");
     } else {
         DxcBuffer source = {t.hlsl.data, t.hlsl.length, DXC_CP_UTF8};
         const wchar_t* args[] = {L"-E",

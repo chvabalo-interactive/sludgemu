@@ -12,6 +12,7 @@ static ID3D12Device13* g_device = nullptr;
 static IDXGIFactory6* g_factory = nullptr;
 static IDXGIAdapter3* g_adapter = nullptr; // for memory budgets
 static INIT_ONCE g_init_once = INIT_ONCE_STATIC_INIT;
+static bool g_int64_image_atomics = false;
 
 void gpu_set_options(const GpuOptions& options) {
     g_options = options;
@@ -43,7 +44,22 @@ static bool check_features(ID3D12Device* device) {
         LOG_E("gpu", "adapter lacks mesh shaders");
         return false;
     }
+    // Optional: 64-bit atomics on typed views (console images of 64-bit texels), which translated
+    // programs reach through the descriptor heap; programs using them fail to build without both.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS9 o9 = {};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS11 o11 = {};
+    bool typed = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &o9, sizeof(o9))) &&
+                 o9.AtomicInt64OnTypedResourceSupported;
+    bool heap = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &o11, sizeof(o11))) &&
+                o11.AtomicInt64OnDescriptorHeapResourceSupported;
+    g_int64_image_atomics = typed && heap;
+    LOG_I("gpu", "64-bit atomics on typed views: %s, on descriptor heap views: %s", typed ? "yes" : "no",
+          heap ? "yes" : "no");
     return true;
+}
+
+bool gpu_int64_image_atomics() {
+    return g_int64_image_atomics;
 }
 
 static void CALLBACK on_debug_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
@@ -105,7 +121,8 @@ static void log_dred(ID3D12Device* device) {
             u32 done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
             if (done >= n->BreadcrumbCount)
                 continue;
-            LOG_E("gpu", "  list %p (%ls) on queue %p (%ls) stopped after %u of %u operations:", n->pCommandList,
+            LOG_E("gpu",
+                  "  list %p (%ls) on queue %p (%ls) stopped after %u of %u operations:", n->pCommandList,
                   n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"", n->pCommandQueue,
                   n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"", done, n->BreadcrumbCount);
             u32 from = done > 4 ? done - 4 : 0;
