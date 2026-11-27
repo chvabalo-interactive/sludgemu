@@ -31,8 +31,10 @@ u64 shader_compile_cost(u64 hlsl_bytes);
 
 // Whether a compile estimated at `cost` may start while compiles estimated at `in_flight` run. Urgent
 // ones always may; others while the sum fits the budget, or when no compile runs (one larger than the
-// whole budget would otherwise never start).
-bool shader_compile_admitted(u64 in_flight, u64 cost, u64 budget, bool urgent);
+// whole budget would otherwise never start), and only while the sum fits `commit_room`, the commit the
+// system can spare (a budget sized from the machine's memory doesn't know what other processes and the
+// title hold; running the system out of commit stops the title).
+bool shader_compile_admitted(u64 in_flight, u64 cost, u64 budget, u64 commit_room, bool urgent);
 
 // A job: a program to build, a program whose compile waited for memory, or a function to run.
 struct ShaderJob {
@@ -72,6 +74,7 @@ struct ShaderQueueState {
     u64 compile_cost;      // the cheapest such program's estimate
     u64 compile_in_flight; // the estimates of the compiles running
     u64 compile_budget;
+    u64 commit_room; // the commit the system can spare for compiles nothing waits for
 };
 
 enum ShaderPick : u32 {

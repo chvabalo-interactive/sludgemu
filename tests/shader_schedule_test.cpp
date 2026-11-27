@@ -34,6 +34,9 @@ static void test_schedule_for_machine() {
     CHECK(shader_schedule_for(8, GiB(256)).compile_budget == GiB(4));
 }
 
+// Commit enough for anything.
+#define ROOM (~0ull)
+
 static void test_compile_admission() {
     // The estimate grows with the HLSL; the largest program seen (4 MB of HLSL) took 987 MiB.
     CHECK(shader_compile_cost(0) > 0);
@@ -44,24 +47,33 @@ static void test_compile_admission() {
     u64 ordinary = shader_compile_cost(30000);
     u64 budget = GiB(1);
     // Nothing running: anything starts, even a compile larger than the whole budget.
-    CHECK(shader_compile_admitted(0, huge, MiB(512), false));
+    CHECK(shader_compile_admitted(0, huge, MiB(512), ROOM, false));
     // One of the largest running: another waits, ordinary ones fit next to it.
-    CHECK(!shader_compile_admitted(huge, large, budget, false));
-    CHECK(shader_compile_admitted(large, ordinary, budget, false));
-    CHECK(!shader_compile_admitted(large, large, budget, false));
+    CHECK(!shader_compile_admitted(huge, large, budget, ROOM, false));
+    CHECK(shader_compile_admitted(large, ordinary, budget, ROOM, false));
+    CHECK(!shader_compile_admitted(large, large, budget, ROOM, false));
     // On a 32 GiB machine the two largest run at once, not a third large one with them.
     u64 budget32 = shader_schedule_for(24, GiB(32)).compile_budget;
     u64 second = shader_compile_cost(3375245);
-    CHECK(shader_compile_admitted(huge, second, budget32, false));
-    CHECK(!shader_compile_admitted(huge + second, large, budget32, false));
-    CHECK(shader_compile_admitted(2 * large, large, budget32, false));
-    CHECK(!shader_compile_admitted(3 * large, large, budget32, false));
+    CHECK(shader_compile_admitted(huge, second, budget32, ROOM, false));
+    CHECK(!shader_compile_admitted(huge + second, large, budget32, ROOM, false));
+    CHECK(shader_compile_admitted(2 * large, large, budget32, ROOM, false));
+    CHECK(!shader_compile_admitted(3 * large, large, budget32, ROOM, false));
     // Up to the budget exactly.
-    CHECK(shader_compile_admitted(budget - ordinary, ordinary, budget, false));
-    CHECK(!shader_compile_admitted(budget - ordinary + 1, ordinary, budget, false));
+    CHECK(shader_compile_admitted(budget - ordinary, ordinary, budget, ROOM, false));
+    CHECK(!shader_compile_admitted(budget - ordinary + 1, ordinary, budget, ROOM, false));
     // Something waits for it: always.
-    CHECK(shader_compile_admitted(budget, huge, budget, true));
-    CHECK(shader_compile_admitted(4 * huge, huge, budget, true));
+    CHECK(shader_compile_admitted(budget, huge, budget, ROOM, true));
+    CHECK(shader_compile_admitted(4 * huge, huge, budget, ROOM, true));
+    // The system short of commit: compiles nothing waits for wait even when nothing compiles (a
+    // compile running the system out of commit stops the title), counting the running ones again.
+    CHECK(!shader_compile_admitted(0, huge, budget, huge - 1, false));
+    CHECK(shader_compile_admitted(0, huge, budget, huge, false));
+    CHECK(!shader_compile_admitted(ordinary, ordinary, budget, 2 * ordinary - 1, false));
+    CHECK(shader_compile_admitted(ordinary, ordinary, budget, 2 * ordinary, false));
+    CHECK(!shader_compile_admitted(0, ordinary, budget, 0, false));
+    // Something waits for it: whatever the commit.
+    CHECK(shader_compile_admitted(0, huge, budget, 0, true));
 }
 
 static ShaderJob job_with(uintptr_t id) {
@@ -131,6 +143,7 @@ static ShaderQueueState idle_queues() {
     memset(&s, 0, sizeof(s));
     s.background_slots = 2;
     s.compile_budget = GiB(1);
+    s.commit_room = ROOM;
     return s;
 }
 
@@ -160,6 +173,13 @@ static void test_pick() {
     s.compile_cost = GiB(3);
     CHECK(shader_pick(s) == PICK_NOTHING);
     s.compile_in_flight = 0;
+    CHECK(shader_pick(s) == PICK_COMPILE);
+    // Not while the system is short of commit, even with nothing compiling; queued jobs still run.
+    s.commit_room = GiB(3) - 1;
+    CHECK(shader_pick(s) == PICK_NOTHING);
+    s.background_queued = 1;
+    CHECK(shader_pick(s) == PICK_BACKGROUND);
+    s.commit_room = GiB(3);
     CHECK(shader_pick(s) == PICK_COMPILE);
     // No slot: still nothing, even for a compile that fits.
     s.background_running = 2;

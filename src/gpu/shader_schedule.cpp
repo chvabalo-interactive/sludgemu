@@ -41,8 +41,12 @@ u64 shader_compile_cost(u64 hlsl_bytes) {
     return COMPILE_BASE_BYTES + hlsl_bytes * COMPILE_BYTES_PER_BYTE;
 }
 
-bool shader_compile_admitted(u64 in_flight, u64 cost, u64 budget, bool urgent) {
-    return urgent || in_flight == 0 || in_flight + cost <= budget;
+bool shader_compile_admitted(u64 in_flight, u64 cost, u64 budget, u64 commit_room, bool urgent) {
+    if (urgent)
+        return true;
+    // The compiles running are counted against the room again, as most of what they will take is not
+    // committed yet: a compile grows to its peak over its run.
+    return in_flight + cost <= commit_room && (in_flight == 0 || in_flight + cost <= budget);
 }
 
 // --- the background queue ----------------------------------------------------------------------------
@@ -128,7 +132,7 @@ ShaderPick shader_pick(const ShaderQueueState& s) {
     if (s.background_running >= s.background_slots)
         return PICK_NOTHING;
     if (s.compile_waiting &&
-        shader_compile_admitted(s.compile_in_flight, s.compile_cost, s.compile_budget, false))
+        shader_compile_admitted(s.compile_in_flight, s.compile_cost, s.compile_budget, s.commit_room, false))
         return PICK_COMPILE;
     if (s.background_queued)
         return PICK_BACKGROUND;

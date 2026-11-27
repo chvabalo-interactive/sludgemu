@@ -9,6 +9,7 @@
 #include <dxcapi.h>
 
 #include "common/log.h"
+#include "core/memory.h"
 #include "generated/shader_translator_hash.h"
 #include "gpu/shader_schedule.h"
 #include "shader/rdna.h"
@@ -193,6 +194,19 @@ static void hurry(ShaderProgram* p) {
         WakeConditionVariable(&g_job_ready);
 }
 
+// Compiles nothing waits for take only commit the system can spare: beyond the reserve the title's own
+// memory stops at (core/memory.h), room for the title to grow, as a compile of one of the largest
+// programs takes a gigabyte and the title stops when the system runs short. All if Windows doesn't tell.
+#define COMPILE_COMMIT_HEADROOM GiB(2)
+
+static u64 commit_room() {
+    MEMORYSTATUSEX m = {sizeof(m)};
+    if (!GlobalMemoryStatusEx(&m))
+        return ~0ull;
+    u64 keep = MEM_COMMIT_RESERVE + COMPILE_COMMIT_HEADROOM;
+    return m.ullAvailPageFile > keep ? m.ullAvailPageFile - keep : 0;
+}
+
 static ShaderQueueState queue_state() {
     ShaderQueueState s;
     ShaderJob cheapest;
@@ -204,6 +218,7 @@ static ShaderQueueState queue_state() {
     s.compile_cost = s.compile_waiting ? cheapest.program->compile_cost : 0;
     s.compile_in_flight = g_compile_in_flight;
     s.compile_budget = g_schedule.compile_budget;
+    s.commit_room = s.compile_waiting ? commit_room() : 0;
     return s;
 }
 
@@ -524,10 +539,12 @@ static void build_program(Worker& w, ShaderProgram* p, bool urgent) {
         return;
     }
     u64 cost = shader_compile_cost(t.hlsl.length);
+    u64 room = urgent ? 0 : commit_room();
     TranslatedShader* aside = nullptr;
     AcquireSRWLockExclusive(&g_job_lock);
-    bool admitted =
-        shader_compile_admitted(g_compile_in_flight, cost, g_schedule.compile_budget, urgent || p->urgent);
+    bool admitted = shader_compile_admitted(g_compile_in_flight, cost, g_schedule.compile_budget, room,
+                                            urgent || p->urgent);
+    bool short_of_commit = !admitted && g_compile_in_flight + cost > room;
     if (!admitted) {
         aside = (TranslatedShader*)malloc(sizeof(TranslatedShader));
         // Out of memory or the heap full (more programs than it holds can't be): compiled now.
@@ -551,6 +568,11 @@ static void build_program(Worker& w, ShaderProgram* p, bool urgent) {
     if (admitted) {
         compile_and_finish(w, p, t, cost);
     } else {
+        if (short_of_commit)
+            LOG_W_ONCE("gpu",
+                       "shader compiles nothing waits for wait: the system has little commit left (%llu MiB "
+                       "to spare)",
+                       (unsigned long long)(room >> 20));
         WakeByAddressAll((void*)&p->state);
     }
 }
@@ -587,8 +609,10 @@ static DWORD WINAPI worker_main(void* param) {
         ShaderJob job;
         AcquireSRWLockExclusive(&g_job_lock);
         ShaderPick pick;
+        // Compiles waiting for memory are looked at again now and then: commit other processes and
+        // the title give back wakes no one.
         while ((pick = take_job(&job)) == PICK_NOTHING)
-            SleepConditionVariableSRW(&g_job_ready, &g_job_lock, INFINITE, 0);
+            SleepConditionVariableSRW(&g_job_ready, &g_job_lock, g_compiles.count ? 500 : INFINITE, 0);
         bool background = pick != PICK_URGENT;
         g_active++;
         if (background)
