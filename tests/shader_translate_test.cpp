@@ -724,7 +724,8 @@ static void test_descriptor_values() {
     }
     {
         // A descriptor picked per lane: the address is the table's plus a scaled index, with a high
-        // dword of zero (heaps are below 4 GiB), read from the shadow lane by lane.
+        // dword of zero (heaps are below 4 GiB), read from the shadow lane by lane. The write may take
+        // every lane, so lanes outside EXEC read the first record (the shadow has no bounds).
         Asm a = {};
         a.vop2(VOP2_LSHLREV_B32, 2, ZERO + 5, 0);
         a.vop1(VOP1_MOV_B32, 3, ZERO);
@@ -732,7 +733,7 @@ static void test_descriptor_values() {
         a.global_load(GLOBAL_LOAD_DWORD, 4, 2, 8);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("v4 = g_descriptor_info.Load(v2 + 0x8u);"));
+        CHECK(hlsl_has("v4 = g_descriptor_info.Load((EXEC ? v2 + 0x8u : 0u));"));
     }
     {
         // The second half of a slot is an image descriptor's dwords 4-7.
@@ -813,7 +814,7 @@ static void test_descriptor_values() {
         a.global_load(GLOBAL_LOAD_DWORDX2, 2, 2, 4);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("{ uint a_ = v2 + 0x4u;"));
+        CHECK(hlsl_has("{ uint a_ = (EXEC ? v2 + 0x4u : 0u);"));
         CHECK(hlsl_has("v3 = g_descriptor_info.Load2(a_).y;"));
     }
     {

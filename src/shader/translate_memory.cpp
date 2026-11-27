@@ -2330,7 +2330,13 @@ static bool emit_heap_global_load(Translator& t, const RdnaInst& in, const char*
         return false;
     }
     t.needs_descriptor_info = true;
-    write_global_loaded(t, in, "g_descriptor_info", fmt(t, "%s + 0x%xu", address, (u32)in.mem.offset));
+    const char* load_address = fmt(t, "%s + 0x%xu", address, (u32)in.mem.offset);
+    // Compute programs may run the load in lanes outside EXEC too (see write_vgpr), whose address
+    // registers hold anything, and the shadow, a root descriptor, has no bounds: they read the first
+    // record instead.
+    if (t.exact)
+        load_address = fmt(t, "(%s ? %s : 0u)", exec_cond(t), load_address);
+    write_global_loaded(t, in, "g_descriptor_info", load_address);
     return true;
 }
 
