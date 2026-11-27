@@ -103,6 +103,9 @@ static bool reserved_texture_supported(const D3D12_RESOURCE_DESC1& desc) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
         gpu_device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
         tier = o.TiledResourcesTier;
+        if (tier < D3D12_TILED_RESOURCES_TIER_2)
+            LOG_W("d3d12", "the GPU's tiled resources tier is below 2: textures are created whole, and "
+                           "shaders that clamp the sampled LOD don't build");
     }
     // Tier 2 reads zeros from tiles without memory and drops writes to them, which uploads rely on.
     if (tier < D3D12_TILED_RESOURCES_TIER_2 || desc.SampleDesc.Count != 1 || (u32)desc.Format >= 256)

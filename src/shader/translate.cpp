@@ -2,6 +2,7 @@
 
 #include "shader/translate.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -624,6 +625,28 @@ bool copies_tags(const Translator& t, const TagState& s, const RdnaInst& in, u32
     }
 }
 
+// The value of a float operand known at translation time (literals, inline constants, SGPRs and
+// VGPRs holding constants), without modifiers.
+static bool float_constant(const TagState& s, const RdnaOperand& o, f32* value) {
+    u32 bits;
+    if (o.abs || o.neg || !eval_const_u32(s, o, TYPE_32, 0, &bits))
+        return false;
+    memcpy(value, &bits, sizeof(bits));
+    return true;
+}
+
+// Cube array faces are index * 8 + face. A variable index is folded in by a multiply-add with 8.0; a
+// constant one by adding index * 8 (0 included: the compiler keeps the add).
+static bool cube_index_scale(const TagState& s, const RdnaOperand& o) {
+    f32 v;
+    return float_constant(s, o, &v) && v == 8.0f;
+}
+
+static bool cube_index_offset(const TagState& s, const RdnaOperand& o) {
+    f32 v;
+    return float_constant(s, o, &v) && v >= 0.0f && v < 16777216.0f && v == 8.0f * floorf(v / 8.0f);
+}
+
 void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx) {
     // A three-XOR swap moves tags and constants as a whole; folding its steps one by one would undo it.
     bool swap = inst_idx != ~0u && t.xor_swap_role && t.xor_swap_role[inst_idx] != 0;
@@ -700,6 +723,36 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
             set_tag(s, in.dst[0], 0, make_tag(TAG_MASK, 0));
         if (raw && eval_const_u32(s, in.src[0], TYPE_32, 0, &cv))
             set_any_constant(s, in.dst[0], 0, cv);
+        return;
+    }
+    case OP_V_CUBEID_F32:
+        clear_spill(t, s, in.dst[0], 0);
+        set_tag(s, in.dst[0], 0, make_tag(TAG_CUBE_FACE, 0));
+        set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
+        return;
+    case OP_V_FMAC_F32:
+    case OP_V_MAC_F32:
+    case OP_V_FMA_F32:
+    case OP_V_MAD_F32:
+    case OP_V_FMAMK_F32:
+    case OP_V_MADMK_F32: {
+        // index * 8 + face: the face of a cube in a cube array, as cube sampling takes it.
+        bool accumulate = in.op == OP_V_FMAC_F32 || in.op == OP_V_MAC_F32;
+        Tag addend = accumulate ? tag_of(s, in.dst[0]) : tag_of(s, in.src[2]);
+        bool cube = tag_kind(addend) == TAG_CUBE_FACE &&
+                    (cube_index_scale(s, in.src[0]) || cube_index_scale(s, in.src[1]));
+        clear_spill(t, s, in.dst[0], 0);
+        set_tag(s, in.dst[0], 0, cube ? make_tag(TAG_CUBE_FACE, 1) : TAG_NONE);
+        set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
+        return;
+    }
+    case OP_V_ADD_F32: {
+        // Constant index * 8 + face (see cube_index_offset).
+        bool cube = (tag_kind(tag_of(s, in.src[0])) == TAG_CUBE_FACE && cube_index_offset(s, in.src[1])) ||
+                    (tag_kind(tag_of(s, in.src[1])) == TAG_CUBE_FACE && cube_index_offset(s, in.src[0]));
+        clear_spill(t, s, in.dst[0], 0);
+        set_tag(s, in.dst[0], 0, cube ? make_tag(TAG_CUBE_FACE, 1) : TAG_NONE);
+        set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
         return;
     }
     case OP_V_SWAP_B32: {
@@ -844,7 +897,9 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
                     in.op == OP_S_AND_B32 || in.op == OP_S_OR_B32 ? make_tag(TAG_MASK, 0) : TAG_NONE);
             return;
         }
-        set_tag(s, in.dst[0], 0, carried(a, b));
+        // Cube faces are floats: integer arithmetic on them makes something else.
+        set_tag(s, in.dst[0], 0,
+                tag_kind(a) == TAG_CUBE_FACE || tag_kind(b) == TAG_CUBE_FACE ? TAG_NONE : carried(a, b));
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
         // Scalar results are folded in tags_transfer; vector ones here (texel offsets are built so).
         u32 va = 0, vb = 0;

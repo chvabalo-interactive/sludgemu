@@ -552,6 +552,8 @@ static void note_view_mips(ConsoleResource* r, const D3D12_SHADER_RESOURCE_VIEW_
         mip = d.Texture2D.MostDetailedMip;
     else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
         mip = d.Texture2DArray.MostDetailedMip;
+    else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) // cube views too (srv_cube_as_array)
+        mip = d.TextureCubeArray.MostDetailedMip;
     else
         return;
     // Views of one texture are made by one thread at a time in practice; a lost update only leaves a
@@ -564,6 +566,41 @@ static void note_view_mips(ConsoleResource* r, const D3D12_SHADER_RESOURCE_VIEW_
     }
 }
 
+// Console shaders read cube and cube array views with the same cube instructions, so the translator
+// declares every cube resource a TextureCubeArray: cube views become cube arrays of one cube. Applied
+// where a description comes in, so null views written for it later have the array dimension too.
+static void srv_cube_as_array(D3D12_SHADER_RESOURCE_VIEW_DESC* d) {
+    if (d->ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE)
+        return;
+    D3D12_TEXCUBE_SRV cube = d->TextureCube; // the union's fields differ from the third on
+    d->ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+    d->TextureCubeArray.MostDetailedMip = cube.MostDetailedMip;
+    d->TextureCubeArray.MipLevels = cube.MipLevels;
+    d->TextureCubeArray.First2DArrayFace = 0;
+    d->TextureCubeArray.NumCubes = 1;
+    d->TextureCubeArray.ResourceMinLODClamp = cube.ResourceMinLODClamp;
+}
+
+// Desktop removes the device for a cube view its texture can't take: it must be a square 2D texture
+// with the faces and mips the view names.
+static bool cube_view_ok(const ConsoleResource* r, ID3D12Resource* desktop,
+                         const D3D12_SHADER_RESOURCE_VIEW_DESC& d) {
+    D3D12_RESOURCE_DESC t = desktop->GetDesc();
+    const D3D12_TEXCUBE_ARRAY_SRV& v = d.TextureCubeArray;
+    u64 faces = (u64)v.First2DArrayFace + 6ull * v.NumCubes;
+    bool ok = t.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && t.SampleDesc.Count == 1 &&
+              t.Width == t.Height && v.NumCubes != 0 && faces <= t.DepthOrArraySize &&
+              v.MostDetailedMip < t.MipLevels &&
+              (v.MipLevels == (UINT)-1 || (u64)v.MostDetailedMip + v.MipLevels <= t.MipLevels);
+    if (!ok)
+        LOG_W_ONCE("d3d12",
+                   "cube view (faces %u + 6 x %u, mips %u + %u) of a texture of dimension %d, %llux%u, %u "
+                   "slices, %u mips, %u samples (format %d): writing null views",
+                   v.First2DArrayFace, v.NumCubes, v.MostDetailedMip, v.MipLevels, t.Dimension, t.Width,
+                   t.Height, t.DepthOrArraySize, t.MipLevels, t.SampleDesc.Count, r->desc.Format);
+    return ok;
+}
+
 static ID3D12Resource* texture_srv(ConsoleDevice* self, const ConsoleResource* r,
                                    D3D12_SHADER_RESOURCE_VIEW_DESC* d) {
     if (r && r->first_mip && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
@@ -574,6 +611,8 @@ static ID3D12Resource* texture_srv(ConsoleDevice* self, const ConsoleResource* r
     }
     ID3D12Resource* desktop = texture_view_target(r);
     if (desktop && !texture_plane_ok(self->desktop, r, desktop, srv_plane(*d), d->Format))
+        desktop = nullptr;
+    if (desktop && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY && !cube_view_ok(r, desktop, *d))
         desktop = nullptr;
     if (!desktop || !texture_view_format(r, d->Format, true, &d->Format)) {
         *d = null_srv(d->ViewDimension);
@@ -607,6 +646,7 @@ void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resour
         if (!r && !desc)
             return; // the console API requires one or the other
         d = desc ? *desc : whole_texture_srv(r->desc);
+        srv_cube_as_array(&d);
         desktop = texture_srv(self, r, &d);
     }
     self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
@@ -801,6 +841,7 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
     if (!resource_desc || !desc || !console_descriptor_slots(dest.ptr, 1, &slot))
         return;
     D3D12_SHADER_RESOURCE_VIEW_DESC d = desc->view;
+    srv_cube_as_array(&d);
     ID3D12Resource* desktop = nullptr;
     ConsoleResource* texture = nullptr;
     u32 bits[4] = {};

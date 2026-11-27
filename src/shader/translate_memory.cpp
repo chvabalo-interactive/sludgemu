@@ -1328,9 +1328,11 @@ static ImageForm image_form(RdnaOp op) {
     return f;
 }
 
-static const char* const k_texture_types[8] = {"Texture1D",   "Texture2D",       "Texture3D",
-                                               "TextureCube", "Texture1DArray",  "Texture2DArray",
-                                               "Texture2DMS", "Texture2DMSArray"};
+// Every cube view is a cube array on desktop (the runtime makes TEXTURECUBE views TEXTURECUBEARRAY):
+// console shaders read either kind through one cube instruction. Cube gradients are face-space 2D.
+static const char* const k_texture_types[8] = {"Texture1D",        "Texture2D",       "Texture3D",
+                                               "TextureCubeArray", "Texture1DArray",  "Texture2DArray",
+                                               "Texture2DMS",      "Texture2DMSArray"};
 // Read-write views by dimension: a cube's is an array of its faces; multisampled images have none.
 static const char* const k_rw_texture_types[8] = {"RWTexture1D",
                                                   "RWTexture2D",
@@ -1341,7 +1343,7 @@ static const char* const k_rw_texture_types[8] = {"RWTexture1D",
                                                   "",
                                                   ""};
 static const u8 k_dim_coords[8] = {1, 2, 3, 3, 2, 3, 2, 3};
-static const u8 k_dim_grads[8] = {1, 2, 3, 3, 1, 2, 2, 2};
+static const u8 k_dim_grads[8] = {1, 2, 3, 2, 1, 2, 2, 2};
 
 // Image address registers. With 16-bit addresses, components after the first `unpacked` share
 // registers two by two (low half first); the unpacked ones keep a whole register each, and the bias
@@ -1396,13 +1398,19 @@ static bool emit_image_size(Translator& t, const RdnaInst& in, bool read_write) 
             emit(t, "tex_.GetDimensions(%s, w_, l_);", mip);
         return true;
     case DIM_2D:
-    case DIM_CUBE:
-        if (read_write && in.mem.dim == DIM_CUBE)
-            emit(t, "tex_.GetDimensions(w_, h_, d_); d_ = 1u;"); // a cube's read-write view is an array
-        else if (read_write)
+        if (read_write)
             emit(t, "tex_.GetDimensions(w_, h_);");
         else
             emit(t, "tex_.GetDimensions(%s, w_, h_, l_);", mip);
+        return true;
+    case DIM_CUBE:
+        if (read_write) {
+            emit(t, "tex_.GetDimensions(w_, h_, d_); d_ = 1u;"); // a cube's read-write view is an array
+        } else {
+            // Desktop counts cubes; the hardware counts faces, one per slice as for 2D arrays.
+            emit(t, "tex_.GetDimensions(%s, w_, h_, d_, l_);", mip);
+            emit(t, "d_ *= 6u;");
+        }
         return true;
     case DIM_3D:
     case DIM_2D_ARRAY:
@@ -1635,6 +1643,13 @@ static bool emit_image_atomic(Translator& t, const RdnaInst& in, const ImageAddr
     return true;
 }
 
+// Cube coordinates (s, t, face from `first` on) as the desktop direction and cube index in c_ (see
+// cube_coord in the preamble).
+static void emit_cube_coord(Translator& t, const ImageAddress& a, u32 first) {
+    emit(t, "float4 c_ = cube_coord(%s, %s, %s);", address_value(t, a, (s32)first),
+         address_value(t, a, (s32)first + 1), address_value(t, a, (s32)first + 2));
+}
+
 static bool emit_image(Translator& t, const RdnaInst& in) {
     const RdnaMemory& m = in.mem;
     ImageForm form = image_form(in.op);
@@ -1646,8 +1661,9 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         translator_fail(t, "%s with residency feedback at 0x%x", rdna_op_name(in.op), in.offset);
         return false;
     }
-    if (m.dim == DIM_CUBE && (form.sample || form.gather)) {
-        translator_fail(t, "cube sampling at 0x%x", in.offset);
+    // Desktop cube sampling takes no texel offsets (no title uses them).
+    if (m.dim == DIM_CUBE && form.offset) {
+        translator_fail(t, "%s at 0x%x: cube sampling with texel offsets", rdna_op_name(in.op), in.offset);
         return false;
     }
     u32 rsrc = in.src[1].reg;
@@ -1721,6 +1737,17 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         translator_fail(t, "%s at 0x%x: address layout mismatch", rdna_op_name(in.op), in.offset);
         return false;
     }
+    // Cube arrays can be sampled with the 2D array dimension, the layer being cube index * 8 + face. A
+    // Texture2DArray reading a cube array view would be wrong twice over; only a v_cubeid face with an
+    // index folded in says so for certain (a bare face may be a layer of a real 2D array).
+    if (m.dim == DIM_2D_ARRAY && !m.a16 && (form.sample || form.gather || in.op == OP_IMAGE_GET_LOD)) {
+        Tag layer = t.tags.vgpr[addr.regs[coord_at + 2] & 255];
+        if (tag_kind(layer) == TAG_CUBE_FACE && tag_payload(layer) == 1) {
+            translator_fail(t, "%s at 0x%x: cube array sampling through the 2D array dimension",
+                            rdna_op_name(in.op), in.offset);
+            return false;
+        }
+    }
     // Texel offsets: 6-bit signed fields at bits 0, 8 and 16 of a register whose value is known. Kept
     // out of the scratch ring (", offsets" or empty), since many expressions are formatted after it.
     char offset_arg[48] = {};
@@ -1756,6 +1783,13 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         return false;
     if (access == VIEW_BY_SHADOW && !k_rw_texture_types[m.dim][0])
         access = VIEW_READ_ONLY; // no read-write views of multisampled images
+    if (m.dim == DIM_CUBE && form.load && access != VIEW_READ_WRITE) {
+        // Cube views (see k_texture_types) take no texel loads on desktop, so neither can a slot whose
+        // view the shadow decides.
+        translator_fail(t, "%s at 0x%x: image load from a cube view%s", rdna_op_name(in.op), in.offset,
+                        access == VIEW_BY_SHADOW ? " (or a view of a kind the program doesn't say)" : "");
+        return false;
+    }
     // Loads and size queries work through either kind of view: with the shadow's kind deciding, both are
     // emitted, and the results are written after.
     bool by_shadow = access == VIEW_BY_SHADOW;
@@ -1787,7 +1821,15 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         } else if (form.sample || form.gather) {
             if (!emit_sampler(t, in, form.compare))
                 return false;
-            const char* uv = address_vector(t, addr, true, coord_at, coords);
+            const char* uv;
+            if (m.dim == DIM_CUBE) {
+                emit_cube_coord(t, addr, coord_at);
+                uv = "c_";
+            } else {
+                uv = address_vector(t, addr, true, coord_at, coords);
+            }
+            // The clamp forms take an offset argument before the clamp, except on cubes (which have none).
+            const char* clamp_offset = m.dim == DIM_CUBE ? "" : form.offset ? offset_arg : ", 0";
             bool implicit_lod_ok = implicit_lod_usable(t);
             if (form.gather) {
                 static const char* const k_gather[4] = {"GatherRed", "GatherGreen", "GatherBlue",
@@ -1821,17 +1863,33 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
             } else if (form.lod) {
                 value = fmt(t, "tex_.SampleLevel(smp_, %s, %s%s)", uv, address_value(t, addr, lod_at),
                             offset_arg);
-            } else if (form.bias && !form.clamp) {
-                value = fmt(t, "tex_.SampleBias(smp_, %s, %s%s)", uv, address_value(t, addr, bias_at),
-                            offset_arg);
-            } else if (form.grad && !form.clamp) {
-                const char* ddx = address_vector(t, addr, true, (u32)grad_at, grads);
-                const char* ddy = address_vector(t, addr, true, (u32)grad_at + grads, grads);
-                value = fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s%s)", uv, ddx, ddy, offset_arg);
-            } else if (!form.bias && !form.grad) {
-                // The clamp form takes an offset argument either way.
-                value = form.clamp ? fmt(t, "tex_.Sample(smp_, %s, %s, %s)", uv,
-                                         form.offset ? offset_arg + 2 : "0", address_value(t, addr, clamp_at))
+            } else if (form.bias) {
+                const char* bias = address_value(t, addr, bias_at);
+                value = form.clamp ? fmt(t, "tex_.SampleBias(smp_, %s, %s%s, %s)", uv, bias, clamp_offset,
+                                         address_value(t, addr, clamp_at))
+                                   : fmt(t, "tex_.SampleBias(smp_, %s, %s%s)", uv, bias, offset_arg);
+            } else if (form.grad) {
+                const char* ddx;
+                const char* ddy;
+                if (m.dim == DIM_CUBE) {
+                    // Face-space gradients (ds, dt per screen axis) lie in the face's plane of the direction.
+                    const char* face = address_value(t, addr, (s32)coord_at + 2);
+                    emit(t, "float3 dx_ = cube_grad(%s, %s, %s);", face, address_value(t, addr, grad_at),
+                         address_value(t, addr, grad_at + 1));
+                    emit(t, "float3 dy_ = cube_grad(%s, %s, %s);", face, address_value(t, addr, grad_at + 2),
+                         address_value(t, addr, grad_at + 3));
+                    ddx = "dx_";
+                    ddy = "dy_";
+                } else {
+                    ddx = address_vector(t, addr, true, (u32)grad_at, grads);
+                    ddy = address_vector(t, addr, true, (u32)grad_at + grads, grads);
+                }
+                value = form.clamp ? fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s%s, %s)", uv, ddx, ddy,
+                                         clamp_offset, address_value(t, addr, clamp_at))
+                                   : fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s%s)", uv, ddx, ddy, offset_arg);
+            } else {
+                value = form.clamp ? fmt(t, "tex_.Sample(smp_, %s%s, %s)", uv, clamp_offset,
+                                         address_value(t, addr, clamp_at))
                                    : fmt(t, "tex_.Sample(smp_, %s%s)", uv, offset_arg);
             }
             if (!value) {
@@ -1873,7 +1931,13 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         } else if (in.op == OP_IMAGE_GET_LOD) {
             if (!emit_sampler(t, in, false))
                 return false;
-            const char* uv = address_vector(t, addr, true, coord_at, coords);
+            const char* uv;
+            if (m.dim == DIM_CUBE) {
+                emit_cube_coord(t, addr, coord_at);
+                uv = "c_.xyz";
+            } else {
+                uv = address_vector(t, addr, true, coord_at, coords);
+            }
             value = fmt(t,
                         "float4(tex_.CalculateLevelOfDetail(smp_, %s), "
                         "tex_.CalculateLevelOfDetailUnclamped(smp_, %s), "
