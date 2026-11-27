@@ -118,16 +118,18 @@ enum ViewAccess {
     VIEW_BY_SHADOW,
 };
 
-// What the program does through the descriptor in `reg` elsewhere, if it is at a known place.
-static u8 slot_flags(const Translator& t, const TagState& s, u32 reg) {
-    Tag tag = s.sgpr[reg & 127];
-    u16 index = s.descriptor[reg & 127];
-    if (index == NO_DESCRIPTOR)
+u8 slot_use(const Translator& t, Tag tag, u16 index) {
+    if (index == NO_DESCRIPTOR || !heap_loaded(tag) || (tag_payload(tag) & 1) != HEAP_RESOURCES)
         return 0;
     for (u32 i = 0; i < t.slot_use_count; i++)
         if (t.slot_uses[i].parameter == heap_parameter(tag) && t.slot_uses[i].index == index)
             return t.slot_uses[i].flags;
     return 0;
+}
+
+// What the program does through the descriptor in `reg` elsewhere, if it is at a known place.
+static u8 slot_flags(const Translator& t, const TagState& s, u32 reg) {
+    return slot_use(t, s.sgpr[reg & 127], s.descriptor[reg & 127]);
 }
 
 // The view for an access through the descriptor in `reg` that writes, samples or only reads: writing
@@ -192,7 +194,7 @@ static bool view_next(Translator& t, ViewPass& v) {
     return !t.failed;
 }
 
-// What an instruction does through its descriptor (SLOT_* flags), for find_slot_uses.
+// What an instruction does through its resource descriptor (SLOT_* flags), for find_slot_uses.
 static u8 access_flags(const RdnaInst& in);
 
 void find_slot_uses(Translator& t) {
@@ -1030,9 +1032,8 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
     }
     u32 vaddr = in.src[0].reg;
     u32 voffset_reg = vaddr + (in.mem.idxen ? 1 : 0);
-    const char* index = in.mem.idxen ? register_data(t, t.tags.vgpr[vaddr & 255], vgpr(t, vaddr)) : "0u";
-    const char* voffset =
-        in.mem.offen ? register_data(t, t.tags.vgpr[voffset_reg & 255], vgpr(t, voffset_reg)) : "0u";
+    const char* index = in.mem.idxen ? vgpr_data(t, vaddr) : "0u";
+    const char* voffset = in.mem.offen ? vgpr_data(t, voffset_reg) : "0u";
     const char* offset = fmt(t, "(%s + 0x%xu + %s)", voffset, (u32)in.mem.offset, soffset(t, in, 2));
 
     if (tag_kind(hi) == TAG_ROOT_HI) {
@@ -1123,8 +1124,7 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
             // (the shadow's copy of the slot's while it is unchanged).
             const char* stride = "0u";
             if (in.mem.idxen)
-                stride = fmt(t, "((%s >> 16) & 0x3fffu)",
-                             register_data(t, sgpr_tag(t, rsrc + 1), sgpr(t, rsrc + 1)));
+                stride = fmt(t, "((%s >> 16) & 0x3fffu)", sgpr_data(t, rsrc + 1));
             if (snprintf(address, sizeof(address), "uint a_ = %s * %s + %s;", index, stride, offset) >=
                 (int)sizeof(address))
                 translator_fail(t, "expression too long");
@@ -1336,16 +1336,16 @@ struct ImageAddress {
 // Component `i` as uint bits.
 static const char* address_bits(Translator& t, const ImageAddress& a, s32 i) {
     if (!a.a16 || (u32)i < a.unpacked)
-        return vgpr(t, a.regs[i]);
+        return vgpr_data(t, a.regs[i]);
     u32 j = (u32)i - a.unpacked;
-    const char* reg = vgpr(t, a.regs[a.unpacked + j / 2]);
+    const char* reg = vgpr_data(t, a.regs[a.unpacked + j / 2]);
     return j & 1 ? fmt(t, "(%s >> 16)", reg) : fmt(t, "(%s & 0xffffu)", reg);
 }
 
 // Component `i` as a float.
 static const char* address_value(Translator& t, const ImageAddress& a, s32 i) {
     if (a.a16 && i == a.half_at)
-        return fmt(t, "f16tof32(%s)", vgpr(t, a.regs[i]));
+        return fmt(t, "f16tof32(%s)", vgpr_data(t, a.regs[i]));
     if (!a.a16 || (u32)i < a.unpacked)
         return fmt(t, "asfloat(%s)", address_bits(t, a, i));
     return fmt(t, "f16tof32(%s)", address_bits(t, a, i));
@@ -1367,7 +1367,7 @@ static const char* address_vector(Translator& t, const ImageAddress& a, bool flo
 // An image size query (image_get_resinfo) into w_, h_, d_ and l_: read-only views have mips to ask
 // about, read-write views are of one mip.
 static bool emit_image_size(Translator& t, const RdnaInst& in, bool read_write) {
-    const char* mip = register_data(t, t.tags.vgpr[in.src[0].reg & 255], vgpr(t, in.src[0].reg));
+    const char* mip = vgpr_data(t, in.src[0].reg);
     switch (in.mem.dim) {
     case DIM_1D:
         if (read_write)
@@ -1699,8 +1699,8 @@ static u8 access_flags(const RdnaInst& in) {
         return 0;
     ImageForm form = image_form(in.op);
     if (form.store || is_image_atomic(in.op))
-        return SLOT_WRITTEN;
-    return form.sample || form.gather || in.op == OP_IMAGE_GET_LOD ? SLOT_SAMPLED : 0;
+        return SLOT_IMAGE | SLOT_WRITTEN;
+    return SLOT_IMAGE | (form.sample || form.gather || in.op == OP_IMAGE_GET_LOD ? SLOT_SAMPLED : 0);
 }
 
 // --- LDS ---------------------------------------------------------------------------------------------
@@ -1949,6 +1949,21 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
 
 // --- global memory -----------------------------------------------------------------------------------
 
+// A global load from `buffer` at the byte address `address`. Results are written a register at a time, and
+// the address may be in those registers: with more than one, it is taken first.
+static void write_global_loaded(Translator& t, const RdnaInst& in, const char* buffer, const char* address) {
+    u32 dwords = in.dst[0].count;
+    if (dwords == 1) {
+        write_loaded(t, in, 1, fmt(t, "%s.Load(%s)", buffer, address));
+        return;
+    }
+    emit(t, "{ uint a_ = %s;", address);
+    t.depth++;
+    write_loaded(t, in, dwords, fmt(t, "%s.%s(a_)", buffer, k_load_fn[dwords]));
+    t.depth--;
+    emit(t, "}");
+}
+
 // Descriptor heap memory read as data (programs read fields of descriptors they pick per lane): from the
 // descriptor shadow, which holds dwords 0-3 of each slot. The address is a heap address (a table's or
 // the heap's base plus an index scaled by the slot size, which translated code holds as a desktop heap
@@ -1967,8 +1982,7 @@ static bool emit_heap_global_load(Translator& t, const RdnaInst& in, const char*
         return false;
     }
     t.needs_descriptor_info = true;
-    write_loaded(t, in, dwords,
-                 fmt(t, "g_descriptor_info.%s(%s + 0x%xu)", k_load_fn[dwords], address, (u32)in.mem.offset));
+    write_global_loaded(t, in, "g_descriptor_info", fmt(t, "%s + 0x%xu", address, (u32)in.mem.offset));
     return true;
 }
 
@@ -1984,7 +1998,7 @@ static bool emit_global(Translator& t, const RdnaInst& in) {
             base = fmt(t, "(%s + %s)", sgpr(t, saddr.reg), vgpr(t, in.src[0].reg));
         } else if (tag_kind(lo) == TAG_HEAP && !heap_loaded(lo) && (tag_payload(lo) & 1) == HEAP_RESOURCES &&
                    sgpr_constant(t.tags, saddr.reg + 1, &hi_value) && hi_value == 0) {
-            const char* offset = register_data(t, t.tags.vgpr[in.src[0].reg & 255], vgpr(t, in.src[0].reg));
+            const char* offset = vgpr_data(t, in.src[0].reg);
             return emit_heap_global_load(t, in, fmt(t, "%s + %s", sgpr(t, saddr.reg), offset));
         }
     } else {
@@ -2003,17 +2017,43 @@ static bool emit_global(Translator& t, const RdnaInst& in) {
         return false;
     }
     t.root_used |= 1ull << parameter;
-    u32 dwords = in.dst[0].count;
     const char* a = fmt(t, "(%s + 0x%xu)", base, (u32)in.mem.offset);
     if (in.op >= OP_GLOBAL_LOAD_DWORD && in.op <= OP_GLOBAL_LOAD_DWORDX3) {
-        write_loaded(t, in, dwords, fmt(t, "g_root%u.%s(%s)", parameter, k_load_fn[dwords], a));
+        write_global_loaded(t, in, fmt(t, "g_root%u", parameter), a);
         return true;
     }
     translator_fail(t, "unsupported %s", rdna_op_name(in.op));
     return false;
 }
 
+// Stores and atomics write their data registers as translated code holds them: a loaded descriptor
+// dword's heap address would reach memory in place of the dword. None seen; fail where one would.
+static bool check_stored_registers(Translator& t, const RdnaInst& in, const RdnaOperand& o) {
+    if (o.kind != OPND_VGPR)
+        return true;
+    for (u32 i = 0; i < (o.count ? o.count : 1u); i++) {
+        if (heap_loaded(t.tags.vgpr[(o.reg + i) & 255])) {
+            translator_fail(t, "%s at 0x%x stores a descriptor dword", rdna_op_name(in.op), in.offset);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool stores_data(const RdnaInst& in) {
+    if (in.enc == ENC_MUBUF || in.enc == ENC_MTBUF)
+        return is_store(in.op) || is_buffer_atomic(in.op);
+    if (in.enc == ENC_MIMG)
+        return image_form(in.op).store || is_image_atomic(in.op);
+    return false;
+}
+
 bool emit_memory(Translator& t, const RdnaInst& in) {
+    if (stores_data(in) && !check_stored_registers(t, in, in.dst[0]))
+        return false;
+    if (in.enc == ENC_DS &&
+        !(check_stored_registers(t, in, in.src[1]) && check_stored_registers(t, in, in.src[2])))
+        return false;
     switch (in.enc) {
     case ENC_SMEM:
         return emit_scalar_memory(t, in);

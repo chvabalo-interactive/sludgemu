@@ -451,12 +451,20 @@ bool join_converts(Tag tag) {
     return heap_loaded(tag) && (tag_payload(tag) & (1 | HEAP_MODIFIED | HEAP_IMAGE)) == HEAP_RESOURCES;
 }
 
+// Whether two tags don't name different tables (or heaps), which would make their slot indices
+// incomparable.
+static bool same_table(Tag a, Tag b) {
+    if (tag_kind(a) != TAG_HEAP || tag_kind(b) != TAG_HEAP)
+        return true;
+    return ((tag_payload(a) ^ tag_payload(b)) & 1) == 0 && heap_parameter(a) == heap_parameter(b);
+}
+
 // A register's tag where two paths join (or where an instruction leaves either of two values): what both
 // agree on, or nothing. Loaded descriptor dwords are held as heap addresses, which must not pass for
-// values: a loaded dword on both paths stays one (of a table not known when they differ). On one path
-// only, a scalar register at a join of blocks becomes a value (`converting`: the path holding the
-// address reads the dword from the shadow at the jump, see emit_join_conversions); otherwise it is
-// marked HEAP_MODIFIED, which nothing can use.
+// values: a loaded dword on both paths stays one, of its table (of a table not known, 0x3F, where the
+// paths' tables differ). On one path only, a scalar register at a join of blocks becomes a value
+// (`converting`: the path holding the address reads the dword from the shadow at the jump, see
+// emit_join_conversions); otherwise it is marked HEAP_MODIFIED, which nothing can use.
 //
 // A dword that can't be converted (one the shadow doesn't hold, an image's or a sampler's, or one
 // already an address on some paths only) joins as a value all the same, holding its heap address on
@@ -472,7 +480,10 @@ static Tag merged_tag(Tag a, Tag b, bool converting = false) {
     if (converting && la != lb)
         return TAG_NONE;
     u32 pa = la ? tag_payload(a) : 0, pb = lb ? tag_payload(b) : 0;
-    u32 payload = ((pa | pb) & 1) | (0x3F << 1) | HEAP_LOADED | ((pa | pb) & (HEAP_MODIFIED | HEAP_IMAGE));
+    u32 parameter = la ? heap_parameter(a) : heap_parameter(b);
+    if (la && lb && !same_table(a, b))
+        parameter = 0x3F;
+    u32 payload = ((pa | pb) & 1) | parameter << 1 | HEAP_LOADED | ((pa | pb) & (HEAP_MODIFIED | HEAP_IMAGE));
     if (!la || !lb || ((pa ^ pb) & 1))
         payload |= HEAP_MODIFIED;
     return make_tag(TAG_HEAP, payload);
@@ -485,8 +496,10 @@ static void conditional_move(TagState& s, const RdnaOperand& dst, u32 part, Tag 
     u32 old_value = 0;
     bool old_known = constant_of(s, dst, part, &old_value);
     u32 old_descriptor = descriptor_of(s, dst, part);
-    set_tag(s, dst, part, merged_tag(tag_of(s, dst, part), tag));
-    set_descriptor(s, dst, part, old_descriptor == descriptor ? descriptor : NO_DESCRIPTOR);
+    Tag old_tag = tag_of(s, dst, part);
+    set_tag(s, dst, part, merged_tag(old_tag, tag));
+    set_descriptor(s, dst, part,
+                   old_descriptor == descriptor && same_table(old_tag, tag) ? descriptor : NO_DESCRIPTOR);
     if (known && old_known && value == old_value)
         set_constant(s, dst, part, value);
 }
@@ -613,6 +626,24 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     case OP_S_CMOVK_I32:
         conditional_move(s, in.dst[0], 0, TAG_NONE, NO_DESCRIPTOR, true, (u32)(s32)in.simm16);
         return;
+    case OP_S_CMPK_EQ_I32:
+    case OP_S_CMPK_LG_I32:
+    case OP_S_CMPK_GT_I32:
+    case OP_S_CMPK_GE_I32:
+    case OP_S_CMPK_LT_I32:
+    case OP_S_CMPK_LE_I32:
+    case OP_S_CMPK_EQ_U32:
+    case OP_S_CMPK_LG_U32:
+    case OP_S_CMPK_GT_U32:
+    case OP_S_CMPK_GE_U32:
+    case OP_S_CMPK_LT_U32:
+    case OP_S_CMPK_LE_U32:
+    case OP_S_SETREG_B32:
+    case OP_S_WAITCNT_VSCNT:
+    case OP_S_WAITCNT_VMCNT:
+    case OP_S_WAITCNT_EXPCNT:
+    case OP_S_WAITCNT_LGKMCNT:
+        return; // their register (decoded as the destination) is only read
     case OP_S_ADDK_I32: {
         // Adds to the register in place: a constant stays one, anything else is forgotten.
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
@@ -871,17 +902,19 @@ static bool tags_merge(const Translator& t, TagState& into, const TagState& from
         into.exec_version = joined;
         changed = true;
     }
+    // Slot indices first, while the tags still tell which table each is in.
+    for (u32 i = 0; i < 128; i++)
+        if ((into.descriptor[i] != from.descriptor[i] || !same_table(into.sgpr[i], from.sgpr[i])) &&
+            into.descriptor[i] != NO_DESCRIPTOR) {
+            into.descriptor[i] = NO_DESCRIPTOR;
+            changed = true;
+        }
     for (u32 i = 0; i < 128; i++)
         changed |= merge_tag(into.sgpr[i], from.sgpr[i], true);
     // Vector registers aren't converted: lanes outside EXEC may hold anything, the shadow has no room
     // for reads at stray addresses.
     for (u32 i = 0; i < 256; i++)
         changed |= merge_tag(into.vgpr[i], from.vgpr[i], false);
-    for (u32 i = 0; i < 128; i++)
-        if (into.descriptor[i] != from.descriptor[i] && into.descriptor[i] != NO_DESCRIPTOR) {
-            into.descriptor[i] = NO_DESCRIPTOR;
-            changed = true;
-        }
     // Constants survive a join only where both paths agree.
     for (u32 w = 0; w < 2; w++) {
         u64 keep = into.constant_known[w] & from.constant_known[w];
@@ -901,12 +934,13 @@ static bool tags_merge(const Translator& t, TagState& into, const TagState& from
         }
     for (u32 slot = 0; slot < t.spill_vgpr_count; slot++)
         for (u32 lane = 0; lane < 64; lane++) {
-            changed |= merge_tag(into.spill_tag[slot][lane], from.spill_tag[slot][lane], true);
-            if (into.spill_desc[slot][lane] != from.spill_desc[slot][lane] &&
+            if ((into.spill_desc[slot][lane] != from.spill_desc[slot][lane] ||
+                 !same_table(into.spill_tag[slot][lane], from.spill_tag[slot][lane])) &&
                 into.spill_desc[slot][lane] != NO_DESCRIPTOR) {
                 into.spill_desc[slot][lane] = NO_DESCRIPTOR;
                 changed = true;
             }
+            changed |= merge_tag(into.spill_tag[slot][lane], from.spill_tag[slot][lane], true);
         }
     return changed;
 }

@@ -107,7 +107,7 @@ static const char* operand_u32(Translator& t, const RdnaOperand& o, OperandType 
     }
 }
 
-const char* register_data(Translator& t, Tag tag, const char* raw) {
+const char* register_data(Translator& t, Tag tag, const char* raw, u16 descriptor, bool vector) {
     if (!heap_loaded(tag) || t.copying)
         return raw;
     u32 payload = tag_payload(tag);
@@ -116,23 +116,36 @@ const char* register_data(Translator& t, Tag tag, const char* raw) {
                         t.inst_offset);
     else if ((payload & 1) == HEAP_SAMPLERS)
         translator_fail(t, "sampler descriptor dword read as a value at 0x%x", t.inst_offset);
-    else if (payload & HEAP_IMAGE)
+    else if ((payload & HEAP_IMAGE) || (slot_use(t, tag, descriptor) & SLOT_IMAGE))
         translator_fail(t, "image descriptor dword read as a value at 0x%x (the shadow has buffers' only)",
                         t.inst_offset);
     // The shadow lays out each desktop slot's descriptor bits like console heap memory: the dword at
-    // heap byte address A is word A of it.
+    // heap byte address A is word A of it. Lanes outside EXEC may hold anything in a vector register,
+    // and the shadow, a root descriptor, has no bounds: they read the first record instead.
     t.needs_descriptor_info = true;
+    if (vector)
+        return fmt(t, "g_descriptor_info.Load(EXEC ? %s : 0u)", raw);
     return fmt(t, "g_descriptor_info.Load(%s)", raw);
 }
 
-// The tag of a register operand (dword `part`), TAG_NONE for anything else.
-static Tag operand_tag(const Translator& t, const RdnaOperand& o, u32 part) {
-    if (o.kind == OPND_SGPR ||
-        (o.kind == OPND_SPECIAL && o.reg + part >= SRC_VCC_LO && o.reg + part <= SRC_VCC_HI))
-        return t.tags.sgpr[(o.reg + part) & 127];
+const char* sgpr_data(Translator& t, u32 reg) {
+    return register_data(t, t.tags.sgpr[reg & 127], sgpr(t, reg), t.tags.descriptor[reg & 127], false);
+}
+
+const char* vgpr_data(Translator& t, u32 reg) {
+    return register_data(t, t.tags.vgpr[reg & 255], vgpr(t, reg), NO_DESCRIPTOR, true);
+}
+
+// A register operand (dword `part`) read as a value; `raw` for anything else. Scalar registers are the
+// ones tags_transfer tracks (tag_of): SGPRs, VCC, M0 and EXEC.
+static const char* operand_data(Translator& t, const RdnaOperand& o, u32 part, const char* raw) {
+    if (o.kind == OPND_SGPR || (o.kind == OPND_SPECIAL && o.reg < 128 && o.reg != SRC_NULL)) {
+        u32 reg = (o.reg + part) & 127;
+        return register_data(t, t.tags.sgpr[reg], raw, t.tags.descriptor[reg], false);
+    }
     if (o.kind == OPND_VGPR)
-        return t.tags.vgpr[(o.reg + part) & 255];
-    return TAG_NONE;
+        return register_data(t, t.tags.vgpr[(o.reg + part) & 255], raw, NO_DESCRIPTOR, true);
+    return raw;
 }
 
 const char* src_u32(Translator& t, const RdnaInst& in, u32 i, OperandType type, u32 part) {
@@ -141,7 +154,7 @@ const char* src_u32(Translator& t, const RdnaInst& in, u32 i, OperandType type, 
     const RdnaOperand& o = in.src[i];
     if (o.kind == OPND_SPECIAL && (o.reg == SRC_VCC_LO || o.reg == SRC_EXEC_LO))
         t.sgpr_used[o.reg] = 1;
-    const char* value = register_data(t, operand_tag(t, o, part), operand_u32(t, o, type, part));
+    const char* value = operand_data(t, o, part, operand_u32(t, o, type, part));
     if (in.has_sdwa && i < 2 && in.sdwa.src_sel[i] != SDWA_DWORD) {
         u32 sel = in.sdwa.src_sel[i];
         u32 shift = sel <= SDWA_BYTE_3 ? sel * 8 : (sel - SDWA_WORD_0) * 16;

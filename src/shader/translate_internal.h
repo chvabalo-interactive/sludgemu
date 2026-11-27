@@ -139,6 +139,7 @@ struct PcPool {
 enum : u8 {
     SLOT_WRITTEN = 1, // stores or atomics through it: it must be an unordered access view
     SLOT_SAMPLED = 2, // sampled through it: it must be a shader resource view
+    SLOT_IMAGE = 4,   // used as an image: the shadow holds none of its bits
 };
 
 struct SlotUse {
@@ -147,7 +148,7 @@ struct SlotUse {
     u16 index;
 };
 
-#define SHADER_MAX_SLOT_USES 64
+#define SHADER_MAX_SLOT_USES 256
 
 struct Translator {
     const ShaderInfo* info;
@@ -220,10 +221,16 @@ bool copies_tags(const Translator& t, const RdnaInst& in, u32 inst_idx);
 bool join_converts(Tag tag);
 // A register read as a value by the instruction being emitted: `raw` (its HLSL variable), or, for a
 // loaded descriptor dword (which translated code holds the heap address of), the dword from the
-// descriptor shadow. Fails translation where neither is the register's value.
-const char* register_data(Translator& t, Tag tag, const char* raw);
-// Records which descriptors at known places the program writes or samples through. translate_memory.cpp
+// descriptor shadow. Fails translation where neither is the register's value. `descriptor`: the
+// register's slot where known (see find_slot_uses); `vector`: a vector register, whose lanes outside
+// EXEC hold no address to read.
+const char* register_data(Translator& t, Tag tag, const char* raw, u16 descriptor, bool vector);
+const char* sgpr_data(Translator& t, u32 reg);
+const char* vgpr_data(Translator& t, u32 reg);
+// Records which descriptors at known places the program writes, samples or uses as images through, and
+// what it does through the one at `index` of the heap tag's table (SLOT_* flags). translate_memory.cpp
 void find_slot_uses(Translator& t);
+u8 slot_use(const Translator& t, Tag tag, u16 index);
 // A v_readlane/v_writelane lane operand known at translation time (a literal or inline integer), in the
 // wave's lane range.
 bool constant_lane(const Translator& t, const RdnaOperand& o, u32* lane);

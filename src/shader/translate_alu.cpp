@@ -12,7 +12,7 @@ static const char* src(Translator& t, const RdnaInst& in, u32 i, u32 part = 0) {
 
 // The destination register's old value, which accumulating and half-writing instructions read.
 static const char* dst_value(Translator& t, const RdnaInst& in) {
-    return register_data(t, t.tags.vgpr[in.dst[0].reg & 255], vgpr(t, in.dst[0].reg));
+    return vgpr_data(t, in.dst[0].reg);
 }
 
 static const char* src64(Translator& t, const RdnaInst& in, u32 i) {
@@ -264,11 +264,10 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
         break;
     case OP_S_ADDK_I32:
         emit(t, "{ uint a_ = %s, b_ = 0x%08xu, r_ = a_ + b_; scc = ((~(a_ ^ b_)) & (a_ ^ r_)) >> 31 != 0u;",
-             register_data(t, t.tags.sgpr[d.reg & 127], sgpr(t, d.reg)), (u32)in.simm16);
+             sgpr_data(t, d.reg), (u32)in.simm16);
         break;
     case OP_S_MULK_I32:
-        emit(t, "{ uint r_ = %s * 0x%08xu;", register_data(t, t.tags.sgpr[d.reg & 127], sgpr(t, d.reg)),
-             (u32)in.simm16);
+        emit(t, "{ uint r_ = %s * 0x%08xu;", sgpr_data(t, d.reg), (u32)in.simm16);
         break;
     case OP_S_MIN_I32:
     case OP_S_MAX_I32:
@@ -344,10 +343,10 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
         emit(t, "{ uint r_ = (uint)abs((int)%s); scc = r_ != 0u;", src(t, in, 0));
         break;
     case OP_S_BITSET0_B32:
-        emit(t, "{ uint r_ = %s & ~(1u << (%s & 31u));", sgpr(t, d.reg), src(t, in, 0));
+        emit(t, "{ uint r_ = %s & ~(1u << (%s & 31u));", sgpr_data(t, d.reg), src(t, in, 0));
         break;
     case OP_S_BITSET1_B32:
-        emit(t, "{ uint r_ = %s | (1u << (%s & 31u));", sgpr(t, d.reg), src(t, in, 0));
+        emit(t, "{ uint r_ = %s | (1u << (%s & 31u));", sgpr_data(t, d.reg), src(t, in, 0));
         break;
     case OP_S_BCNT0_I32_B32:
     case OP_S_BCNT0_I32_B64:
@@ -507,7 +506,7 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
         u32 k = (u32)(in.op - OP_S_CMPK_EQ_I32);
         bool is_signed = k < 6;
         u32 imm = is_signed ? (u32)in.simm16 : (u32)(u16)in.simm16;
-        set_scc(t, fmt(t, "%s%s %s %s0x%08xu", is_signed ? "(int)" : "", sgpr(t, d.reg), k_ops[k % 6],
+        set_scc(t, fmt(t, "%s%s %s %s0x%08xu", is_signed ? "(int)" : "", sgpr_data(t, d.reg), k_ops[k % 6],
                        is_signed ? "(int)" : "", imm));
         return true;
     }
@@ -1608,7 +1607,7 @@ static bool emit_vop3p(Translator& t, const RdnaInst& in) {
 }
 
 static bool begin_dpp(Translator& t, const RdnaInst& in) {
-    const char* v = register_data(t, t.tags.vgpr[in.src[0].reg & 255], vgpr(t, in.src[0].reg));
+    const char* v = vgpr_data(t, in.src[0].reg);
     u32 c = in.dpp.ctrl;
     const char* addr = nullptr;
     bool always_in_bounds = true;

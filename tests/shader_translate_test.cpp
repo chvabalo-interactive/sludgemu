@@ -94,6 +94,7 @@ enum : u32 {
     SOP1_CMOV_B64 = 6,
     SOP1_MOVRELD_B32 = 48,
     SOPK_MOVK_I32 = 0,
+    SOPK_CMPK_LG_U32 = 10,
     SOPK_ADDK_I32 = 15,
     SMEM_LOAD_DWORD = 0,
     SMEM_LOAD_DWORDX4 = 2,
@@ -108,6 +109,7 @@ enum : u32 {
     MUBUF_ATOMIC_ADD = 50,
     MIMG_STORE = 8,
     GLOBAL_LOAD_DWORD = 12,
+    GLOBAL_LOAD_DWORDX2 = 13,
     VOP1_MOV_B32 = 1,
     VOP2_LSHLREV_B32 = 26,
     VOP2_ADD_NC_U32 = 37,
@@ -698,6 +700,63 @@ static void test_descriptor_values() {
         CHECK(translate(a, info));
         CHECK(hlsl_has("s10 = g_descriptor_info.Load(s10);"));
         CHECK(hlsl_has("(s10 & 0x0001ffffu)"));
+    }
+    {
+        // A compare with an inline constant reads its register (decoded as the destination) and
+        // leaves it a loaded dword.
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.sopk(SOPK_CMPK_LG_U32, 10, 0);
+        a.sop2(SOP2_AND_B32, 20, 10, LIT, 0x1FFFFu);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("scc = g_descriptor_info.Load(s10) != 0x00000000u;"));
+        CHECK(hlsl_has("(g_descriptor_info.Load(s10) & 0x0001ffffu)"));
+    }
+    {
+        // A dword of a slot the program samples through, loaded on its own: an image descriptor's,
+        // which the shadow doesn't hold.
+        Asm a = {};
+        load_descriptors(a, true);
+        a.smem(SMEM_LOAD_DWORD, 20, 2, 4);
+        sample(a, 16);
+        a.sop2(SOP2_AND_B32, 21, 20, LIT, 0x3FFFu);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("image descriptor dword read as a value"));
+    }
+    {
+        // A loaded dword in a vector register, read as a value: lanes outside EXEC read the first record.
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.vop1(VOP1_MOV_B32, 6, 10);
+        a.vop2(VOP2_ADD_NC_U32, 7, V0 + 6, 0);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("g_descriptor_info.Load(EXEC ? v6 : 0u)"));
+    }
+    {
+        // Stored as it is, it would reach memory as its heap address.
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.vop1(VOP1_MOV_B32, 6, 10);
+        a.mubuf_offen(MUBUF_STORE_DWORD, 6, 0, 8);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("stores a descriptor dword"));
+    }
+    {
+        // Two dwords of descriptors picked per lane into the address registers: the address is taken
+        // before the first is written.
+        Asm a = {};
+        a.vop2(VOP2_LSHLREV_B32, 2, ZERO + 5, 0);
+        a.vop1(VOP1_MOV_B32, 3, ZERO);
+        a.vop2(VOP2_ADD_NC_U32, 2, 0, 2);
+        a.global_load(GLOBAL_LOAD_DWORDX2, 2, 2, 4);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("{ uint a_ = v2 + 0x4u;"));
+        CHECK(hlsl_has("if (EXEC) v3 = g_descriptor_info.Load2(a_).y;"));
     }
 }
 
