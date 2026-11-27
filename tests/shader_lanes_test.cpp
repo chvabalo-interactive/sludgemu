@@ -1027,16 +1027,21 @@ void test_shader_lanes() {
     } else {
         g_failures++;
     }
-    // Program G: which writes keep their EXEC guards (both halves are emitted alike; the first is checked).
+    // Program G: which writes keep the lanes outside EXEC (a select) and which write every lane (both
+    // halves are emitted alike; the first is checked).
     static const char* const k_guards[] = {
-        "if (EXEC0) v4_0 = 0x00000007u;",  // the else lanes read the old value
-        "!if (EXEC0) v5_0 = ",             // temporaries of the then side
-        "!if (EXEC0) v6_0 = ",
-        "if (EXEC0) v7_0 = 0x00000037u;",  // v_readlane reads a lane outside EXEC
-        "if (EXEC0) v9_0 = g_lds[",        // a load whose other lanes are read after the join
-        "if (EXEC0) v12_0 = 0x00000002u;", // whole-wave code reads the other lanes
-        "if (EXEC0) v15_0 = ",             // waterfall passes each write their lanes
-        "!if (EXEC0) v16_0 = ",            // a temporary of the passes
+        "v4_0 = select(EXEC0, 0x00000007u, v4_0);",  // the else lanes read the old value
+        "v5_0 = 0x00000003u;",                       // temporaries of the then side
+        "!v5_0 = select(",
+        "!if (EXEC0) v5_0",
+        "!v6_0 = select(",
+        "!if (EXEC0) v6_0",
+        "v7_0 = select(EXEC0, 0x00000037u, v7_0);",  // v_readlane reads a lane outside EXEC
+        "v9_0 = select(EXEC0, g_lds[",               // a load whose other lanes are read after the join
+        "v12_0 = select(EXEC0, 0x00000002u, v12_0);", // whole-wave code reads the other lanes
+        "v15_0 = select(EXEC0, ",                    // waterfall passes each write their lanes
+        "!v16_0 = select(",                          // a temporary of the passes
+        "!if (EXEC0) v16_0",
         nullptr,
     };
     if (run_program(b, k_lane_writes_program, sizeof(k_lane_writes_program), compute_info(64, 64), out, k_guards)) {

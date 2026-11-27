@@ -295,6 +295,22 @@ const char* float_result(Translator& t, const RdnaInst& in, const char* value) {
     return fmt(t, "asuint(%s)", v);
 }
 
+// Whether a value may be computed in lanes outside EXEC too: everything but cross-lane operations (the
+// lanes outside EXEC would take part), texture sampling with derivatives and reads through root
+// descriptors, which aren't bounds-checked (addresses there may be anything). Buffer views and LDS
+// are bounds-checked and contained, and translated code already reads them in every lane.
+static bool computable_in_every_lane(const char* value) {
+    static const char* const k_lane_bound[] = {
+        "g_root",   "WaveActive", "WavePrefix", "WaveRead",   "WaveMatch",  "WaveMulti", "QuadRead",
+        "wave_any", "wave_count", "wave_first", "wave_last",  "read_first", "quad_any",  "mask_bits",
+        "mask_any", "Sample",     "Gather",     "LevelOfDetail", "Interlocked",
+    };
+    for (u32 i = 0; i < ARRAY_COUNT(k_lane_bound); i++)
+        if (strstr(value, k_lane_bound[i]))
+            return false;
+    return true;
+}
+
 void write_vgpr(Translator& t, const RdnaInst& in, u32 reg, const char* value) {
     const char* dst = vgpr(t, reg);
     const RdnaOperand& d = in.dst[0];
@@ -318,15 +334,26 @@ void write_vgpr(Translator& t, const RdnaInst& in, u32 reg, const char* value) {
     }
     if (strcmp(value, dst) == 0)
         return; // a move onto itself (v_mov v1, v1 and the like)
+    bool every_lane = computable_in_every_lane(value);
     if (t.write_all_lanes) {
         // The lanes outside EXEC are never read again (see translate_lanes.cpp): write them all, so
         // that the old value dies here. Only the destination the analysis knows may be written so.
         if (!in_destination || t.dpp_has_mask)
             t.lane_check_failed = true;
-        emit(t, "%s = %s;", dst, value);
-        return;
+        if (every_lane) {
+            emit(t, "%s = %s;", dst, value);
+            return;
+        }
     }
-    emit(t, t.dpp_has_mask ? "if (%s && dpp_en_) %s = %s;" : "if (%s) %s = %s;", exec_cond(t), dst, value);
+    // The lanes outside EXEC keep the old value. A select says so without a branch (long programs full
+    // of branches on EXEC keep the desktop compiler's jump threading busy for minutes); it computes the
+    // value in every lane.
+    if (t.dpp_has_mask)
+        emit(t, "if (%s && dpp_en_) %s = %s;", exec_cond(t), dst, value);
+    else if (every_lane)
+        emit(t, "%s = select(%s, %s, %s);", dst, exec_cond(t), value, dst);
+    else
+        emit(t, "if (%s) %s = %s;", exec_cond(t), dst, value);
 }
 
 void write_sgpr(Translator& t, const RdnaOperand& dst, u32 part, const char* value) {

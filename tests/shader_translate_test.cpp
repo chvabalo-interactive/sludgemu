@@ -1027,7 +1027,7 @@ static void test_image_atomics() {
         CHECK(hlsl_has("{ RWTexture2D<uint> tex_ = ResourceDescriptorHeap[s8 >> 5];"));
         CHECK(hlsl_has("uint2 at_ = uint2(v0, v1);"));
         CHECK(hlsl_has("if (EXEC) InterlockedMax(tex_[at_], v4);"));
-        CHECK(!hlsl_has("if (EXEC) v4 = "));
+        CHECK(!hlsl_has("if (EXEC) v4 = ") && !hlsl_has("v4 = select("));
         CHECK(!g_out.uses_int64_atomics);
     }
     {
@@ -1039,8 +1039,8 @@ static void test_image_atomics() {
         CHECK(translate(a, info));
         CHECK(hlsl_has("RWTexture2D<uint64_t> tex_"));
         CHECK(hlsl_has("if (EXEC) InterlockedMax(tex_[at_], ((uint64_t)v5 << 32 | v4), o_);"));
-        CHECK(hlsl_has("if (EXEC) v4 = (uint)o_;"));
-        CHECK(hlsl_has("if (EXEC) v5 = (uint)((uint64_t)o_ >> 32);"));
+        CHECK(hlsl_has("v4 = select(EXEC, (uint)o_, v4);"));
+        CHECK(hlsl_has("v5 = select(EXEC, (uint)((uint64_t)o_ >> 32), v5);"));
         CHECK(g_out.uses_int64_atomics);
     }
     {
@@ -1052,8 +1052,8 @@ static void test_image_atomics() {
         a.end();
         CHECK(translate(a, info));
         CHECK(hlsl_has("if (EXEC) InterlockedCompareExchange(tex_[at_], v5, v4, o_);"));
-        CHECK(hlsl_has("if (EXEC) v4 = (uint)o_;"));
-        CHECK(!hlsl_has("if (EXEC) v5 = "));
+        CHECK(hlsl_has("v4 = select(EXEC, (uint)o_, v4);"));
+        CHECK(!hlsl_has("if (EXEC) v5 = ") && !hlsl_has("v5 = select("));
         CHECK(hlsl_has("if (EXEC) InterlockedCompareStore(tex_[at_], ((uint64_t)v11 << 32 | v10), "
                        "((uint64_t)v9 << 32 | v8));"));
     }
@@ -1077,7 +1077,7 @@ static void test_image_atomics() {
         a.end();
         CHECK(translate(a, info));
         CHECK(hlsl_has("InterlockedCompareExchange(tex_[at_], c_, c_ >= v4 ? 0u : c_ + 1u, p_);"));
-        CHECK(hlsl_has("if (EXEC) v4 = (uint)o_;"));
+        CHECK(hlsl_has("v4 = select(EXEC, (uint)o_, v4);"));
     }
     {
         // Three dwords are no texel width.
@@ -1367,7 +1367,7 @@ static void test_wave64_emission() {
         CHECK(hlsl_has("uint2 at_ = uint2(v0_0, v1_0);"));
         CHECK(hlsl_has("uint2 at_ = uint2(v0_1, v1_1);"));
         CHECK(hlsl_has("if (EXEC0) InterlockedMax(tex_[at_], v4_0, o_);"));
-        CHECK(hlsl_has("if (EXEC1) v4_1 = (uint)o_;"));
+        CHECK(hlsl_has("v4_1 = select(EXEC1, (uint)o_, v4_1);"));
         CHECK(!hlsl_tests_one_exec());
     }
     {
