@@ -758,6 +758,22 @@ static void test_descriptor_values() {
         CHECK(hlsl_has("{ uint a_ = v2 + 0x4u;"));
         CHECK(hlsl_has("if (EXEC) v3 = g_descriptor_info.Load2(a_).y;"));
     }
+    {
+        // A slot loaded four dwords at a time on one path and eight on the other is still the table's
+        // slot after the join: a store through it there decides the view of a read elsewhere.
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.sopc(SOPC_CMP_EQ_U32, 0, ZERO);
+        a.sopp(SOPP_CBRANCH_SCC0, 2);
+        a.smem(SMEM_LOAD_DWORDX8, 8, 2, 0);
+        a.mubuf_offen(MUBUF_STORE_DWORD, 6, 0, 8);
+        a.smem(SMEM_LOAD_DWORDX4, 16, 2, 0);
+        a.mubuf_offen(MUBUF_LOAD_DWORD, 7, 0, 16);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("RWByteAddressBuffer b_ = ResourceDescriptorHeap[(s16 >> 5)];"));
+        CHECK(!hlsl_has("if (g_descriptor_info.Load((s16 & ~31u) + 16u) == 2u) {"));
+    }
 }
 
 // --- descriptor shadow records -------------------------------------------------------------------------
