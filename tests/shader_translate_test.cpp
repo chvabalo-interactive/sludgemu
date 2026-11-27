@@ -310,7 +310,8 @@ static void test_sampler_decoding() {
     }
     {
         // Unnormalized coordinates: clamped and without mips is fine, wrapping isn't.
-        u32 clamped[4] = {0x92 | 1u << 15, 0, 0x00500000, 0};
+        // Linear mips and a bias change nothing with the level held at 0: point mips, no bias.
+        u32 clamped[4] = {0x92 | 1u << 15, 0, 0x08500010, 0};
         u32 wrapped[4] = {1u << 15, 0, 0x00500000, 0};
         Asm a = {};
         load_descriptors(a, false);
@@ -319,6 +320,7 @@ static void test_sampler_decoding() {
         a.end();
         CHECK(translate(a, info));
         CHECK(g_out.sampler_count == 1 && g_out.samplers[0].unnormalized);
+        CHECK(g_out.samplers[0].filter == 0x14 && g_out.samplers[0].mip_bias == 0.0f);
         Asm b = {};
         load_descriptors(b, false);
         constant_sampler(b, 20, wrapped);

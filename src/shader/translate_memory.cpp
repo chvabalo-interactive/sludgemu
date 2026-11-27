@@ -1092,6 +1092,10 @@ static bool decode_sampler(const u32 w[4], bool compare, InlineSampler* out, con
             *why = "unnormalized coordinates with wrapping, mips, anisotropy, comparison or unequal filters";
             return false;
         }
+        // With the level held at 0 the mip filter and the bias change nothing: point mips and no bias,
+        // the form the desktop rules for unnormalized samplers (Vulkan's) are written for.
+        out->filter &= ~1u;
+        out->mip_bias = 0.0f;
     }
     return true;
 }
