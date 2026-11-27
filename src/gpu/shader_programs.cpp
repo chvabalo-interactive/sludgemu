@@ -9,7 +9,7 @@
 #include <dxcapi.h>
 
 #include "common/log.h"
-#include "common/thread_slot.h"
+#include "generated/shader_translator_hash.h"
 #include "shader/rdna.h"
 
 // --- jobs --------------------------------------------------------------------------------------------
@@ -21,8 +21,8 @@ struct Job {
     void* context;
 };
 
-// Two lanes: work a draw is waiting for, served first, and programs titles merely created (often
-// thousands at once, at startup).
+// Two lanes: work something waits for, served first, and work nothing waits for yet: programs titles
+// merely created (often thousands at once, at startup) and jobs queued behind them.
 #define JOB_CAPACITY 65536
 
 struct JobLane {
@@ -30,12 +30,37 @@ struct JobLane {
     u32 head, count;
 };
 
+// Each worker has its own compiler: DXC compiler objects are not thread safe.
+struct Worker {
+    IDxcCompiler3* compiler;
+    HANDLE thread;
+    u32 index;
+    bool urgent_only;      // takes urgent work alone, so that waits never sit behind background work
+    volatile long boosted; // raised to normal priority for a program something waits for
+};
+
+#define MAX_GENERAL_WORKERS 8
+#define MAX_WORKERS         (MAX_GENERAL_WORKERS + 1) // and the urgent-only one
+
 static JobLane g_lanes[2]; // urgent, background
 static SRWLOCK g_job_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE g_job_ready = CONDITION_VARIABLE_INIT;
+static CONDITION_VARIABLE g_job_ready = CONDITION_VARIABLE_INIT;    // general workers
+static CONDITION_VARIABLE g_urgent_ready = CONDITION_VARIABLE_INIT; // the urgent-only worker
+static Worker g_workers[MAX_WORKERS];
+static u32 g_worker_count;
+static u32 g_active; // workers running a job (under g_job_lock)
 static bool g_ready;
 
+// Programs done, for the report when the queue drains.
+static struct {
+    volatile long cached, built, failed;
+    long reported;       // cached + built + failed at the last report (under g_job_lock)
+    LARGE_INTEGER start; // when the queue last went from idle to busy (under g_job_lock)
+} g_stats;
+
 static bool queue(const Job& job, bool urgent) {
+    if (!g_ready)
+        return false;
     AcquireSRWLockExclusive(&g_job_lock);
     JobLane& lane = g_lanes[urgent ? 0 : 1];
     if (lane.count == JOB_CAPACITY) {
@@ -43,32 +68,85 @@ static bool queue(const Job& job, bool urgent) {
         LOG_E("gpu", "GPU job queue full; job dropped");
         return false;
     }
+    if (!g_active && !g_lanes[0].count && !g_lanes[1].count)
+        QueryPerformanceCounter(&g_stats.start);
     lane.jobs[(lane.head + lane.count) % JOB_CAPACITY] = job;
     lane.count++;
     ReleaseSRWLockExclusive(&g_job_lock);
     WakeConditionVariable(&g_job_ready);
+    if (urgent)
+        WakeConditionVariable(&g_urgent_ready);
     return true;
 }
 
-void gpu_job_queue(void (*run)(void* context), void* context) {
-    queue({nullptr, run, context}, true);
+bool gpu_job_queue(void (*run)(void* context), void* context) {
+    return queue({nullptr, run, context}, true);
 }
 
-void shader_program_hurry(ShaderProgram* p) {
-    if (p && p->state == PROGRAM_PENDING && InterlockedExchange(&p->urgent, 1) == 0)
-        queue({p, nullptr, nullptr}, true);
+bool gpu_job_queue_background(void (*run)(void* context), void* context) {
+    return queue({nullptr, run, context}, false);
 }
 
-// --- compiler ----------------------------------------------------------------------------------------
+static void hurry(ShaderProgram* p) {
+    if (p->state == PROGRAM_PENDING && InterlockedExchange(&p->urgent, 1) == 0 &&
+        !queue({p, nullptr, nullptr}, true))
+        InterlockedExchange(&p->urgent, 0); // asked again by the next wait
+}
+
+// A program being built while something waits for it: its worker leaves background priority until
+// the job ends (the waiting thread would otherwise wait for what busy cores leave over).
+static void boost(const ShaderProgram* p) {
+    long w = p->worker;
+    if (w > 0 && w <= (long)g_worker_count && InterlockedExchange(&g_workers[w - 1].boosted, 1) == 0)
+        SetThreadPriority(g_workers[w - 1].thread, THREAD_PRIORITY_NORMAL);
+}
+
+static bool is_final(u32 state) {
+    return state == PROGRAM_READY || state == PROGRAM_FAILED;
+}
+
+bool shader_program_wait(ShaderProgram* p) {
+    u32 state = p->state;
+    if (is_final(state))
+        return state == PROGRAM_READY;
+    hurry(p);
+    u32 waited_s = 0;
+    bool boosted = false;
+    for (;;) {
+        state = p->state;
+        if (is_final(state))
+            return state == PROGRAM_READY;
+        if (state == PROGRAM_BUILDING && !boosted) {
+            boost(p);
+            boosted = true;
+        }
+        // Builders wake every waiter when the state becomes final; the timeout only asks again where
+        // the queue was full, and tells about a wait that looks stuck.
+        if (!WaitOnAddress(&p->state, &state, sizeof(state), 1000) && GetLastError() == ERROR_TIMEOUT) {
+            hurry(p);
+            if (++waited_s == 10)
+                LOG_W("gpu", "still waiting for shader %016llx after 10 s (state %u)",
+                      (unsigned long long)p->key, p->state);
+        }
+    }
+}
+
+bool shader_program_wait_started(ShaderProgram* p) {
+    for (;;) {
+        u32 state = p->state;
+        if (is_final(state))
+            return true;
+        if (state == PROGRAM_PENDING)
+            return false;
+        WaitOnAddress(&p->state, &state, sizeof(state), INFINITE);
+    }
+}
+
+// --- building ----------------------------------------------------------------------------------------
 
 static DxcCreateInstanceProc g_dxc_create;
-static ShaderTarget g_target; // what the device runs, for the translator
-
-// Each worker has its own compiler: DXC compiler objects are not thread safe.
-struct Worker {
-    IDxcCompiler3* compiler;
-    u32 index;
-};
+static ShaderTarget g_target;     // what the device runs, for the translator
+static char g_dump_dir[MAX_PATH]; // SLUDGE_SHADER_DUMP, or empty
 
 static const wchar_t* profile_of(ShaderStage stage) {
     switch (stage) {
@@ -84,23 +162,22 @@ static const wchar_t* profile_of(ShaderStage stage) {
 // Programs (code, what the translator was told about them, and HLSL with the error for failures) are
 // written to SLUDGE_SHADER_DUMP=<directory>; shader_tool retranslate translates them again.
 static void dump(const ShaderProgram* p, const char* hlsl, const char* reason) {
-    char dir[MAX_PATH];
-    if (!GetEnvironmentVariableA("SLUDGE_SHADER_DUMP", dir, sizeof(dir)))
+    if (!g_dump_dir[0])
         return;
     char path[MAX_PATH + 64];
-    snprintf(path, sizeof(path), "%s\\%016llx.bin", dir, (unsigned long long)p->key);
+    snprintf(path, sizeof(path), "%s\\%016llx.bin", g_dump_dir, (unsigned long long)p->key);
     FILE* f = fopen(path, "wb");
     if (f) {
         fwrite(p->code, 1, p->code_size, f);
         fclose(f);
     }
-    snprintf(path, sizeof(path), "%s\\%016llx.info", dir, (unsigned long long)p->key);
+    snprintf(path, sizeof(path), "%s\\%016llx.info", g_dump_dir, (unsigned long long)p->key);
     f = fopen(path, "wb");
     if (f) {
         fwrite(&p->info, sizeof(p->info), 1, f);
         fclose(f);
     }
-    snprintf(path, sizeof(path), "%s\\%016llx.hlsl", dir, (unsigned long long)p->key);
+    snprintf(path, sizeof(path), "%s\\%016llx.hlsl", g_dump_dir, (unsigned long long)p->key);
     f = fopen(path, "w");
     if (f) {
         if (reason)
@@ -111,13 +188,10 @@ static void dump(const ShaderProgram* p, const char* hlsl, const char* reason) {
     }
 }
 
-static void build_program(Worker& w, ShaderProgram* p) {
-    // Programs can be queued in both lanes; the first worker to get one builds it.
-    if (InterlockedCompareExchange((volatile LONG*)&p->state, PROGRAM_BUILDING, PROGRAM_PENDING) !=
-        PROGRAM_PENDING)
-        return;
+// Translates and compiles the program into `out`; false (logged) if it can't be.
+static bool translate_program(Worker& w, const ShaderProgram* p, ShaderBinary* out) {
     TranslatedShader t = {};
-    u32 state = PROGRAM_FAILED;
+    bool ok = false;
     bool translated = shader_translate(p->code, p->code_size, p->info, g_target, &t);
     // The pipeline's wave size (unverified) against what the code proves, where both tell; the code wins.
     if (p->info.wave_size && t.code_wave_size && t.code_wave_size != p->info.wave_size)
@@ -150,19 +224,19 @@ static void build_program(Worker& w, ShaderProgram* p) {
         if (SUCCEEDED(status))
             result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr);
         if (object && object->GetBufferSize()) {
-            p->dxil = malloc(object->GetBufferSize());
-            if (p->dxil) {
-                memcpy(p->dxil, object->GetBufferPointer(), object->GetBufferSize());
-                p->dxil_size = object->GetBufferSize();
-                p->vertex_element_mask = t.vertex_element_mask;
-                memcpy(p->element_format, t.element_format, sizeof(p->element_format));
-                p->ps_target_mask = t.ps_target_mask;
-                p->ps_writes_depth = t.ps_writes_depth;
-                p->sampler_count = t.sampler_count;
-                memcpy(p->samplers, t.samplers, sizeof(p->samplers));
-                memcpy(p->table_reach, t.table_reach, sizeof(p->table_reach));
-                p->vs_param_mask = t.vs_param_mask;
-                state = PROGRAM_READY;
+            out->dxil = malloc(object->GetBufferSize());
+            if (out->dxil) {
+                memcpy(out->dxil, object->GetBufferPointer(), object->GetBufferSize());
+                out->dxil_size = object->GetBufferSize();
+                out->vertex_element_mask = t.vertex_element_mask;
+                memcpy(out->element_format, t.element_format, sizeof(out->element_format));
+                out->ps_target_mask = t.ps_target_mask;
+                out->ps_writes_depth = t.ps_writes_depth;
+                out->sampler_count = t.sampler_count;
+                memcpy(out->samplers, t.samplers, sizeof(out->samplers));
+                memcpy(out->table_reach, t.table_reach, sizeof(out->table_reach));
+                out->vs_param_mask = t.vs_param_mask;
+                ok = true;
                 dump(p, t.hlsl.data, nullptr);
             }
         } else {
@@ -183,31 +257,89 @@ static void build_program(Worker& w, ShaderProgram* p) {
             result->Release();
     }
     t.hlsl.release();
+    return ok;
+}
+
+static void build_program(Worker& w, ShaderProgram* p) {
+    // Programs can be queued in both lanes; the first worker to get one builds it.
+    if (InterlockedCompareExchange((volatile LONG*)&p->state, PROGRAM_BUILDING, PROGRAM_PENDING) !=
+        PROGRAM_PENDING)
+        return;
+    InterlockedExchange(&p->worker, (long)w.index + 1);
+    ShaderBinary b;
+    memset(&b, 0, sizeof(b));
+    // Dumps are made by building, so they bypass the cache (and refresh it).
+    bool ready = !g_dump_dir[0] && shader_cache_load(p->key, p->code_size, &b);
+    if (ready) {
+        InterlockedIncrement(&g_stats.cached);
+    } else {
+        ready = translate_program(w, p, &b);
+        InterlockedIncrement(ready ? &g_stats.built : &g_stats.failed);
+        if (ready)
+            shader_cache_store(p->key, p->code_size, b);
+    }
+    p->binary = b;
     free(p->code);
     p->code = nullptr;
-    InterlockedExchange((volatile LONG*)&p->state, (LONG)state);
+    InterlockedExchange((volatile LONG*)&p->state, ready ? PROGRAM_READY : PROGRAM_FAILED);
+    WakeByAddressAll((void*)&p->state);
+}
+
+// Logs what the workers did since the last report, once the queue drains after enough programs (a
+// report per pipeline titles create mid-game would only be noise).
+static void report_drained(const LARGE_INTEGER& start) {
+    long cached = g_stats.cached, built = g_stats.built, failed = g_stats.failed;
+    long total = cached + built + failed;
+    AcquireSRWLockExclusive(&g_job_lock);
+    long since = total - g_stats.reported;
+    bool report = since >= 64;
+    if (report)
+        g_stats.reported = total;
+    ReleaseSRWLockExclusive(&g_job_lock);
+    if (!report)
+        return;
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    LOG_I("gpu",
+          "shader queue drained (busy %.1f s): %ld programs since the last report; in all %ld from the disk "
+          "cache, %ld translated, %ld failed",
+          (f64)(now.QuadPart - start.QuadPart) / (f64)frequency.QuadPart, since, cached, built, failed);
 }
 
 static DWORD WINAPI worker_main(void* param) {
-    Worker w = {};
-    w.index = (u32)(usize)param;
-    if (FAILED(g_dxc_create(CLSID_DxcCompiler, IID_PPV_ARGS(&w.compiler)))) {
-        LOG_E("gpu", "shader worker %u: cannot create a compiler", w.index);
-        return 1;
-    }
+    Worker& w = *(Worker*)param;
+    int resting = w.urgent_only ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL;
     for (;;) {
         AcquireSRWLockExclusive(&g_job_lock);
-        while (g_lanes[0].count == 0 && g_lanes[1].count == 0)
-            SleepConditionVariableSRW(&g_job_ready, &g_job_lock, INFINITE, 0);
-        JobLane& lane = g_lanes[g_lanes[0].count ? 0 : 1];
+        while (g_lanes[0].count == 0 && (w.urgent_only || g_lanes[1].count == 0))
+            SleepConditionVariableSRW(w.urgent_only ? &g_urgent_ready : &g_job_ready, &g_job_lock, INFINITE,
+                                      0);
+        bool urgent = g_lanes[0].count != 0;
+        JobLane& lane = g_lanes[urgent ? 0 : 1];
         Job job = lane.jobs[lane.head];
         lane.head = (lane.head + 1) % JOB_CAPACITY;
         lane.count--;
+        g_active++;
         ReleaseSRWLockExclusive(&g_job_lock);
+        // Urgent work runs at normal priority: something is waiting for it.
+        bool raised = urgent && !w.urgent_only;
+        if (raised)
+            SetThreadPriority(w.thread, THREAD_PRIORITY_NORMAL);
         if (job.program)
             build_program(w, job.program);
         else
             job.run(job.context);
+        if (InterlockedExchange(&w.boosted, 0))
+            raised = true;
+        if (raised && !w.urgent_only)
+            SetThreadPriority(w.thread, resting);
+        AcquireSRWLockExclusive(&g_job_lock);
+        bool drained = --g_active == 0 && !g_lanes[0].count && !g_lanes[1].count;
+        LARGE_INTEGER start = g_stats.start;
+        ReleaseSRWLockExclusive(&g_job_lock);
+        if (drained)
+            report_drained(start);
     }
 }
 
@@ -318,9 +450,62 @@ static u64 hash_bytes(const void* data, usize size, u64 h) {
     return h;
 }
 
-bool shader_programs_init(const ShaderTarget& target) {
+// The cache generation: everything besides a program's code and inputs (its key) that decides what
+// its translation comes out as. The translator's sources (hashed at build time), what the device runs,
+// and the compiler's version.
+static u64 cache_generation(IDxcCompiler3* compiler) {
+    u64 h = hash_bytes("sludgemu shader cache", 21, 0xcbf29ce484222325ull);
+    u64 translator = SHADER_TRANSLATOR_HASH;
+    h = hash_bytes(&translator, sizeof(translator), h);
+    h = hash_bytes(&g_target, sizeof(g_target), h);
+    bool int64_atomics = gpu_int64_image_atomics();
+    h = hash_bytes(&int64_atomics, sizeof(int64_atomics), h);
+    IDxcVersionInfo2* version = nullptr;
+    if (SUCCEEDED(compiler->QueryInterface(IID_PPV_ARGS(&version)))) {
+        UINT32 numbers[3] = {};
+        char* commit = nullptr;
+        version->GetVersion(&numbers[0], &numbers[1]);
+        if (SUCCEEDED(version->GetCommitInfo(&numbers[2], &commit)) && commit) {
+            h = hash_bytes(commit, strlen(commit), h);
+            CoTaskMemFree(commit);
+        }
+        h = hash_bytes(numbers, sizeof(numbers), h);
+        version->Release();
+    } else {
+        LOG_W("gpu",
+              "the shader compiler doesn't tell its version; the shader cache can't tell its builds apart");
+    }
+    return h;
+}
+
+static void prune_cache(void*) {
+    u32 removed = shader_cache_prune(14);
+    if (removed)
+        LOG_I("gpu", "shader cache: removed %u generations unused for two weeks", removed);
+}
+
+static void open_cache(const wchar_t* root, IDxcCompiler3* compiler) {
+    char setting[8];
+    if (GetEnvironmentVariableA("SLUDGE_SHADER_CACHE", setting, sizeof(setting)) && setting[0] == '0') {
+        LOG_I("gpu", "shader cache: off (SLUDGE_SHADER_CACHE=0)");
+        return;
+    }
+    if (!root)
+        return;
+    u64 generation = cache_generation(compiler);
+    if (!shader_cache_open(root, generation)) {
+        LOG_W("gpu", "shader cache: cannot use %ls; programs are translated on every run", root);
+        return;
+    }
+    LOG_I("gpu", "shader cache: %ls", shader_cache_folder());
+    gpu_job_queue_background(prune_cache, nullptr);
+}
+
+bool shader_programs_init(const ShaderTarget& target, const wchar_t* cache_root) {
     rdna_init();
     g_target = target;
+    if (!GetEnvironmentVariableA("SLUDGE_SHADER_DUMP", g_dump_dir, sizeof(g_dump_dir)))
+        g_dump_dir[0] = 0;
     HMODULE dxc = LoadLibraryW(L"dxcompiler.dll");
     g_dxc_create = dxc ? (DxcCreateInstanceProc)GetProcAddress(dxc, "DxcCreateInstance") : nullptr;
     if (!g_dxc_create) {
@@ -334,19 +519,33 @@ bool shader_programs_init(const ShaderTarget& target) {
         return false;
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    u32 workers = si.dwNumberOfProcessors > 4 ? si.dwNumberOfProcessors - 2 : 2;
-    if (workers > 8)
-        workers = 8;
-    for (u32 i = 0; i < workers; i++) {
-        HANDLE thread = CreateThread(nullptr, 1 << 20, worker_main, (void*)(usize)i, 0, nullptr);
-        if (!thread)
+    u32 general = si.dwNumberOfProcessors > 4 ? si.dwNumberOfProcessors - 2 : 2;
+    if (general > MAX_GENERAL_WORKERS)
+        general = MAX_GENERAL_WORKERS;
+    // Compilers first: a pool without them would leave waits for programs hanging.
+    g_worker_count = general + 1;
+    for (u32 i = 0; i < g_worker_count; i++) {
+        Worker& w = g_workers[i];
+        w.index = i;
+        w.urgent_only = i == general;
+        if (FAILED(g_dxc_create(CLSID_DxcCompiler, IID_PPV_ARGS(&w.compiler)))) {
+            LOG_E("gpu", "cannot create a shader compiler: shaders cannot be translated");
             return false;
-        SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
-        SetThreadDescription(thread, L"sludgemu shader worker");
-        CloseHandle(thread);
+        }
     }
-    g_ready = true;
-    LOG_I("gpu", "shader translation: %u workers", workers);
+    g_ready = true; // jobs can be queued from here on; the workers take them once started
+    open_cache(cache_root, g_workers[0].compiler);
+    for (u32 i = 0; i < g_worker_count; i++) {
+        Worker& w = g_workers[i];
+        w.thread = CreateThread(nullptr, 1 << 20, worker_main, &w, CREATE_SUSPENDED, nullptr);
+        if (!w.thread)
+            FATAL("cannot start shader workers");
+        SetThreadPriority(w.thread, w.urgent_only ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
+        SetThreadDescription(w.thread,
+                             w.urgent_only ? L"sludgemu shader worker (urgent)" : L"sludgemu shader worker");
+        ResumeThread(w.thread);
+    }
+    LOG_I("gpu", "shader translation: %u workers and one for work draws wait for", general);
     return true;
 }
 
@@ -386,7 +585,10 @@ ShaderProgram* shader_program_get(const void* code, u32 code_size, const ShaderI
         LOG_W_ONCE("gpu", "shader program table full; more programs are not translated");
     }
     ReleaseSRWLockExclusive(&g_program_lock);
-    if (p)
-        queue({p, nullptr, nullptr}, false);
+    // A program no queue holds would never be built, and a draw waiting for it would wait forever.
+    if (p && !queue({p, nullptr, nullptr}, false)) {
+        InterlockedExchange((volatile LONG*)&p->state, PROGRAM_FAILED);
+        WakeByAddressAll((void*)&p->state);
+    }
     return p;
 }

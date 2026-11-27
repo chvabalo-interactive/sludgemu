@@ -15,8 +15,8 @@ static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAccess acce
 
 // --- draws and dispatches ----------------------------------------------------------------------------
 
-// The desktop pipeline and user data for a draw or dispatch. Draws are skipped while the pipeline's
-// translation is being built (or when it failed).
+// The desktop pipeline and user data for a draw or dispatch, waiting for the pipeline to be made if
+// it is not yet. Draws are skipped only when it cannot be made.
 static bool prepare(ConsoleCommandList* self, bool graphics) {
     ListState& s = self->state;
     ID3D12RootSignature* signature = nullptr;

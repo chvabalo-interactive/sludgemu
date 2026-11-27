@@ -170,6 +170,20 @@ sludge_shader(sludgemu gpu/shaders/present.hlsl vs_main vs_6_0 present_vs)
 sludge_shader(sludgemu gpu/shaders/present.hlsl ps_main ps_6_0 present_ps)
 sludge_shader(sludgemu gpu/shaders/untile.hlsl cs_main cs_6_0 untile_cs)
 target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# The shader cache generation: a hash of every source that can change what a translated program comes
+# out as (or how the cache stores it). Derived from the sources rather than bumped by hand, so that no
+# edit can leave stale translations in use: an unneeded rebuild of the cache is the worst case.
+set(SLUDGE_TRANSLATOR_SOURCES ${SLUDGE_SHADER_SOURCES}
+    gpu/shader_programs.h gpu/shader_programs.cpp gpu/shader_cache.h gpu/shader_cache.cpp)
+list(TRANSFORM SLUDGE_TRANSLATOR_SOURCES PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
+set(translator_hash ${CMAKE_CURRENT_BINARY_DIR}/generated/shader_translator_hash.h)
+add_custom_command(OUTPUT ${translator_hash}
+    COMMAND ${CMAKE_COMMAND} -DNAME=SHADER_TRANSLATOR_HASH -DOUT=${translator_hash}
+        "-DSOURCES=${SLUDGE_TRANSLATOR_SOURCES}" -P ${PROJECT_SOURCE_DIR}/cmake/source_hash.cmake
+    DEPENDS ${SLUDGE_TRANSLATOR_SOURCES} ${PROJECT_SOURCE_DIR}/cmake/source_hash.cmake
+    COMMENT "Hashing the shader translator sources")
+target_sources(sludgemu PRIVATE ${translator_hash})
 target_link_libraries(sludgemu PRIVATE sludge_shader agility sludge_options shell32 user32 synchronization delayimp
     dstorage libdeflate::libdeflate_static opus addrlib d3d12 dxgi dxc)
 

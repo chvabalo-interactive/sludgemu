@@ -219,7 +219,7 @@ struct ConsoleCommandList {
     ConsoleCommandAllocator* allocator; // the allocator of the current recording
     ID3D12Device13* device;
     bool recording;
-    u32 skipped_draws; // draws and dispatches without a desktop pipeline yet
+    u32 skipped_draws; // draws and dispatches skipped: their pipeline cannot be made
     ListState state;
 
     // Descriptor tables the recording uses, mirrored again when the list is submitted: titles may
@@ -583,14 +583,14 @@ enum PipelineVariantState : u32 {
 
 struct PipelineVariant {
     PipelineOutputs outputs;
-    volatile u32 state; // PipelineVariantState
+    volatile u32 state; // PipelineVariantState; builders wake waiters (WaitOnAddress) when it's final
     ID3D12PipelineState* desktop;
     ID3D12RootSignature* signature; // the desktop signature it was made with (owned by the signature)
 };
 
 // A pipeline state: the console's packet for it (public; title code copies it into command lists)
 // and its translation: shader programs, fixed-function state and desktop pipelines, made when a
-// draw first uses a set of output formats once the programs are built.
+// draw first uses a set of output formats (draws wait for them).
 struct ConsolePipelineState {
     ConsoleObjectHeader header;
     u32 packet[8];
@@ -601,8 +601,10 @@ struct ConsolePipelineState {
     ShaderProgram* programs[2]; // graphics: vertex, pixel (may be null); compute: compute
     PipelineFixedState fixed;
 
+    // Variants are only added (under the lock), each filled in before the count that publishes it:
+    // draws find theirs without locking.
     SRWLOCK lock;
-    u32 variant_count;
+    volatile long variant_count;
     PipelineVariant variants[PIPELINE_MAX_VARIANTS];
     volatile long skip_reported; // why its draws are skipped was logged
 };
@@ -622,11 +624,12 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice* device, bool compute,
                                            const ConsoleSerializedPipeline* serialized, REFIID iid,
                                            void** out);
 
-// The desktop pipeline for drawing (or dispatching) with `pso` to `outputs`, or nullptr while it is
-// being made or if it cannot be.
+// The desktop pipeline for drawing (or dispatching) with `pso` to `outputs`, waiting for its
+// translation and desktop pipeline if they aren't made yet; nullptr if they can't be. For the threads
+// recording command lists: workers never wait for those, so the wait can't deadlock.
 ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs,
                                               ID3D12RootSignature** signature);
-// Logs, once per pipeline, why draws with it are skipped for good (not while its programs build).
+// Logs, once per pipeline, why draws with it are skipped.
 void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics);
 
 // Page pools (page_pool.cpp): title memory registered as a source of GPU page mapping copies.

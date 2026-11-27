@@ -3,11 +3,13 @@
 // Console pipeline states carry console GPU code, translated by gpu/shader_programs, and
 // fixed-function state as hardware registers, decoded here into desktop descriptions. Desktop
 // pipelines also depend on the formats drawn to, which console pipelines leave to the bound
-// targets: they are made when a draw first uses a set of formats, on a worker thread once the
-// programs are built. Draws are skipped until then.
+// targets: they are made on a worker thread when a draw first uses a set of formats, and the draw
+// waits for them (and for the programs). A console never skips a draw, and one pass of a multi-pass
+// effect left out looks broken where a late frame only looks late.
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "common/log.h"
@@ -36,7 +38,7 @@ static ID3D12Device* g_device = nullptr;
 
 static void pipeline_state_destroy(void* object) {
     ConsolePipelineState* pso = (ConsolePipelineState*)object;
-    for (u32 i = 0; i < pso->variant_count; i++)
+    for (u32 i = 0; i < (u32)pso->variant_count; i++)
         gpu_retire(pso->variants[i].desktop);
     if (pso->root_signature)
         console_release(pso->root_signature);
@@ -623,11 +625,6 @@ HRESULT console_derive_pipeline_state(ConsoleDevice*, void* source, u32 count, c
 
 // --- desktop pipelines -------------------------------------------------------------------------------
 
-struct VariantJob {
-    ConsolePipelineState* pso; // referenced for the job
-    u32 index;
-};
-
 static bool programs_ready(const ConsolePipelineState* pso) {
     for (u32 i = 0; i < 2; i++)
         if (pso->programs[i] && pso->programs[i]->state != PROGRAM_READY)
@@ -640,6 +637,10 @@ static bool programs_failed(const ConsolePipelineState* pso) {
         if (pso->programs[i] && pso->programs[i]->state == PROGRAM_FAILED)
             return true;
     return false;
+}
+
+static bool desktop_signature_exists(const ConsolePipelineState* pso) {
+    return pso->translated && pso->root_signature && pso->root_signature->desktop;
 }
 
 void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics) {
@@ -661,17 +662,8 @@ void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics) {
         snprintf(reason, sizeof(reason), "a program failed: %016llx %s, %016llx %s",
                  a ? (unsigned long long)a->key : 0ull, a && a->state == PROGRAM_FAILED ? "failed" : "ok",
                  b ? (unsigned long long)b->key : 0ull, b && b->state == PROGRAM_FAILED ? "failed" : "ok");
-    } else if (programs_ready(pso)) {
-        bool failed = false;
-        AcquireSRWLockShared(&pso->lock);
-        for (u32 i = 0; i < pso->variant_count; i++)
-            failed |= pso->variants[i].state == VARIANT_FAILED;
-        ReleaseSRWLockShared(&pso->lock);
-        if (!failed)
-            return; // still being made
-        snprintf(reason, sizeof(reason), "its desktop pipeline could not be made");
     } else {
-        return; // programs still building
+        snprintf(reason, sizeof(reason), "its desktop pipeline could not be made (see above)");
     }
     if (InterlockedExchange(&pso->skip_reported, 1) == 0)
         LOG_W("d3d12", "%s with pipeline %p skipped: %s", what, (void*)pso, reason);
@@ -680,15 +672,15 @@ void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics) {
 static ID3D12PipelineState* create_graphics(const ConsolePipelineState* pso, const PipelineOutputs& o,
                                             ID3D12RootSignature* signature) {
     const PipelineFixedState& f = pso->fixed;
-    const ShaderProgram* vs = pso->programs[0];
-    const ShaderProgram* ps = pso->programs[1];
+    const ShaderBinary& vs = pso->programs[0]->binary;
+    const ShaderBinary* ps = pso->programs[1] ? &pso->programs[1]->binary : nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
     d.pRootSignature = signature;
-    d.VS = {vs->dxil, vs->dxil_size};
+    d.VS = {vs.dxil, vs.dxil_size};
     if (ps)
         d.PS = {ps->dxil, ps->dxil_size};
     if (o.rect_list) {
-        const D3D12_SHADER_BYTECODE* gs = shader_rect_list_gs(vs->vs_param_mask);
+        const D3D12_SHADER_BYTECODE* gs = shader_rect_list_gs(vs.vs_param_mask);
         if (!gs)
             return nullptr;
         d.GS = *gs;
@@ -705,12 +697,12 @@ static ID3D12PipelineState* create_graphics(const ConsolePipelineState* pso, con
     D3D12_INPUT_ELEMENT_DESC elements[SHADER_MAX_VERTEX_ELEMENTS];
     u32 element_count = 0;
     for (u32 i = 0; i < f.element_count; i++) {
-        if (!(vs->vertex_element_mask & (1u << i)))
+        if (!(vs.vertex_element_mask & (1u << i)))
             continue;
         D3D12_INPUT_ELEMENT_DESC& e = elements[element_count++];
         e.SemanticName = "E";
         e.SemanticIndex = i;
-        e.Format = (DXGI_FORMAT)vs->element_format[i];
+        e.Format = (DXGI_FORMAT)vs.element_format[i];
         e.InputSlot = f.elements[i].slot;
         e.AlignedByteOffset = f.elements[i].offset;
         e.InputSlotClass = f.element_per_instance[i] ? D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
@@ -729,34 +721,85 @@ static ID3D12PipelineState* create_graphics(const ConsolePipelineState* pso, con
     HRESULT hr = g_device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&desktop));
     if (FAILED(hr))
         LOG_W("d3d12", "creating a translated graphics pipeline failed (0x%08lx): vs %016llx ps %016llx",
-              (unsigned long)hr, (unsigned long long)vs->key, ps ? (unsigned long long)ps->key : 0ull);
+              (unsigned long)hr, (unsigned long long)pso->programs[0]->key,
+              pso->programs[1] ? (unsigned long long)pso->programs[1]->key : 0ull);
     return desktop;
 }
 
 static ID3D12PipelineState* create_compute(const ConsolePipelineState* pso, ID3D12RootSignature* signature) {
-    const ShaderProgram* cs = pso->programs[0];
+    const ShaderBinary& cs = pso->programs[0]->binary;
     D3D12_COMPUTE_PIPELINE_STATE_DESC d = {};
     d.pRootSignature = signature;
-    d.CS = {cs->dxil, cs->dxil_size};
+    d.CS = {cs.dxil, cs.dxil_size};
     ID3D12PipelineState* desktop = nullptr;
     HRESULT hr = g_device->CreateComputePipelineState(&d, IID_PPV_ARGS(&desktop));
     if (FAILED(hr))
         LOG_W("d3d12", "creating a translated compute pipeline failed (0x%08lx): cs %016llx",
-              (unsigned long)hr, (unsigned long long)cs->key);
+              (unsigned long)hr, (unsigned long long)pso->programs[0]->key);
     return desktop;
 }
 
-static void build_variant(void* context) {
-    VariantJob* job = (VariantJob*)context;
-    ConsolePipelineState* pso = job->pso;
-    PipelineVariant& v = pso->variants[job->index];
+// What a variant is keyed by: the formats drawn to. A pipeline that neither tests nor writes depth or
+// stencil works with any depth target bound; desktop wants no depth format in it then (and its
+// variants don't differ by depth target). Programs must be ready.
+static PipelineOutputs variant_key(const ConsolePipelineState* pso, const PipelineOutputs* outputs) {
+    PipelineOutputs key;
+    memset(&key, 0, sizeof(key));
+    if (!pso->compute && outputs)
+        key = *outputs;
+    const ShaderProgram* ps = pso->programs[1];
+    if (!pso->fixed.depth_stencil.DepthEnable && !pso->fixed.depth_stencil.StencilEnable &&
+        !(ps && ps->binary.ps_writes_depth))
+        key.depth_format = DXGI_FORMAT_UNKNOWN;
+    return key;
+}
+
+static PipelineVariant* find_variant(ConsolePipelineState* pso, const PipelineOutputs& key) {
+    long count = pso->variant_count;
+    for (long i = 0; i < count; i++)
+        if (memcmp(&pso->variants[i].outputs, &key, sizeof(key)) == 0)
+            return &pso->variants[i];
+    return nullptr;
+}
+
+// The variant for `key`: an existing one, or a new one being built (`*added`: the caller builds it).
+// nullptr (logged once) when the pipeline has no room for more.
+static PipelineVariant* add_variant(ConsolePipelineState* pso, const PipelineOutputs& key, bool* added) {
+    *added = false;
+    AcquireSRWLockExclusive(&pso->lock);
+    PipelineVariant* v = find_variant(pso, key);
+    if (!v && pso->variant_count < PIPELINE_MAX_VARIANTS) {
+        v = &pso->variants[pso->variant_count];
+        v->outputs = key;
+        v->state = VARIANT_BUILDING;
+        v->desktop = nullptr;
+        v->signature = nullptr;
+        InterlockedIncrement(&pso->variant_count); // publishes it, filled in
+        *added = true;
+    }
+    ReleaseSRWLockExclusive(&pso->lock);
+    if (!v)
+        LOG_W_ONCE("d3d12", "a pipeline is drawn with more than %d sets of formats; draws skipped",
+                   PIPELINE_MAX_VARIANTS);
+    return v;
+}
+
+static void finish_variant(PipelineVariant* v, ID3D12PipelineState* desktop, ID3D12RootSignature* signature) {
+    v->signature = signature;
+    v->desktop = desktop;
+    InterlockedExchange((volatile LONG*)&v->state, desktop ? VARIANT_READY : VARIANT_FAILED);
+    WakeByAddressAll((void*)&v->state);
+}
+
+// Builds an added variant. Runs on worker threads; the programs are ready.
+static void build_variant(ConsolePipelineState* pso, PipelineVariant* v) {
     // The programs' inline samplers go to the root signature, each stage's for that stage.
     SamplerSet sets[2];
     u32 set_count = 0;
     for (u32 i = 0; i < 2; i++) {
         const ShaderProgram* p = pso->programs[i];
-        if (p && p->sampler_count)
-            sets[set_count++] = {p->samplers, p->sampler_count,
+        if (p && p->binary.sampler_count)
+            sets[set_count++] = {p->binary.samplers, p->binary.sampler_count,
                                  pso->compute ? D3D12_SHADER_VISIBILITY_ALL
                                  : i == 0     ? D3D12_SHADER_VISIBILITY_VERTEX
                                               : D3D12_SHADER_VISIBILITY_PIXEL};
@@ -764,73 +807,96 @@ static void build_variant(void* context) {
     ID3D12RootSignature* signature = console_root_signature_desktop(pso->root_signature, sets, set_count);
     ID3D12PipelineState* desktop = nullptr;
     if (signature)
-        desktop = pso->compute ? create_compute(pso, signature) : create_graphics(pso, v.outputs, signature);
-    v.signature = signature;
-    v.desktop = desktop;
-    InterlockedExchange((volatile LONG*)&v.state, desktop ? VARIANT_READY : VARIANT_FAILED);
-    console_release(pso);
+        desktop = pso->compute ? create_compute(pso, signature) : create_graphics(pso, v->outputs, signature);
+    finish_variant(v, desktop, signature);
+}
+
+struct VariantJob {
+    ConsolePipelineState* pso; // referenced for the job
+    PipelineVariant* variant;
+};
+
+static void variant_job(void* context) {
+    VariantJob* job = (VariantJob*)context;
+    build_variant(job->pso, job->variant);
+    console_release(job->pso);
     free(job);
+}
+
+static bool wait_variant(PipelineVariant* v) {
+    for (;;) {
+        u32 state = v->state;
+        if (state != VARIANT_BUILDING)
+            return state == VARIANT_READY;
+        WaitOnAddress(&v->state, &state, sizeof(state), INFINITE);
+    }
+}
+
+// A new variant a draw needs, built on a worker ahead of other work.
+static PipelineVariant* request_variant(ConsolePipelineState* pso, const PipelineOutputs& key) {
+    bool added;
+    PipelineVariant* v = add_variant(pso, key, &added);
+    if (!added)
+        return v;
+    VariantJob* job = (VariantJob*)malloc(sizeof(VariantJob));
+    if (!job || !console_try_add_ref(pso)) {
+        free(job);
+        finish_variant(v, nullptr, nullptr);
+        return v;
+    }
+    job->pso = pso;
+    job->variant = v;
+    if (!gpu_job_queue(variant_job, job)) {
+        console_release(pso);
+        free(job);
+        finish_variant(v, nullptr, nullptr);
+        return v;
+    }
+    return v;
+}
+
+// Waits worth knowing about are logged, each once: a pipeline waits at most once per set of formats.
+static void report_wait(const ConsolePipelineState* pso, const LARGE_INTEGER& start) {
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    f64 ms = (f64)(now.QuadPart - start.QuadPart) * 1000.0 / (f64)frequency.QuadPart;
+    const ShaderProgram* a = pso->programs[0];
+    const ShaderProgram* b = pso->programs[1];
+    if (ms >= 50.0)
+        LOG_I("d3d12", "a %s waited %.0f ms for pipeline %p (programs %016llx %016llx) to be made",
+              pso->compute ? "dispatch" : "draw", ms, (const void*)pso, a ? (unsigned long long)a->key : 0ull,
+              b ? (unsigned long long)b->key : 0ull);
+    else
+        LOG_D("d3d12", "a %s waited %.1f ms for pipeline %p to be made", pso->compute ? "dispatch" : "draw",
+              ms, (const void*)pso);
 }
 
 ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs,
                                               ID3D12RootSignature** signature) {
-    if (!pso || !pso->translated || !pso->root_signature || !pso->root_signature->desktop)
+    if (!pso || !desktop_signature_exists(pso))
         return nullptr;
+    // What isn't made yet is waited for: the draw is late, never left out.
+    LARGE_INTEGER wait_start = {};
     if (!programs_ready(pso)) {
+        QueryPerformanceCounter(&wait_start);
         for (u32 i = 0; i < 2; i++)
-            shader_program_hurry(pso->programs[i]);
-        return nullptr;
+            if (pso->programs[i] && !shader_program_wait(pso->programs[i]))
+                return nullptr;
     }
-    PipelineOutputs key = {};
-    if (!pso->compute && outputs)
-        key = *outputs;
-    // A pipeline that neither tests nor writes depth or stencil works with any depth target bound;
-    // desktop wants no depth format in it then (and its variants don't differ by depth target).
-    const ShaderProgram* ps = pso->programs[1];
-    if (!pso->fixed.depth_stencil.DepthEnable && !pso->fixed.depth_stencil.StencilEnable &&
-        !(ps && ps->ps_writes_depth))
-        key.depth_format = DXGI_FORMAT_UNKNOWN;
-    AcquireSRWLockShared(&pso->lock);
-    for (u32 i = 0; i < pso->variant_count; i++) {
-        PipelineVariant& v = pso->variants[i];
-        if (memcmp(&v.outputs, &key, sizeof(key)) == 0) {
-            ID3D12PipelineState* desktop = v.state == VARIANT_READY ? v.desktop : nullptr;
-            *signature = v.signature;
-            ReleaseSRWLockShared(&pso->lock);
-            return desktop;
-        }
-    }
-    ReleaseSRWLockShared(&pso->lock);
-    if (programs_failed(pso))
+    PipelineOutputs key = variant_key(pso, outputs);
+    PipelineVariant* v = find_variant(pso, key);
+    if (!v && !(v = request_variant(pso, key)))
         return nullptr;
-    // A new set of outputs: made on a worker.
-    AcquireSRWLockExclusive(&pso->lock);
-    for (u32 i = 0; i < pso->variant_count; i++)
-        if (memcmp(&pso->variants[i].outputs, &key, sizeof(key)) == 0) {
-            ReleaseSRWLockExclusive(&pso->lock);
-            return nullptr; // another thread got there first
-        }
-    if (pso->variant_count == PIPELINE_MAX_VARIANTS) {
-        ReleaseSRWLockExclusive(&pso->lock);
-        LOG_W_ONCE("d3d12", "a pipeline is drawn with more than %d sets of formats; draws skipped",
-                   PIPELINE_MAX_VARIANTS);
-        return nullptr;
+    if (v->state == VARIANT_BUILDING) {
+        if (!wait_start.QuadPart)
+            QueryPerformanceCounter(&wait_start);
+        wait_variant(v);
     }
-    u32 index = pso->variant_count++;
-    PipelineVariant& v = pso->variants[index];
-    v.outputs = key;
-    v.state = VARIANT_BUILDING;
-    v.desktop = nullptr;
-    v.signature = nullptr;
-    ReleaseSRWLockExclusive(&pso->lock);
-    VariantJob* job = (VariantJob*)malloc(sizeof(VariantJob));
-    if (!job || !console_try_add_ref(pso)) {
-        free(job);
-        InterlockedExchange((volatile LONG*)&v.state, VARIANT_FAILED);
+    if (wait_start.QuadPart)
+        report_wait(pso, wait_start);
+    if (v->state != VARIANT_READY)
         return nullptr;
-    }
-    job->pso = pso;
-    job->index = index;
-    gpu_job_queue(build_variant, job);
-    return nullptr;
+    *signature = v->signature;
+    return v->desktop;
 }
