@@ -145,6 +145,7 @@ bool shader_program_wait_started(ShaderProgram* p) {
 // --- building ----------------------------------------------------------------------------------------
 
 static DxcCreateInstanceProc g_dxc_create;
+static bool g_cache_open;         // the disk cache is in use
 static ShaderTarget g_target;     // what the device runs, for the translator
 static char g_dump_dir[MAX_PATH]; // SLUDGE_SHADER_DUMP, or empty
 
@@ -275,8 +276,9 @@ static void build_program(Worker& w, ShaderProgram* p) {
     } else {
         ready = translate_program(w, p, &b);
         InterlockedIncrement(ready ? &g_stats.built : &g_stats.failed);
-        if (ready)
-            shader_cache_store(p->key, p->code_size, b);
+        if (ready && g_cache_open && !shader_cache_store(p->key, p->code_size, b))
+            LOG_W_ONCE("gpu", "shader cache: cannot write to %ls; programs are translated again next run",
+                       shader_cache_folder());
     }
     p->binary = b;
     free(p->code);
@@ -479,9 +481,11 @@ static u64 cache_generation(IDxcCompiler3* compiler) {
 }
 
 static void prune_cache(void*) {
-    u32 removed = shader_cache_prune(14);
+    // A generation per translator build: keep the few most recently used (switching between builds
+    // stays quick), none older than two weeks.
+    u32 removed = shader_cache_prune(14, 4);
     if (removed)
-        LOG_I("gpu", "shader cache: removed %u generations unused for two weeks", removed);
+        LOG_I("gpu", "shader cache: removed %u older generations", removed);
 }
 
 static void open_cache(const wchar_t* root, IDxcCompiler3* compiler) {
@@ -497,6 +501,7 @@ static void open_cache(const wchar_t* root, IDxcCompiler3* compiler) {
         LOG_W("gpu", "shader cache: cannot use %ls; programs are translated on every run", root);
         return;
     }
+    g_cache_open = true;
     LOG_I("gpu", "shader cache: %ls", shader_cache_folder());
     gpu_job_queue_background(prune_cache, nullptr);
 }

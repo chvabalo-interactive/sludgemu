@@ -85,7 +85,8 @@ static void touch(const wchar_t* folder) {
 bool shader_cache_open(const wchar_t* root, u64 generation) {
     shader_cache_close();
     usize n = wcslen(root);
-    if (!n || n + 20 >= MAX_PATH)
+    // Room for the generation folder and a file name in it (key and temporary suffix).
+    if (!n || n + 64 >= MAX_PATH)
         return false;
     const wchar_t* separator = root[n - 1] == L'\\' || root[n - 1] == L'/' ? L"" : L"\\";
     _snwprintf(g_cache.root, MAX_PATH, L"%s%s", root, separator);
@@ -277,34 +278,79 @@ static void remove_folder(const wchar_t* folder) {
     RemoveDirectoryW(folder);
 }
 
-u32 shader_cache_prune(u32 max_age_days) {
-    if (!g_cache.open)
-        return 0;
-    FILETIME now_ft;
-    GetSystemTimeAsFileTime(&now_ft);
-    u64 now = ((u64)now_ft.dwHighDateTime << 32) | now_ft.dwLowDateTime;
-    u64 max_age = (u64)max_age_days * 24 * 3600 * 10000000ull; // FILETIME counts 100 ns
-    wchar_t pattern[MAX_PATH], current[17], path[MAX_PATH];
+#define PRUNE_MAX_KEEP 8
+
+// Calls `visit(name, last write time, context)` for each generation folder under the root other than
+// the open one. False if the root can't be listed.
+static bool for_other_generations(void (*visit)(const wchar_t* name, u64 written, void* context),
+                                  void* context) {
+    wchar_t pattern[MAX_PATH], current[17];
     _snwprintf(pattern, MAX_PATH, L"%s*", g_cache.root);
     _snwprintf(current, ARRAY_COUNT(current), L"%016llx", (unsigned long long)g_cache.generation);
-    u32 removed = 0;
     WIN32_FIND_DATAW fd;
     HANDLE find = FindFirstFileW(pattern, &fd);
     if (find == INVALID_HANDLE_VALUE)
-        return 0;
+        return false;
     do {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !is_generation_name(fd.cFileName) ||
             _wcsicmp(fd.cFileName, current) == 0)
             continue;
         u64 written = ((u64)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
-        if (written + max_age > now)
-            continue;
-        _snwprintf(path, MAX_PATH, L"%s%s", g_cache.root, fd.cFileName);
-        remove_folder(path);
-        removed++;
+        visit(fd.cFileName, written, context);
     } while (FindNextFileW(find, &fd));
     FindClose(find);
-    return removed;
+    return true;
+}
+
+struct Pruning {
+    u32 keep;
+    u32 newest_count;
+    u64 newest[PRUNE_MAX_KEEP]; // last write times of the most recently used, newest first
+    u64 oldest_allowed;         // folders written before this go
+    u32 removed;
+};
+
+static void note_generation(const wchar_t*, u64 written, void* context) {
+    Pruning* p = (Pruning*)context;
+    u32 at = p->newest_count < p->keep ? p->newest_count++ : p->keep;
+    for (; at > 0 && p->newest[at - 1] < written; at--)
+        if (at < p->keep)
+            p->newest[at] = p->newest[at - 1];
+    if (at < p->keep)
+        p->newest[at] = written;
+}
+
+static void prune_generation(const wchar_t* name, u64 written, void* context) {
+    Pruning* p = (Pruning*)context;
+    if (written >= p->oldest_allowed)
+        return;
+    wchar_t path[MAX_PATH];
+    _snwprintf(path, MAX_PATH, L"%s%s", g_cache.root, name);
+    remove_folder(path);
+    p->removed++;
+}
+
+u32 shader_cache_prune(u32 max_age_days, u32 keep) {
+    if (!g_cache.open)
+        return 0;
+    Pruning p = {};
+    p.keep = keep < PRUNE_MAX_KEEP ? keep : PRUNE_MAX_KEEP;
+    if (p.keep && !for_other_generations(note_generation, &p))
+        return 0;
+    FILETIME now_ft;
+    GetSystemTimeAsFileTime(&now_ft);
+    u64 now = ((u64)now_ft.dwHighDateTime << 32) | now_ft.dwLowDateTime;
+    u64 max_age = (u64)max_age_days * 24 * 3600 * 10000000ull; // FILETIME counts 100 ns
+    p.oldest_allowed = max_age < now ? now - max_age + 1 : 0;
+    // Every build of the translator is a generation of its own, so developers make many: past the
+    // few most recently used, the rest go whatever their age.
+    if (p.newest_count == p.keep) {
+        u64 kept = p.keep ? p.newest[p.keep - 1] : ~0ull;
+        if (kept > p.oldest_allowed)
+            p.oldest_allowed = kept;
+    }
+    for_other_generations(prune_generation, &p);
+    return p.removed;
 }
 
 // --- records -----------------------------------------------------------------------------------------

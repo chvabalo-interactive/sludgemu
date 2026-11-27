@@ -44,9 +44,9 @@ bool shader_cache_load(u64 key, u32 code_size, ShaderBinary* out);
 // Writes the program with `key`. False (unlogged) if it can't; the cache is only an optimization.
 bool shader_cache_store(u64 key, u32 code_size, const ShaderBinary& binary);
 
-// Deletes generation folders under the root other than the open one, unused for `max_age_days`.
-// Returns the number of folders removed.
-u32 shader_cache_prune(u32 max_age_days);
+// Deletes generation folders under the root other than the open one: those unused for
+// `max_age_days`, and all but the `keep` most recently used. Returns the number of folders removed.
+u32 shader_cache_prune(u32 max_age_days, u32 keep);
 
 // The record log. A record is an ID and data opaque to the cache.
 #define CACHE_RECORD_DATA_BYTES 16

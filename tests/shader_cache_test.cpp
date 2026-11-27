@@ -108,6 +108,22 @@ static void remove_tree(const wchar_t* dir) {
     RemoveDirectoryW(dir);
 }
 
+// Dates a folder's last write `seconds` back (pruning goes by it).
+static void set_written_ago(const wchar_t* folder, u64 seconds) {
+    HANDLE h =
+        CreateFileW(folder, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    u64 t = (((u64)now.dwHighDateTime << 32) | now.dwLowDateTime) - seconds * 10000000ull;
+    FILETIME then = {(DWORD)t, (DWORD)(t >> 32)};
+    CHECK(SetFileTime(h, nullptr, nullptr, &then));
+    CloseHandle(h);
+}
+
 void test_shader_cache() {
     wchar_t temp[MAX_PATH], root[MAX_PATH];
     GetTempPathW(MAX_PATH, temp);
@@ -180,21 +196,24 @@ void test_shader_cache() {
     // Pruning keeps the open generation and recent ones, removes old ones.
     wchar_t old_folder[MAX_PATH];
     _snwprintf(old_folder, MAX_PATH, L"%s\\%016llx", root, (unsigned long long)gen2);
-    CHECK(shader_cache_prune(14) == 0);
-    HANDLE h =
-        CreateFileW(old_folder, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    CHECK(h != INVALID_HANDLE_VALUE);
-    if (h != INVALID_HANDLE_VALUE) {
-        FILETIME now;
-        GetSystemTimeAsFileTime(&now);
-        u64 t = (((u64)now.dwHighDateTime << 32) | now.dwLowDateTime) - 30ull * 24 * 3600 * 10000000ull;
-        FILETIME old = {(DWORD)t, (DWORD)(t >> 32)};
-        CHECK(SetFileTime(h, nullptr, nullptr, &old));
-        CloseHandle(h);
-    }
-    CHECK(shader_cache_prune(14) == 1);
+    CHECK(shader_cache_prune(14, 4) == 0);
+    set_written_ago(old_folder, 30ull * 24 * 3600);
+    CHECK(shader_cache_prune(14, 4) == 1);
     CHECK(GetFileAttributesW(old_folder) == INVALID_FILE_ATTRIBUTES);
+    CHECK(load_matches(0xA, 64, a));
+
+    // Past the most recently used few, generations go whatever their age: of six recent ones (made
+    // a minute apart, the first one longest ago), the two used longest ago go.
+    wchar_t recent[6][MAX_PATH];
+    for (u32 i = 0; i < 6; i++) {
+        _snwprintf(recent[i], MAX_PATH, L"%s\\%016llx", root, 0xAB00000000000000ull + i);
+        CHECK(CreateDirectoryW(recent[i], nullptr));
+        set_written_ago(recent[i], (6 - i) * 60ull);
+    }
+    CHECK(shader_cache_prune(14, 4) == 2);
+    for (u32 i = 0; i < 6; i++)
+        CHECK((GetFileAttributesW(recent[i]) == INVALID_FILE_ATTRIBUTES) == (i < 2));
+    CHECK(shader_cache_prune(14, 0) == 4); // keeping none: all but the open one
     CHECK(load_matches(0xA, 64, a));
     shader_cache_close();
 
