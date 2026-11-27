@@ -943,50 +943,72 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
 
 // --- images ------------------------------------------------------------------------------------------
 
-// Samplers built from constants: the descriptor's fields in D3D12 terms. False (with the reason) for
-// what a desktop static sampler can't express.
-static bool decode_sampler(const u32 w[4], InlineSampler* out, const char** why) {
+// Samplers built from constants: the descriptor's fields in D3D12 terms, for a sampling instruction
+// that compares (an _c one) or not: the descriptor's comparison function applies only to those. False
+// (with the reason) for what a desktop static sampler can't express.
+static bool decode_sampler(const u32 w[4], bool compare, InlineSampler* out, const char** why) {
     static const u8 k_address[8] = {1, 2, 3, 5, 4, 5, 4, 5}; // wrap, mirror, clamp, mirror once, border
     memset(out, 0, sizeof(*out));
     for (u32 a = 0; a < 3; a++)
         out->address[a] = k_address[(w[0] >> (3 * a)) & 7];
     u32 aniso_ratio = (w[0] >> 9) & 7;
-    u32 compare = (w[0] >> 12) & 7;
+    u32 compare_func = (w[0] >> 12) & 7;
     out->unnormalized = (w[0] >> 15) & 1;
-    u32 reduction = (w[0] >> 29) & 3;
+    u32 filter_mode = (w[0] >> 29) & 3; // blend, min, max
     out->min_lod = (f32)(w[1] & 0xFFF) / 256.0f;
     out->max_lod = (f32)((w[1] >> 12) & 0xFFF) / 256.0f;
     out->mip_bias = (f32)((s32)(w[2] << 18) >> 18) / 256.0f;
+    // Filters: point, bilinear, then anisotropic over point or bilinear; mip none, point, linear, and
+    // point with an anisotropic adjustment.
     u32 mag = (w[2] >> 20) & 3, min = (w[2] >> 22) & 3, mip = (w[2] >> 26) & 3;
     out->border_color = (u8)((w[3] >> 30) & 3);
     if (out->border_color == 3) {
         *why = "a border color from the border color table";
         return false;
     }
-    if (reduction == 3) {
+    if (filter_mode == 3) {
         *why = "an unknown reduction mode";
         return false;
     }
-    if (mag >= 2 || min >= 2)
-        out->filter = 0x55; // anisotropic
+    if (compare && filter_mode) {
+        *why = "a comparison with a min/max reduction";
+        return false;
+    }
+    // D3D12's reduction field takes one of standard, comparison, minimum, maximum.
+    u32 reduction = compare ? 1 : filter_mode == 1 ? 2 : filter_mode == 2 ? 3 : 0;
+    bool aniso = mag >= 2 || min >= 2;
+    if (aniso)
+        out->filter = mip == 2 ? 0x55 : 0x54; // anisotropic, with linear or point mips
     else
         out->filter = (min == 1 ? 0x10 : 0) | (mag == 1 ? 0x4 : 0) | (mip == 2 ? 0x1 : 0);
-    if (compare)
-        out->filter |= 0x80;
-    if (reduction)
-        out->filter |= reduction == 1 ? 0x100 : 0x180; // minimum, maximum
-    out->comparison = (u8)(compare + 1);
+    out->filter |= reduction << 7;
+    out->comparison = (u8)(compare ? compare_func + 1 : 1); // D3D12's functions are the console's + 1
     out->max_anisotropy = (u8)(1u << (aniso_ratio > 4 ? 4 : aniso_ratio));
     if (out->max_lod >= 15.99f)
         out->max_lod = 3.402823466e+38f; // saturated: no limit
+    if (mip == 0) {
+        // No mipmapping: always the view's first level, whatever the LOD.
+        out->min_lod = 0.0f;
+        out->max_lod = 0.0f;
+    }
+    if (out->unnormalized) {
+        // What desktop samplers with unnormalized coordinates allow.
+        bool clamped =
+            (out->address[0] == 3 || out->address[0] == 4) && (out->address[1] == 3 || out->address[1] == 4);
+        if (!clamped || aniso || min != mag || compare || out->max_lod != 0.0f || out->min_lod != 0.0f) {
+            *why = "unnormalized coordinates with wrapping, mips, anisotropy, comparison or unequal filters";
+            return false;
+        }
+    }
     return true;
 }
 
-// The program's inline sampler for a descriptor, added on first use; -1 (failed) if impossible.
+// The program's inline sampler for a descriptor, added on first use; -1 (failed) if impossible. A
+// descriptor used both with and without comparison makes two samplers (their filters differ).
 static s32 inline_sampler(Translator& t, const RdnaInst& in, const u32 words[4], bool compare) {
     InlineSampler s;
     const char* why = nullptr;
-    if (!decode_sampler(words, &s, &why)) {
+    if (!decode_sampler(words, compare, &s, &why)) {
         translator_fail(t, "%s at 0x%x with a constant sampler using %s", rdna_op_name(in.op), in.offset,
                         why);
         return -1;
@@ -1003,9 +1025,6 @@ static s32 inline_sampler(Translator& t, const RdnaInst& in, const u32 words[4],
         out.samplers[out.sampler_count++] = s;
         if (compare)
             t.sampler_compare |= 1u << i;
-    } else if (((t.sampler_compare >> i) & 1) != (compare ? 1u : 0u)) {
-        translator_fail(t, "constant sampler %u used with and without comparison", i);
-        return -1;
     }
     return (s32)i;
 }

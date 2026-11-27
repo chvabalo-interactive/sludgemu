@@ -791,6 +791,7 @@ void test_xdsp();
 void test_xma();
 void test_layout_addressing();
 void test_bcpack();
+void test_shader_translate();
 
 int main() {
     log_init(nullptr, LOG_LEVEL_WARN);
@@ -818,6 +819,7 @@ int main() {
     test_xma();
     test_layout_addressing();
     test_bcpack();
+    test_shader_translate();
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "passed", g_failures);
     return g_failures;
 }

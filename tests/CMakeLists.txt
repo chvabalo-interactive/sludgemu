@@ -7,6 +7,7 @@ add_executable(sludgemu_tests
     xma_test.cpp
     layout_test.cpp
     bcpack_test.cpp
+    shader_translate_test.cpp
     ${PROJECT_SOURCE_DIR}/src/common/log.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory_tracking.cpp
@@ -19,5 +20,5 @@ add_executable(sludgemu_tests
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xma_decoder.cpp
 )
 target_include_directories(sludgemu_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(sludgemu_tests PRIVATE sludge_options opus addrlib agility)
+target_link_libraries(sludgemu_tests PRIVATE sludge_options sludge_shader opus addrlib agility)
 add_test(NAME memory COMMAND sludgemu_tests)

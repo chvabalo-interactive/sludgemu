@@ -1,0 +1,406 @@
+// Shader translation: hand-assembled RDNA 2 programs through shader_translate(), checking what the
+// static analysis makes of them (samplers built from constants, descriptors moved through register
+// swaps) and that what it can't place fails instead of translating wrong.
+
+#include <string.h>
+
+#include "shader/rdna.h"
+#include "shader/translate.h"
+#include "test.h"
+
+// --- a small assembler ---------------------------------------------------------------------------------
+
+// Operand encodings of the scalar source fields.
+enum : u32 {
+    VCC = 106,
+    VCC_HI = 107,
+    NUL = 125,
+    EXEC_LO = 126,
+    ZERO = 128, // inline integers: 128 + n for 0..64
+    MINUS_ONE = 193,
+    LIT = 255, // a literal follows
+    V0 = 256,  // VALU sources: VGPRs from 256
+};
+
+struct Asm {
+    u32 w[256];
+    u32 n;
+
+    void put(u32 word) {
+        if (n < 256)
+            w[n++] = word;
+    }
+    void sop1(u32 op, u32 sdst, u32 s0, u32 literal = 0) {
+        put(0xBE800000u | sdst << 16 | op << 8 | s0);
+        if (s0 == LIT)
+            put(literal);
+    }
+    void sop2(u32 op, u32 sdst, u32 s0, u32 s1, u32 literal = 0) {
+        put(0x80000000u | op << 23 | sdst << 16 | s1 << 8 | s0);
+        if (s0 == LIT || s1 == LIT)
+            put(literal);
+    }
+    void sopk(u32 op, u32 sdst, u32 imm) { put(0xB0000000u | op << 23 | sdst << 16 | (imm & 0xFFFF)); }
+    void sopp(u32 op, u32 imm) { put(0xBF800000u | op << 16 | (imm & 0xFFFF)); }
+    void smem(u32 op, u32 sdata, u32 sbase, u32 offset) {
+        put(0xF4000000u | op << 18 | sdata << 6 | sbase / 2);
+        put(NUL << 25 | offset);
+    }
+    // Sampling and loads: 2D, `dmask` components.
+    void mimg(u32 op, u32 vdata, u32 vaddr, u32 srsrc, u32 ssamp, u32 dmask) {
+        put(0xF0000000u | (op & 0x7F) << 18 | dmask << 8 | 1u << 3 | (op >> 7));
+        put((ssamp / 4) << 21 | (srsrc / 4) << 16 | vdata << 8 | vaddr);
+    }
+    void vop3(u32 op, u32 vdst, u32 s0, u32 s1, u32 s2 = 0) {
+        put(0xD4000000u | op << 16 | vdst);
+        put(s2 << 18 | s1 << 9 | s0);
+    }
+    void vopc(u32 op, u32 s0, u32 vsrc1) { put(0x7C000000u | op << 17 | vsrc1 << 9 | s0); }
+    void end() { sopp(1, 0); }
+};
+
+// Opcodes (rdna_ops.inc).
+enum : u32 {
+    SOP2_AND_B32 = 14,
+    SOP2_XOR_B32 = 18,
+    SOP2_XOR_B64 = 19,
+    SOP2_BFM_B32 = 36,
+    SOP2_BFM_B64 = 37,
+    SOP1_MOV_B32 = 3,
+    SOP1_MOV_B64 = 4,
+    SOP1_MOVRELD_B32 = 48,
+    SOPK_MOVK_I32 = 0,
+    SOPK_ADDK_I32 = 15,
+    SMEM_LOAD_DWORD = 0,
+    SMEM_LOAD_DWORDX4 = 2,
+    SMEM_LOAD_DWORDX8 = 3,
+    MIMG_SAMPLE_LZ = 39,
+    MIMG_SAMPLE_C_LZ = 47,
+    VOPC_CMP_EQ_U32 = 0xC2,
+    VOP3_READLANE = 0x360,
+    VOP3_WRITELANE = 0x361,
+};
+
+// A compute program with a resource table in s0 (all SRVs) and a sampler table in s1.
+static ShaderInfo compute_info() {
+    ShaderInfo info = {};
+    info.stage = SHADER_COMPUTE;
+    info.user_sgprs = 2;
+    info.parameter_count = 2;
+    info.parameters[0].kind = USER_DATA_RESOURCE_TABLE;
+    info.parameters[0].sgpr = 0;
+    info.parameters[0].dwords = 1;
+    info.parameters[0].range_count = 1;
+    info.parameters[0].ranges[0] = {RANGE_SRV, 0, ~0u};
+    info.parameters[1].kind = USER_DATA_SAMPLER_TABLE;
+    info.parameters[1].sgpr = 1;
+    info.parameters[1].dwords = 1;
+    info.resource_heap_sgpr = NO_HEAP_SGPR;
+    info.sampler_heap_sgpr = NO_HEAP_SGPR;
+    info.threads[0] = 64;
+    info.threads[1] = 1;
+    info.threads[2] = 1;
+    info.thread_id_count = 1;
+    return info;
+}
+
+// Loads the texture descriptor from slot 0 of the resource table into s[8:15], and with `sampler` the
+// sampler descriptor from slot 0 of the sampler table into s[16:19].
+static void load_descriptors(Asm& a, bool sampler) {
+    a.sop1(SOP1_MOV_B32, 2, 0);
+    a.sop1(SOP1_MOV_B32, 3, ZERO);
+    a.smem(SMEM_LOAD_DWORDX8, 8, 2, 0);
+    if (sampler) {
+        a.sop1(SOP1_MOV_B32, 4, 1);
+        a.sop1(SOP1_MOV_B32, 5, ZERO);
+        a.smem(SMEM_LOAD_DWORDX4, 16, 4, 0);
+    }
+}
+
+// A constant sampler descriptor in s[104:107] the way compilers build it, the upper half in VCC:
+// clamp, bilinear, point mips, LOD 0..12.
+static void constant_sampler_in_vcc(Asm& a) {
+    a.sopk(SOPK_MOVK_I32, 104, 0x92);
+    a.sop2(SOP2_BFM_B32, 105, ZERO + 2, ZERO + 22);
+    a.sop1(SOP1_MOV_B64, VCC, LIT, 0x14500000);
+}
+
+static void sample(Asm& a, u32 ssamp) {
+    a.mimg(MIMG_SAMPLE_LZ, 0, 0, 8, ssamp, 0xF);
+}
+
+static TranslatedShader g_out;
+
+static bool translate(const Asm& a, const ShaderInfo& info) {
+    return shader_translate(a.w, a.n * 4, info, &g_out);
+}
+
+static bool error_has(const char* text) {
+    return strstr(g_out.error, text) != nullptr;
+}
+
+static bool hlsl_has(const char* text) {
+    return g_out.hlsl.data && strstr(g_out.hlsl.data, text) != nullptr;
+}
+
+// --- constant samplers ---------------------------------------------------------------------------------
+
+static void test_constant_sampler_in_vcc() {
+    ShaderInfo info = compute_info();
+    Asm a = {};
+    load_descriptors(a, false);
+    constant_sampler_in_vcc(a);
+    sample(a, 104);
+    a.end();
+    CHECK(translate(a, info));
+    CHECK(g_out.sampler_count == 1);
+    const InlineSampler& s = g_out.samplers[0];
+    CHECK(s.filter == 0x14); // linear min/mag, point mips
+    CHECK(s.address[0] == 3 && s.address[1] == 3 && s.address[2] == 3);
+    CHECK(s.min_lod == 0.0f && s.max_lod == 12.0f);
+    CHECK(s.comparison == 1 && s.border_color == 0 && !s.unnormalized);
+    CHECK(hlsl_has("SamplerState g_sampler0 : register(s0, space103);"));
+    CHECK(hlsl_has("SamplerState smp_ = g_sampler0;"));
+}
+
+static void test_constant_sampler_bfm64_border() {
+    ShaderInfo info = compute_info();
+    Asm a = {};
+    load_descriptors(a, false);
+    a.sop2(SOP2_BFM_B64, 104, ZERO + 2, ZERO + 54); // s105 = 0x00C00000 (LOD up to 12), s104 = 0
+    a.sop1(SOP1_MOV_B32, 104, LIT, 0x1B6);          // border addressing everywhere
+    a.sop1(SOP1_MOV_B64, VCC, LIT, 0x14500000);
+    sample(a, 104);
+    a.end();
+    CHECK(translate(a, info));
+    CHECK(g_out.sampler_count == 1);
+    const InlineSampler& s = g_out.samplers[0];
+    CHECK(s.address[0] == 4 && s.address[1] == 4 && s.address[2] == 4);
+    CHECK(s.border_color == 0); // transparent black
+    CHECK(s.max_lod == 12.0f);
+}
+
+// Values a constant must not outlive: a compare writing VCC, a non-foldable XOR into VCC's high half.
+static void test_stale_vcc_constants() {
+    ShaderInfo info = compute_info();
+    {
+        Asm a = {};
+        load_descriptors(a, false);
+        constant_sampler_in_vcc(a);
+        a.vopc(VOPC_CMP_EQ_U32, V0 + 0, 1);
+        sample(a, 104);
+        a.end();
+        CHECK(!translate(a, info));
+    }
+    {
+        // s_addk keeps a constant a constant: the bias field picks up the 1.
+        Asm a = {};
+        load_descriptors(a, false);
+        constant_sampler_in_vcc(a);
+        a.sopk(SOPK_ADDK_I32, VCC, 1);
+        sample(a, 104);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(g_out.sampler_count == 1 && g_out.samplers[0].mip_bias == 1.0f / 256.0f);
+    }
+    {
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, EXEC_LO, MINUS_ONE); // wave32
+        load_descriptors(a, false);
+        constant_sampler_in_vcc(a);
+        a.sop2(SOP2_XOR_B32, VCC_HI, 0, VCC_HI); // s0 isn't known
+        sample(a, 104);
+        a.end();
+        CHECK(!translate(a, info));
+    }
+}
+
+static void constant_sampler(Asm& a, u32 reg, const u32 w[4]) {
+    for (u32 i = 0; i < 4; i++)
+        a.sop1(SOP1_MOV_B32, reg + i, LIT, w[i]);
+}
+
+static void test_sampler_decoding() {
+    ShaderInfo info = compute_info();
+    // Point everything, wrap, comparison function NEVER (0), LOD 0..1.
+    u32 never[4] = {0x0, 0x100000, 0x04000000, 0};
+    {
+        // A comparing sample honours NEVER; without comparison the function is ignored.
+        Asm a = {};
+        load_descriptors(a, false);
+        constant_sampler(a, 20, never);
+        a.mimg(MIMG_SAMPLE_C_LZ, 0, 0, 8, 20, 0x1);
+        a.mimg(MIMG_SAMPLE_LZ, 4, 0, 8, 20, 0xF);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(g_out.sampler_count == 2);
+        CHECK(g_out.samplers[0].filter == 0x80 && g_out.samplers[0].comparison == 1);
+        CHECK(g_out.samplers[1].filter == 0x00 && g_out.samplers[1].comparison == 1);
+        CHECK(hlsl_has("SamplerComparisonState g_sampler0"));
+        CHECK(hlsl_has("SamplerState g_sampler1"));
+    }
+    {
+        // A comparison function on a sampler used without comparison doesn't make a comparison filter.
+        u32 less[4] = {1u << 12, 0x100000, 0x04000000, 0};
+        Asm a = {};
+        load_descriptors(a, false);
+        constant_sampler(a, 20, less);
+        a.mimg(MIMG_SAMPLE_LZ, 4, 0, 8, 20, 0xF);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(g_out.sampler_count == 1 && g_out.samplers[0].filter == 0x00);
+    }
+    {
+        // Comparison together with a min reduction has no D3D12 form.
+        u32 min_reduction[4] = {1u << 29, 0x100000, 0x04000000, 0};
+        Asm a = {};
+        load_descriptors(a, false);
+        constant_sampler(a, 20, min_reduction);
+        a.mimg(MIMG_SAMPLE_C_LZ, 0, 0, 8, 20, 0x1);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("min/max reduction"));
+    }
+    {
+        // Min and max reductions without comparison.
+        u32 max_reduction[4] = {2u << 29, 0x100000, 0x04000000, 0};
+        Asm a = {};
+        load_descriptors(a, false);
+        constant_sampler(a, 20, max_reduction);
+        sample(a, 20);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(g_out.sampler_count == 1 && g_out.samplers[0].filter == 0x180);
+    }
+    {
+        // No mip filter: the first level only.
+        u32 no_mips[4] = {0x0, 0xC00000, 0x00500000, 0};
+        Asm a = {};
+        load_descriptors(a, false);
+        constant_sampler(a, 20, no_mips);
+        sample(a, 20);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(g_out.sampler_count == 1 && g_out.samplers[0].filter == 0x14);
+        CHECK(g_out.samplers[0].min_lod == 0.0f && g_out.samplers[0].max_lod == 0.0f);
+    }
+    {
+        // Anisotropic with point mips.
+        u32 aniso_point[4] = {4u << 9, 0xC00000, 0x04F00000, 0};
+        Asm a = {};
+        load_descriptors(a, false);
+        constant_sampler(a, 20, aniso_point);
+        sample(a, 20);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(g_out.sampler_count == 1 && g_out.samplers[0].filter == 0x54);
+        CHECK(g_out.samplers[0].max_anisotropy == 16);
+    }
+    {
+        // Unnormalized coordinates: clamped and without mips is fine, wrapping isn't.
+        u32 clamped[4] = {0x92 | 1u << 15, 0, 0x00500000, 0};
+        u32 wrapped[4] = {1u << 15, 0, 0x00500000, 0};
+        Asm a = {};
+        load_descriptors(a, false);
+        constant_sampler(a, 20, clamped);
+        sample(a, 20);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(g_out.sampler_count == 1 && g_out.samplers[0].unnormalized);
+        Asm b = {};
+        load_descriptors(b, false);
+        constant_sampler(b, 20, wrapped);
+        sample(b, 20);
+        b.end();
+        CHECK(!translate(b, info));
+        CHECK(error_has("unnormalized"));
+    }
+}
+
+// --- heap samplers through register swaps ----------------------------------------------------------------
+
+// Copies the loaded sampler s[16:19] to s[20:23] except its first dword, which comes through a
+// three-XOR swap of s16 with s20 (s20 holding something else first).
+static void test_swapped_heap_sampler() {
+    ShaderInfo info = compute_info();
+    for (u32 commuted = 0; commuted < 2; commuted++) {
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sop1(SOP1_MOV_B32, 21, 17);
+        a.sop1(SOP1_MOV_B32, 22, 18);
+        a.sop1(SOP1_MOV_B32, 23, 19);
+        a.sop1(SOP1_MOV_B32, 20, ZERO + 5);
+        if (commuted)
+            a.sop2(SOP2_XOR_B32, 16, 20, 16);
+        else
+            a.sop2(SOP2_XOR_B32, 16, 16, 20);
+        a.sop1(SOP1_MOV_B32, 30, ZERO + 1); // unrelated work in between
+        a.sop2(SOP2_XOR_B32, 20, 16, 20);
+        a.sop1(SOP1_MOV_B32, 31, ZERO + 2);
+        a.sop2(SOP2_XOR_B32, 16, 16, 20);
+        sample(a, 20);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(g_out.sampler_count == 0);
+        CHECK(hlsl_has("SamplerDescriptorHeap[s20 >> 4]"));
+    }
+    {
+        // 64 bits wide, with VCC: the sampler's upper half moves into VCC.
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sop1(SOP1_MOV_B64, 104, 16);
+        a.sop1(SOP1_MOV_B64, VCC, ZERO);
+        a.sop2(SOP2_XOR_B64, VCC, VCC, 18);
+        a.sop2(SOP2_XOR_B64, 18, VCC, 18);
+        a.sop2(SOP2_XOR_B64, VCC, VCC, 18);
+        sample(a, 104);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(g_out.sampler_count == 0);
+        CHECK(hlsl_has("SamplerDescriptorHeap[s104 >> 4]"));
+    }
+    {
+        // Another write to one of the registers between the steps: not a swap.
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sop1(SOP1_MOV_B32, 21, 17);
+        a.sop1(SOP1_MOV_B32, 22, 18);
+        a.sop1(SOP1_MOV_B32, 23, 19);
+        a.sop1(SOP1_MOV_B32, 20, ZERO + 5);
+        a.sop2(SOP2_XOR_B32, 16, 16, 20);
+        a.sop1(SOP1_MOV_B32, 20, ZERO + 7);
+        a.sop2(SOP2_XOR_B32, 20, 16, 20);
+        a.sop2(SOP2_XOR_B32, 16, 16, 20);
+        sample(a, 20);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("sampler"));
+    }
+    {
+        // Registers picked at run time anywhere in the program: no swap is certain.
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sop1(SOP1_MOV_B32, 21, 17);
+        a.sop1(SOP1_MOV_B32, 22, 18);
+        a.sop1(SOP1_MOV_B32, 23, 19);
+        a.sop1(SOP1_MOV_B32, 20, ZERO + 5);
+        a.sop2(SOP2_XOR_B32, 16, 16, 20);
+        a.sop2(SOP2_XOR_B32, 20, 16, 20);
+        a.sop2(SOP2_XOR_B32, 16, 16, 20);
+        sample(a, 20);
+        a.sop1(SOP1_MOVRELD_B32, 40, 41);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("sampler"));
+    }
+}
+
+void test_shader_translate() {
+    rdna_init();
+    test_constant_sampler_in_vcc();
+    test_constant_sampler_bfm64_border();
+    test_stale_vcc_constants();
+    test_sampler_decoding();
+    test_swapped_heap_sampler();
+    g_out.hlsl.release();
+}

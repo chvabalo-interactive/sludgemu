@@ -155,8 +155,19 @@ static void set_tag(TagState& s, const RdnaOperand& o, u32 part, Tag t) {
     }
 }
 
+// Scalar registers whose values the analysis tracks: SGPRs and VCC (compilers build descriptors in VCC
+// when SGPRs run short; translated code holds VCC as a plain value unless a compare writes it, which
+// forgets the constant). EXEC, held as a broadcast mask, and M0 are left out: nothing reads their
+// constants. `part` picks a dword of a wider operand.
+static bool is_scalar_value_reg(const RdnaOperand& o, u32 part = 0) {
+    if (o.kind == OPND_SGPR)
+        return true;
+    u32 reg = o.reg + part;
+    return o.kind == OPND_SPECIAL && reg >= SRC_VCC_LO && reg <= SRC_VCC_HI;
+}
+
 // The value of an integer operand known at translation time: literals (zero-extended for 64-bit
-// operations), inline integers (sign-extended), and SGPRs holding constants.
+// operations), inline integers (sign-extended), and SGPRs and VCC holding constants.
 static bool constant_of(const TagState& s, const RdnaOperand& o, u32 part, u32* value) {
     switch (o.kind) {
     case OPND_LITERAL:
@@ -171,14 +182,15 @@ static bool constant_of(const TagState& s, const RdnaOperand& o, u32 part, u32* 
         }
         return true;
     case OPND_SGPR:
-        return sgpr_constant(s, o.reg + part, value);
+    case OPND_SPECIAL:
+        return is_scalar_value_reg(o, part) && sgpr_constant(s, o.reg + part, value);
     default:
         return false;
     }
 }
 
 static void set_constant(TagState& s, const RdnaOperand& o, u32 part, u32 value) {
-    if (o.kind != OPND_SGPR)
+    if (!is_scalar_value_reg(o, part))
         return;
     u32 reg = (o.reg + part) & 127;
     s.constant[reg] = value;
@@ -251,7 +263,7 @@ static bool eval_const_u32(const TagState& s, const RdnaOperand& o, OperandType 
 // Scalar integer results of constant operands, evaluated at translation time (programs build sampler
 // descriptors and the like from constants with arithmetic, not only with moves).
 static bool fold_scalar(const TagState& s, const RdnaInst& in, u32* out) {
-    if (in.dst[0].kind != OPND_SGPR || in.dst[0].count != 1)
+    if (!is_scalar_value_reg(in.dst[0]) || in.dst[0].count != 1)
         return false;
     u32 a = 0, b = 0;
     if (in.num_src < 1 || !eval_const_u32(s, in.src[0], TYPE_32, 0, &a))
@@ -375,7 +387,7 @@ static bool fold_scalar(const TagState& s, const RdnaInst& in, u32* out) {
 }
 
 static void set_any_constant(TagState& s, const RdnaOperand& o, u32 part, u32 value) {
-    if (o.kind == OPND_SGPR) {
+    if (is_scalar_value_reg(o, part)) {
         set_constant(s, o, part, value);
     } else if (o.kind == OPND_VGPR) {
         // Lanes outside EXEC keep their old value: the value holds everywhere only if written while
@@ -444,20 +456,28 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     if (inst_idx != ~0u && t.xor_swap_role) {
         u8 role = t.xor_swap_role[inst_idx];
         if (role == 1) {
-            u32 a = in.dst[0].reg & 127, b = in.src[1].reg & 127;
-            Tag st = s.sgpr[a];
-            s.sgpr[a] = s.sgpr[b];
-            s.sgpr[b] = st;
-            u16 sd = s.descriptor[a];
-            s.descriptor[a] = s.descriptor[b];
-            s.descriptor[b] = sd;
-            u32 sv = s.constant[a];
-            s.constant[a] = s.constant[b];
-            s.constant[b] = sv;
-            u64 ka = (s.constant_known[a / 64] >> (a % 64)) & 1ull;
-            u64 kb = (s.constant_known[b / 64] >> (b % 64)) & 1ull;
-            s.constant_known[a / 64] = (s.constant_known[a / 64] & ~(1ull << (a % 64))) | (kb << (a % 64));
-            s.constant_known[b / 64] = (s.constant_known[b / 64] & ~(1ull << (b % 64))) | (ka << (b % 64));
+            // The whole swap happens here: the source that is not the destination is the register
+            // exchanged with it, dword by dword.
+            const RdnaOperand& other = in.src[0].reg == in.dst[0].reg ? in.src[1] : in.src[0];
+            u32 width = in.op == OP_S_XOR_B64 ? 2 : 1;
+            for (u32 part = 0; part < width; part++) {
+                u32 a = (in.dst[0].reg + part) & 127, b = (other.reg + part) & 127;
+                Tag st = s.sgpr[a];
+                s.sgpr[a] = s.sgpr[b];
+                s.sgpr[b] = st;
+                u16 sd = s.descriptor[a];
+                s.descriptor[a] = s.descriptor[b];
+                s.descriptor[b] = sd;
+                u32 sv = s.constant[a];
+                s.constant[a] = s.constant[b];
+                s.constant[b] = sv;
+                u64 ka = (s.constant_known[a / 64] >> (a % 64)) & 1ull;
+                u64 kb = (s.constant_known[b / 64] >> (b % 64)) & 1ull;
+                s.constant_known[a / 64] =
+                    (s.constant_known[a / 64] & ~(1ull << (a % 64))) | (kb << (a % 64));
+                s.constant_known[b / 64] =
+                    (s.constant_known[b / 64] & ~(1ull << (b % 64))) | (ka << (b % 64));
+            }
             return;
         }
         if (role == 2)
@@ -498,13 +518,15 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
         set_constant(s, in.dst[0], 0, (u32)(s32)in.simm16);
         return;
-    case OP_S_ADDK_I32:
+    case OP_S_ADDK_I32: {
+        // Adds to the register in place: a constant stays one, anything else is forgotten.
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
-        if (in.dst[0].kind == OPND_SGPR && sgpr_constant(s, in.dst[0].reg, &value))
-            s.constant[in.dst[0].reg & 127] += (u32)(s32)in.simm16;
-        else if (in.dst[0].kind == OPND_SGPR)
-            s.constant_known[(in.dst[0].reg & 127) / 64] &= ~(1ull << ((in.dst[0].reg & 127) % 64));
+        bool known = constant_of(s, in.dst[0], 0, &value);
+        set_tag(s, in.dst[0], 0, carried(tag_of(s, in.dst[0]), TAG_NONE));
+        if (known)
+            set_constant(s, in.dst[0], 0, value + (u32)(s32)in.simm16);
         return;
+    }
     case OP_S_SWAPPC_B64: // the fetch subroutine: the return address, and the inputs it loads
         for (u32 i = 0; i < 2; i++) {
             set_tag(s, in.dst[0], i, TAG_NONE);
@@ -804,14 +826,92 @@ static void tags_entry(const ShaderInfo& info, TagState& s) {
     s.sgpr[SRC_VCC_LO] = s.sgpr[SRC_VCC_HI] = make_tag(TAG_MASK, 0);
 }
 
-static bool is_sgpr_xor_pair(const RdnaInst& in, u32* dst, u32* s0, u32* s1) {
-    if (in.op != OP_S_XOR_B32 || in.dst[0].kind != OPND_SGPR || in.src[0].kind != OPND_SGPR ||
-        in.src[1].kind != OPND_SGPR)
+// An operand of a scalar XOR that can take part in a swap: SGPRs or VCC (never EXEC), `width` dwords.
+static bool xor_register(const RdnaOperand& o, u32 width, u32* reg) {
+    bool vcc = o.kind == OPND_SPECIAL && (o.reg == SRC_VCC_LO || (o.reg == SRC_VCC_HI && width == 1));
+    if (o.kind != OPND_SGPR && !vcc)
         return false;
-    *dst = in.dst[0].reg & 127;
-    *s0 = in.src[0].reg & 127;
-    *s1 = in.src[1].reg & 127;
+    *reg = o.reg;
     return true;
+}
+
+// A scalar XOR of registers: destination, sources and width in dwords.
+static bool xor_operands(const RdnaInst& in, u32* dst, u32* s0, u32* s1, u32* width) {
+    if (in.op != OP_S_XOR_B32 && in.op != OP_S_XOR_B64)
+        return false;
+    *width = in.op == OP_S_XOR_B64 ? 2 : 1;
+    return xor_register(in.dst[0], *width, dst) && xor_register(in.src[0], *width, s0) &&
+           xor_register(in.src[1], *width, s1);
+}
+
+static bool overlaps(const RdnaOperand& o, u32 reg, u32 width) {
+    if (o.kind != OPND_SGPR && !(o.kind == OPND_SPECIAL && o.reg < 128))
+        return false;
+    u32 first = o.reg, count = o.count ? o.count : 1u; // special registers may come with count 0
+    return first < reg + width && reg < first + count;
+}
+
+// Whether an instruction reads or writes any of the scalar registers [reg, reg + width), including the
+// VCC reads the decoder leaves implicit.
+static bool touches(const RdnaInst& in, u32 reg, u32 width) {
+    for (u32 d = 0; d < 2; d++)
+        if (overlaps(in.dst[d], reg, width))
+            return true;
+    for (u32 k = 0; k < in.num_src; k++)
+        if (overlaps(in.src[k], reg, width))
+            return true;
+    bool vcc = reg <= SRC_VCC_HI && SRC_VCC_LO < reg + width;
+    return vcc && (in.op == OP_S_CBRANCH_VCCZ || in.op == OP_S_CBRANCH_VCCNZ || in.op == OP_V_DIV_FMAS_F32 ||
+                   in.op == OP_V_DIV_FMAS_F64);
+}
+
+static bool picks_registers_at_run_time(RdnaOp op) {
+    return op == OP_S_MOVRELS_B32 || op == OP_S_MOVRELS_B64 || op == OP_S_MOVRELD_B32 ||
+           op == OP_S_MOVRELD_B64 || op == OP_S_MOVRELSD_2_B32 || op == OP_V_MOVRELD_B32 ||
+           op == OP_V_MOVRELS_B32 || op == OP_V_MOVRELSD_B32 || op == OP_V_MOVRELSD_2_B32;
+}
+
+// Three-XOR register swaps (a ^= b; b ^= a; a ^= b), which compilers emit to exchange two registers
+// without a spare one. Folded step by step the tags would be lost, so the first XOR swaps the tags and
+// the other two leave them alone (xor_swap_role 1 and 2); the XORs themselves are still emitted, on
+// plain values. The steps may be interleaved with other instructions as long as none of those touches
+// the two registers, and all three must be in one block.
+static void find_xor_swaps(Translator& t) {
+    const Program& p = t.program;
+    for (u32 i = 0; i < p.count; i++)
+        if (picks_registers_at_run_time(p.insts[i].op))
+            return; // any register may change anywhere: no swap is certain
+    for (u32 b = 0; b < p.block_count; b++) {
+        for (u32 i = p.blocks[b].first; i < p.blocks[b].end; i++) {
+            u32 d, s0, s1, w;
+            if (t.xor_swap_role[i] || !xor_operands(p.insts[i], &d, &s0, &s1, &w) || s0 == s1 ||
+                (d != s0 && d != s1))
+                continue;
+            u32 other = d == s0 ? s1 : s0;
+            if (d < other + w && other < d + w)
+                continue; // partly the same registers
+            u32 steps[3] = {i, 0, 0};
+            u32 n = 1;
+            for (u32 j = i + 1; j < p.blocks[b].end && n < 3; j++) {
+                const RdnaInst& in = p.insts[j];
+                if (in.op == OP_S_SETPC_B64 || in.op == OP_S_SWAPPC_B64 || in.op == OP_S_GETPC_B64)
+                    break;
+                if (!touches(in, d, w) && !touches(in, other, w))
+                    continue;
+                // The next step: an XOR of the same two registers into `other`, then into `d`.
+                u32 jd, j0, j1, jw;
+                if (t.xor_swap_role[j] || !xor_operands(in, &jd, &j0, &j1, &jw) || jw != w ||
+                    !((j0 == d && j1 == other) || (j0 == other && j1 == d)) || jd != (n == 1 ? other : d))
+                    break;
+                steps[n++] = j;
+            }
+            if (n < 3)
+                continue;
+            t.xor_swap_role[steps[0]] = 1;
+            t.xor_swap_role[steps[1]] = 2;
+            t.xor_swap_role[steps[2]] = 2;
+        }
+    }
 }
 
 // Spill VGPRs: registers only v_writelane_b32 writes and only v_readlane_b32 reads, always at constant
@@ -877,25 +977,7 @@ static bool analyze_tags(Translator& t) {
     t.xor_swap_role = (u8*)calloc(p.count + 1, 1);
     if (!t.xor_swap_role)
         return false;
-    for (u32 b = 0; b < p.block_count; b++) {
-        for (u32 i = p.blocks[b].first; i + 2 < p.blocks[b].end; i++) {
-            u32 d0, a0, b0, d1, a1, b1, d2, a2, b2;
-            if (!is_sgpr_xor_pair(p.insts[i], &d0, &a0, &b0) ||
-                !is_sgpr_xor_pair(p.insts[i + 1], &d1, &a1, &b1) ||
-                !is_sgpr_xor_pair(p.insts[i + 2], &d2, &a2, &b2))
-                continue;
-            if (a0 == b0 || d0 != a0 || d2 != a0 || d1 != b0)
-                continue;
-            if (!((a1 == a0 && b1 == b0) || (a1 == b0 && b1 == a0)))
-                continue;
-            if (!((a2 == a0 && b2 == b0) || (a2 == b0 && b2 == a0)))
-                continue;
-            t.xor_swap_role[i] = 1;
-            t.xor_swap_role[i + 1] = 2;
-            t.xor_swap_role[i + 2] = 2;
-            i += 2;
-        }
-    }
+    find_xor_swaps(t);
     t.block_entry = (TagState*)calloc(p.block_count, sizeof(TagState));
     bool* reached = (bool*)calloc(p.block_count, 1);
     if (!t.block_entry || !reached) {
