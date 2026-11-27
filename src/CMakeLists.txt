@@ -1,6 +1,6 @@
 # Console shader decoding and translation: platform independent, shared by sludgemu, the unit tests
 # and the shader tool.
-add_library(sludge_shader STATIC
+set(SLUDGE_SHADER_SOURCES
     shader/rdna.h
     shader/rdna_ops.inc
     shader/rdna_decode.cpp
@@ -18,6 +18,7 @@ add_library(sludge_shader STATIC
     shader/console_container.h
     shader/console_container.cpp
 )
+add_library(sludge_shader STATIC ${SLUDGE_SHADER_SOURCES})
 target_include_directories(sludge_shader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sludge_shader PRIVATE sludge_options libdeflate::libdeflate_static)
 target_compile_options(sludge_shader PRIVATE /Zc:threadSafeInit-) # linked into sludgemu.exe (see below)
@@ -129,6 +130,8 @@ add_executable(sludgemu WIN32
     gpu/page_tables.cpp
     gpu/shader_programs.h
     gpu/shader_programs.cpp
+    gpu/shader_cache.h
+    gpu/shader_cache.cpp
     gpu/formats.h
     gpu/formats.cpp
     gpu/console_layout.h

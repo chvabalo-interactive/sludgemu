@@ -793,6 +793,7 @@ void test_layout_addressing();
 void test_bcpack();
 void test_shader_translate();
 void test_shader_lanes();
+void test_shader_cache();
 
 int main() {
     log_init(nullptr, LOG_LEVEL_WARN);
@@ -822,6 +823,7 @@ int main() {
     test_bcpack();
     test_shader_translate();
     test_shader_lanes();
+    test_shader_cache();
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "passed", g_failures);
     return g_failures;
 }
