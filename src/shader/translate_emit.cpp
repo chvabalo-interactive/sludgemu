@@ -557,7 +557,20 @@ static const char k_preamble[] =
     "a.y >= a.x ? v.x : (v.x < 0.0f ? v.z : -v.z); }\n"
     "float cube_tc(float3 v) { float3 a = abs(v); return a.z >= a.x && a.z >= a.y ? -v.y : a.y >= a.x ? (v.y "
     "< "
-    "0.0f ? -v.z : v.z) : -v.y; }\n";
+    "0.0f ? -v.z : v.z) : -v.y; }\n"
+    // Cube sampling takes face coordinates on console (s, t in [1, 2] across the face, then
+    // slice * 8 + face), desktop a direction: cube_coord turns them back into one, the inverse of
+    // cube_sc/cube_tc above with the major axis at 1. Face-space gradients stay in the face's plane.
+    "uint cube_face(float f) { return (uint)round(max(f, 0.0f)); }\n"
+    "float3 cube_plane(uint id, float sc, float tc) { return id == 0u ? float3(0.0f, -tc, -sc) : id == 1u ? "
+    "float3(0.0f, -tc, sc) : id == 2u ? float3(sc, 0.0f, tc) : id == 3u ? float3(sc, 0.0f, -tc) : id == 4u ? "
+    "float3(sc, -tc, 0.0f) : float3(-sc, -tc, 0.0f); }\n"
+    "float3 cube_major(uint id) { float m = (id & 1u) != 0u ? -1.0f : 1.0f; return id < 2u ? float3(m, 0.0f, "
+    "0.0f) : id < 4u ? float3(0.0f, m, 0.0f) : float3(0.0f, 0.0f, m); }\n"
+    "float4 cube_coord(float s, float t, float face) { uint f = cube_face(face); uint id = min(f & 7u, 5u); "
+    "return float4(cube_major(id) + cube_plane(id, 2.0f * s - 3.0f, 2.0f * t - 3.0f), (float)(f >> 3)); }\n"
+    "float3 cube_grad(float face, float ds, float dt) { return cube_plane(min(cube_face(face) & 7u, 5u), "
+    "2.0f * ds, 2.0f * dt); }\n";
 
 static const char* interpolation_keyword(Interpolation mode) {
     switch (mode) {
