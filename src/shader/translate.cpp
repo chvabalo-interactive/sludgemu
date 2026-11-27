@@ -198,7 +198,7 @@ static void set_constant(TagState& s, const RdnaOperand& o, u32 part, u32 value)
 }
 
 static u32 descriptor_of(const TagState& s, const RdnaOperand& o, u32 part = 0) {
-    if (o.kind == OPND_SGPR)
+    if (o.kind == OPND_SGPR || (o.kind == OPND_SPECIAL && o.reg < 128 && o.reg != SRC_NULL))
         return s.descriptor[(o.reg + part) & 127];
     return NO_DESCRIPTOR;
 }
@@ -213,17 +213,28 @@ static bool is_exec_or_vcc(const RdnaOperand& o) {
            (o.reg == SRC_EXEC_LO || o.reg == SRC_EXEC_HI || o.reg == SRC_VCC_LO || o.reg == SRC_VCC_HI);
 }
 
-static bool mask_source(const TagState& s, const RdnaOperand& o) {
-    return is_exec_or_vcc(o) || tag_kind(tag_of(s, o)) == TAG_MASK;
+static bool is_exec(const RdnaOperand& o) {
+    return o.kind == OPND_SPECIAL && (o.reg == SRC_EXEC_LO || o.reg == SRC_EXEC_HI);
 }
 
-// Address-like results keep their source's tag (heap offsets, root buffer high dwords).
+// EXEC is always a lane mask; VCC is one when its tag says so (compilers also park other values in it,
+// descriptors among them).
+static bool mask_source(const TagState& s, const RdnaOperand& o) {
+    return is_exec(o) || tag_kind(tag_of(s, o)) == TAG_MASK;
+}
+
+// Address-like results keep their source's tag (heap offsets, root buffer high dwords). Arithmetic on
+// a loaded descriptor dword changes the descriptor: the tag stays, marked modified, and each consumer
+// decides whether it can take that.
 static Tag carried(Tag a, Tag b) {
+    Tag r = TAG_NONE;
     if (a != TAG_NONE && b == TAG_NONE)
-        return a;
-    if (b != TAG_NONE && a == TAG_NONE)
-        return b;
-    return a == b ? a : TAG_NONE;
+        r = a;
+    else if (b != TAG_NONE && a == TAG_NONE)
+        r = b;
+    else if (a == b)
+        r = a;
+    return heap_loaded(r) ? (Tag)(r | HEAP_MODIFIED) : r;
 }
 
 static const u32 k_const_f32[9] = {0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
@@ -488,7 +499,7 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     case OP_S_CMOV_B32:
         set_tag(s, in.dst[0], 0, tag_of(s, in.src[0]));
         set_descriptor(s, in.dst[0], 0, descriptor_of(s, in.src[0]));
-        if (is_exec_or_vcc(in.src[0]))
+        if (is_exec(in.src[0]))
             set_tag(s, in.dst[0], 0, make_tag(TAG_MASK, 0));
         if (in.op == OP_S_MOV_B32 && constant_of(s, in.src[0], 0, &value))
             set_constant(s, in.dst[0], 0, value);
@@ -500,7 +511,7 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
         clear_spill(t, s, in.dst[0], 0);
         set_tag(s, in.dst[0], 0, raw ? tag_of(s, in.src[0]) : TAG_NONE);
         set_descriptor(s, in.dst[0], 0, raw ? descriptor_of(s, in.src[0]) : NO_DESCRIPTOR);
-        if (is_exec_or_vcc(in.src[0]))
+        if (is_exec(in.src[0]))
             set_tag(s, in.dst[0], 0, make_tag(TAG_MASK, 0));
         if (raw && eval_const_u32(s, in.src[0], TYPE_32, 0, &cv))
             set_any_constant(s, in.dst[0], 0, cv);
@@ -687,8 +698,11 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
         Tag hi = tag_of(s, in.src[0], 1);
         Tag result = TAG_NONE;
         u32 first = NO_DESCRIPTOR, slot = 32;
-        if (tag_kind(base) == TAG_HEAP) {
-            result = base; // descriptors from the heap: each register holds its own byte address
+        // Loads through a loaded descriptor read the memory it points to: plain values (emission fails
+        // on them).
+        if (tag_kind(base) == TAG_HEAP && !heap_loaded(base)) {
+            // Descriptors from the heap: each register holds its own byte address.
+            result = (Tag)(base | HEAP_LOADED);
             // At a known place when loaded from the table's start with a constant offset.
             slot = (tag_payload(base) & 1) == HEAP_SAMPLERS ? 16 : 32;
             u32 at = descriptor_of(s, in.src[0]);
@@ -728,6 +742,24 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     }
 }
 
+// A register's tag where two paths join: what both agree on, a heap tag modified on either path, or
+// nothing.
+static Tag merged_tag(Tag a, Tag b) {
+    if (a == b)
+        return a;
+    if (tag_kind(a) == TAG_HEAP && tag_kind(b) == TAG_HEAP && ((a ^ b) & ~HEAP_MODIFIED) == 0)
+        return (Tag)(a | HEAP_MODIFIED);
+    return TAG_NONE;
+}
+
+static bool merge_tag(Tag& into, Tag from) {
+    Tag m = merged_tag(into, from);
+    if (m == into)
+        return false;
+    into = m;
+    return true;
+}
+
 static bool tags_merge(const Translator& t, TagState& into, const TagState& from, u32 block) {
     bool changed = false;
     // EXEC: still the starting one only if on both paths; a version of its own where they differ.
@@ -741,15 +773,9 @@ static bool tags_merge(const Translator& t, TagState& into, const TagState& from
         changed = true;
     }
     for (u32 i = 0; i < 128; i++)
-        if (into.sgpr[i] != from.sgpr[i] && into.sgpr[i] != TAG_NONE) {
-            into.sgpr[i] = TAG_NONE;
-            changed = true;
-        }
+        changed |= merge_tag(into.sgpr[i], from.sgpr[i]);
     for (u32 i = 0; i < 256; i++)
-        if (into.vgpr[i] != from.vgpr[i] && into.vgpr[i] != TAG_NONE) {
-            into.vgpr[i] = TAG_NONE;
-            changed = true;
-        }
+        changed |= merge_tag(into.vgpr[i], from.vgpr[i]);
     for (u32 i = 0; i < 128; i++)
         if (into.descriptor[i] != from.descriptor[i] && into.descriptor[i] != NO_DESCRIPTOR) {
             into.descriptor[i] = NO_DESCRIPTOR;
@@ -774,11 +800,7 @@ static bool tags_merge(const Translator& t, TagState& into, const TagState& from
         }
     for (u32 slot = 0; slot < t.spill_vgpr_count; slot++)
         for (u32 lane = 0; lane < 64; lane++) {
-            if (into.spill_tag[slot][lane] != from.spill_tag[slot][lane] &&
-                into.spill_tag[slot][lane] != TAG_NONE) {
-                into.spill_tag[slot][lane] = TAG_NONE;
-                changed = true;
-            }
+            changed |= merge_tag(into.spill_tag[slot][lane], from.spill_tag[slot][lane]);
             if (into.spill_desc[slot][lane] != from.spill_desc[slot][lane] &&
                 into.spill_desc[slot][lane] != NO_DESCRIPTOR) {
                 into.spill_desc[slot][lane] = NO_DESCRIPTOR;
@@ -986,7 +1008,8 @@ static bool analyze_tags(Translator& t) {
     }
     tags_entry(*t.info, t.block_entry[0]);
     reached[0] = true;
-    // Iterate to a fixed point; tags only ever fall to TAG_NONE, so this terminates.
+    // Iterate to a fixed point; joins only ever lower tags (to modified heap tags, then to TAG_NONE), so
+    // this terminates.
     for (bool changed = true; changed;) {
         changed = false;
         for (u32 b = 0; b < p.block_count; b++) {

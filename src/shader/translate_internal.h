@@ -27,16 +27,28 @@ typedef u16 Tag;
 enum TagKind : u16 {
     TAG_NONE = 0,
     TAG_MASK,     // a lane mask (broadcast form)
-    TAG_HEAP,     // a byte address in a desktop descriptor heap; payload: heap | parameter << 1
+    TAG_HEAP,     // a byte address in a desktop descriptor heap; payload: see HEAP_* below
     TAG_ROOT_HI,  // the high dword of a root descriptor (maybe with stride bits); payload: parameter
     TAG_VB_TABLE, // the vertex buffer table address
     TAG_VB_DESC,  // a vertex buffer descriptor dword; payload: slot
     TAG_PC,       // code-relative constant data offset (s_getpc_b64 + offset)
 };
 
+// TAG_HEAP payload bits:
+//   bit 0      which heap (HEAP_RESOURCES or HEAP_SAMPLERS)
+//   bits 1-6   the root parameter of the table the address is in (0x3F: a directly indexed heap)
+//   bit 7      HEAP_LOADED: a descriptor dword loaded from the heap (translated code holds its byte
+//              address), as opposed to a table address. Arithmetic on table addresses indexes the table;
+//              on loaded dwords it changes the descriptor, which translated code can't follow.
+//   bit 8      HEAP_MODIFIED: a loaded dword some arithmetic changed (set only with HEAP_LOADED)
+//   bits 9-11  free
+// The bits travel with the tag through moves, spills and swaps; joins of tags that differ only in
+// HEAP_MODIFIED keep it (see tags_merge).
 enum : u16 {
     HEAP_RESOURCES = 0,
     HEAP_SAMPLERS = 1,
+    HEAP_LOADED = 0x80,
+    HEAP_MODIFIED = 0x100,
 };
 
 inline Tag make_tag(TagKind kind, u32 payload) {
@@ -47,6 +59,12 @@ inline TagKind tag_kind(Tag t) {
 }
 inline u32 tag_payload(Tag t) {
     return t & 0xFFF;
+}
+inline u32 heap_parameter(Tag t) {
+    return (tag_payload(t) >> 1) & 0x3F;
+}
+inline bool heap_loaded(Tag t) {
+    return tag_kind(t) == TAG_HEAP && (tag_payload(t) & HEAP_LOADED);
 }
 
 #define SHADER_MAX_SPILL_VGPRS 16

@@ -13,7 +13,9 @@
 //   values, except that descriptor tables hold byte offsets into the desktop descriptor heaps:
 //   console code computes descriptor addresses with its own arithmetic, and the address of a loaded
 //   descriptor, divided by the slot size, is its desktop heap index. Registers loaded from the heap
-//   hold the byte address of each dword instead of descriptor bits.
+//   hold the byte address of each dword instead of descriptor bits, so translation fails where a
+//   program changes a loaded descriptor or puts one together (except buffer descriptor fields a raw
+//   desktop view ignores).
 // - Root descriptors (buffer addresses in user data) become desktop root SRVs/UAVs read as raw
 //   buffers; registers holding their high address dword are tracked statically.
 // - Vertex fetches (loads through the vertex buffer table) become desktop input assembler inputs.

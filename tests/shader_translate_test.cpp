@@ -56,12 +56,20 @@ struct Asm {
         put(s2 << 18 | s1 << 9 | s0);
     }
     void vopc(u32 op, u32 s0, u32 vsrc1) { put(0x7C000000u | op << 17 | vsrc1 << 9 | s0); }
+    void sopc(u32 op, u32 s0, u32 s1) { put(0xBF000000u | op << 16 | s1 << 8 | s0); }
+    // Untyped buffer access with a byte offset in a VGPR.
+    void mubuf_offen(u32 op, u32 vdata, u32 vaddr, u32 srsrc) {
+        put(0xE0000000u | op << 18 | 1u << 12);
+        put(ZERO << 24 | (srsrc / 4) << 16 | vdata << 8 | vaddr);
+    }
     void end() { sopp(1, 0); }
 };
 
 // Opcodes (rdna_ops.inc).
 enum : u32 {
+    SOP2_ADD_U32 = 0,
     SOP2_AND_B32 = 14,
+    SOP2_OR_B32 = 16,
     SOP2_XOR_B32 = 18,
     SOP2_XOR_B64 = 19,
     SOP2_BFM_B32 = 36,
@@ -77,6 +85,9 @@ enum : u32 {
     MIMG_SAMPLE_LZ = 39,
     MIMG_SAMPLE_C_LZ = 47,
     VOPC_CMP_EQ_U32 = 0xC2,
+    SOPC_CMP_EQ_U32 = 6,
+    SOPP_CBRANCH_SCC0 = 4,
+    MUBUF_LOAD_DWORD = 12,
     VOP3_READLANE = 0x360,
     VOP3_WRITELANE = 0x361,
 };
@@ -395,6 +406,93 @@ static void test_swapped_heap_sampler() {
     }
 }
 
+// --- descriptors changed after loading ------------------------------------------------------------------
+
+// Translated code keeps a loaded descriptor's heap address only, so what changes a descriptor (or puts
+// one together) must fail rather than read the unchanged one.
+static void test_changed_descriptors() {
+    ShaderInfo info = compute_info();
+    {
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sop2(SOP2_AND_B32, 18, 18, LIT, 0xFFFFF000u); // a LOD bias override
+        sample(a, 16);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("sampler changed after loading"));
+    }
+    {
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sop1(SOP1_MOV_B32, 19, ZERO);
+        sample(a, 16);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("sampler partly made of constants"));
+    }
+    {
+        // Changed on one path only.
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sopc(SOPC_CMP_EQ_U32, 0, ZERO);
+        a.sopp(SOPP_CBRANCH_SCC0, 1);
+        a.sop2(SOP2_OR_B32, 18, 18, 18);
+        sample(a, 16);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("sampler changed after loading"));
+    }
+    {
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sop2(SOP2_OR_B32, 13, 13, LIT, 0x1000u);
+        sample(a, 16);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("image descriptor changed after loading"));
+    }
+    {
+        // The sampler's upper half parked in VCC and moved back keeps its origin.
+        Asm a = {};
+        load_descriptors(a, false);
+        a.sop1(SOP1_MOV_B32, 4, 1);
+        a.sop1(SOP1_MOV_B32, 5, ZERO);
+        a.smem(SMEM_LOAD_DWORDX4, 104, 4, 0);
+        a.sop1(SOP1_MOV_B64, 82, VCC);
+        a.sop1(SOP1_MOV_B64, 80, 104);
+        sample(a, 80);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("SamplerDescriptorHeap[s80 >> 4]"));
+    }
+    // Buffers: a raw view ignores a new record count, not a moved base address.
+    for (u32 moved = 0; moved < 2; moved++) {
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, 2, 0);
+        a.sop1(SOP1_MOV_B32, 3, ZERO);
+        a.smem(SMEM_LOAD_DWORDX4, 8, 2, 0);
+        if (moved)
+            a.sop2(SOP2_ADD_U32, 8, 8, ZERO + 16);
+        else
+            a.sop2(SOP2_AND_B32, 10, 10, LIT, 0xFFFFu);
+        a.mubuf_offen(MUBUF_LOAD_DWORD, 4, 0, 8);
+        a.end();
+        CHECK(translate(a, info) == !moved);
+        CHECK(moved ? error_has("buffer descriptor changed after loading") : hlsl_has("ByteAddressBuffer"));
+    }
+    {
+        // A scalar load through the address in a descriptor reads the memory behind it.
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, 2, 0);
+        a.sop1(SOP1_MOV_B32, 3, ZERO);
+        a.smem(SMEM_LOAD_DWORDX4, 8, 2, 0);
+        a.smem(SMEM_LOAD_DWORD, 20, 8, 0);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("through a descriptor's address"));
+    }
+}
+
 void test_shader_translate() {
     rdna_init();
     test_constant_sampler_in_vcc();
@@ -402,5 +500,6 @@ void test_shader_translate() {
     test_stale_vcc_constants();
     test_sampler_decoding();
     test_swapped_heap_sampler();
+    test_changed_descriptors();
     g_out.hlsl.release();
 }

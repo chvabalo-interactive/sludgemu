@@ -50,8 +50,82 @@ static bool range_kind(const Translator& t, u32 parameter, u32 descriptor, Table
 static TableRangeKind heap_kind(const Translator& t, u32 reg, TableRangeKind fallback) {
     Tag tag = sgpr_tag(t, reg);
     TableRangeKind kind = fallback;
-    range_kind(t, tag_payload(tag) >> 1, t.tags.descriptor[reg & 127], &kind);
+    range_kind(t, heap_parameter(tag), t.tags.descriptor[reg & 127], &kind);
     return kind;
+}
+
+// Where the descriptor in registers [reg, reg + dwords) comes from. Translated code keeps only the heap
+// address of a descriptor loaded from the heap (in its first register), so a descriptor works as one
+// only if every dword was loaded from the same slot and left alone, except the dwords in `may_change`
+// (by bit), whose fields the desktop view makes no use of for the access at hand.
+enum DescriptorOrigin {
+    ORIGIN_HEAP,            // loaded from one slot of the heap `heap`, unchanged
+    ORIGIN_CONSTANT,        // every dword known at translation time
+    ORIGIN_PARTLY_CONSTANT, // some dwords known, others not
+    ORIGIN_MODIFIED,        // loaded from the heap, then changed
+    ORIGIN_OTHER_HEAP,      // loaded from the other heap
+    ORIGIN_ASSEMBLED,       // dwords from different slots, or loaded and unknown ones mixed
+    ORIGIN_UNKNOWN,         // nothing the translator can place
+};
+
+static DescriptorOrigin descriptor_origin(const Translator& t, u32 reg, u32 dwords, u32 heap,
+                                          u32 may_change = 0) {
+    u32 constants = 0, value;
+    for (u32 i = 0; i < dwords; i++)
+        constants += sgpr_constant(t.tags, reg + i, &value) ? 1 : 0;
+    if (constants == dwords)
+        return ORIGIN_CONSTANT;
+    Tag first = sgpr_tag(t, reg);
+    if (!heap_loaded(first))
+        return constants ? ORIGIN_PARTLY_CONSTANT : ORIGIN_UNKNOWN;
+    if ((tag_payload(first) & 1) != heap)
+        return ORIGIN_OTHER_HEAP;
+    u16 slot = t.tags.descriptor[reg & 127];
+    DescriptorOrigin origin = ORIGIN_HEAP;
+    for (u32 i = 0; i < dwords; i++) {
+        if ((may_change >> i) & 1)
+            continue; // whatever it holds
+        Tag tag = sgpr_tag(t, reg + i);
+        u16 d = t.tags.descriptor[(reg + i) & 127];
+        if (sgpr_constant(t.tags, reg + i, &value))
+            return ORIGIN_PARTLY_CONSTANT;
+        // The same table and kind of tag; the same slot where known.
+        if ((tag & ~HEAP_MODIFIED) != (first & ~HEAP_MODIFIED) ||
+            (slot != NO_DESCRIPTOR && d != NO_DESCRIPTOR && d != slot))
+            return ORIGIN_ASSEMBLED;
+        if (tag_payload(tag) & HEAP_MODIFIED)
+            origin = ORIGIN_MODIFIED;
+    }
+    return origin;
+}
+
+// Buffer descriptor dwords a raw desktop view of the buffer can ignore changes to. Compilers rewrite
+// structured buffer descriptors into raw ones (record count times stride, stride cleared, raw bounds
+// checking), which is what desktop views are anyway. Not the base address (dword 0); the stride (dword
+// 1, with the base's high bits) only without an index, which the translation scales by the original
+// stride; the record count (dword 2) bounds the console's accesses only, desktop bounds are the view's
+// size; the format and swizzle (dword 3) only for untyped accesses.
+static u32 buffer_fields_unused(bool indexed, bool typed) {
+    return (indexed ? 0u : 1u << 1) | 1u << 2 | (typed ? 0u : 1u << 3);
+}
+
+static const char* origin_text(DescriptorOrigin origin) {
+    switch (origin) {
+    case ORIGIN_HEAP:
+        return "from the heap";
+    case ORIGIN_CONSTANT:
+        return "made of constants";
+    case ORIGIN_PARTLY_CONSTANT:
+        return "partly made of constants";
+    case ORIGIN_MODIFIED:
+        return "changed after loading";
+    case ORIGIN_OTHER_HEAP:
+        return "from the other heap";
+    case ORIGIN_ASSEMBLED:
+        return "put together from different places";
+    default:
+        return "of unknown origin";
+    }
 }
 
 // Constant data in the code (a buffer descriptor based on s_getpc_b64 plus an offset) becomes a static
@@ -114,10 +188,15 @@ static bool emit_scalar_memory(Translator& t, const RdnaInst& in) {
     bool buffer = in.op >= OP_S_BUFFER_LOAD_DWORD && in.op <= OP_S_BUFFER_LOAD_DWORDX16;
     Tag lo = sgpr_tag(t, base), hi = sgpr_tag(t, base + 1);
 
+    if (!buffer && heap_loaded(lo)) {
+        // Through the address in a descriptor (a buffer's base, say): the memory there isn't placed.
+        translator_fail(t, "%s at 0x%x through a descriptor's address", rdna_op_name(in.op), in.offset);
+        return false;
+    }
     if (!buffer && tag_kind(lo) == TAG_HEAP) {
         // How far into its table the program reads: console tables are plain memory, and programs may
         // read past the ranges their root signature declares.
-        u32 parameter = tag_payload(lo) >> 1;
+        u32 parameter = heap_parameter(lo);
         if (parameter < SHADER_MAX_ROOT_PARAMETERS) {
             u32 slot = (tag_payload(lo) & 1) == HEAP_SAMPLERS ? 16 : 32;
             u32 at = t.tags.descriptor[base & 127];
@@ -162,6 +241,13 @@ static bool emit_scalar_memory(Translator& t, const RdnaInst& in) {
         return true;
     }
     if (buffer && tag_kind(lo) == TAG_HEAP && (tag_payload(lo) & 1) == HEAP_RESOURCES) {
+        DescriptorOrigin origin =
+            descriptor_origin(t, base, 4, HEAP_RESOURCES, buffer_fields_unused(false, false));
+        if (origin != ORIGIN_HEAP) {
+            translator_fail(t, "%s at 0x%x through a buffer descriptor %s", rdna_op_name(in.op), in.offset,
+                            origin_text(origin));
+            return false;
+        }
         TableRangeKind kind = heap_kind(t, base, RANGE_CBV);
         emit(t, "{ uint a_ = %s;", fmt(t, "(0x%xu + %s)", (u32)in.mem.offset, soffset(t, in, 1)));
         t.depth++;
@@ -829,6 +915,13 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
         return true;
     }
     if (tag_kind(lo) == TAG_HEAP && (tag_payload(lo) & 1) == HEAP_RESOURCES) {
+        DescriptorOrigin origin = descriptor_origin(
+            t, rsrc, 4, HEAP_RESOURCES, buffer_fields_unused(in.mem.idxen, format && in.enc != ENC_MTBUF));
+        if (origin != ORIGIN_HEAP) {
+            translator_fail(t, "%s at 0x%x through a buffer descriptor %s", rdna_op_name(in.op), in.offset,
+                            origin_text(origin));
+            return false;
+        }
         TableRangeKind kind = heap_kind(t, rsrc, (store || atomic) ? RANGE_UAV : RANGE_SRV);
         const char* heap_index = fmt(t, "(%s >> 5)", sgpr(t, rsrc));
         emit(t, "{");
@@ -1029,6 +1122,30 @@ static s32 inline_sampler(Translator& t, const RdnaInst& in, const u32 words[4],
     return (s32)i;
 }
 
+// The sampler of a sampling instruction as `smp_`: a static sampler for a descriptor made of constants,
+// the heap's sampler for one loaded from a sampler table.
+static bool emit_sampler(Translator& t, const RdnaInst& in, bool compare) {
+    u32 samp = in.src[2].reg;
+    const char* type = compare ? "SamplerComparisonState" : "SamplerState";
+    DescriptorOrigin origin = descriptor_origin(t, samp, 4, HEAP_SAMPLERS);
+    if (origin == ORIGIN_CONSTANT) {
+        u32 words[4];
+        for (u32 i = 0; i < 4; i++)
+            sgpr_constant(t.tags, samp + i, &words[i]);
+        s32 index = inline_sampler(t, in, words, compare);
+        if (index < 0)
+            return false;
+        emit(t, "%s smp_ = g_sampler%d;", type, index);
+        return true;
+    }
+    if (origin == ORIGIN_HEAP) {
+        emit(t, "%s smp_ = SamplerDescriptorHeap[%s >> 4];", type, sgpr(t, samp));
+        return true;
+    }
+    translator_fail(t, "%s at 0x%x with a sampler %s", rdna_op_name(in.op), in.offset, origin_text(origin));
+    return false;
+}
+
 struct ImageForm {
     bool sample, gather, load, store, mip, lod, bias, lod_zero, compare, grad, clamp, offset;
 };
@@ -1137,6 +1254,13 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
                         in.offset);
         return false;
     }
+    DescriptorOrigin origin =
+        descriptor_origin(t, rsrc, in.src[1].count ? in.src[1].count : 8, HEAP_RESOURCES);
+    if (origin != ORIGIN_HEAP) {
+        translator_fail(t, "%s at 0x%x with an image descriptor %s", rdna_op_name(in.op), in.offset,
+                        origin_text(origin));
+        return false;
+    }
     // Address components in order: texel offsets, bias, comparison reference, gradients, then
     // coordinates, LOD (or mip, or sample index) and clamp. With 16-bit addresses only the components
     // from the coordinates on are packed two to a register (low half first): offsets, bias, reference
@@ -1240,26 +1364,8 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     }
     const char* value = nullptr;
     if (form.sample || form.gather) {
-        u32 samp = in.src[2].reg;
-        Tag stag = sgpr_tag(t, samp);
-        u32 words[4];
-        bool literal = true;
-        for (u32 i = 0; i < 4; i++)
-            literal &= sgpr_constant(t.tags, samp + i, &words[i]);
-        if (literal) {
-            s32 index = inline_sampler(t, in, words, form.compare);
-            if (index < 0)
-                return false;
-            emit(t, "%s smp_ = g_sampler%d;", form.compare ? "SamplerComparisonState" : "SamplerState",
-                 index);
-        } else if (tag_kind(stag) == TAG_HEAP && (tag_payload(stag) & 1) == HEAP_SAMPLERS) {
-            emit(t, "%s smp_ = SamplerDescriptorHeap[%s >> 4];",
-                 form.compare ? "SamplerComparisonState" : "SamplerState", sgpr(t, samp));
-        } else {
-            translator_fail(t, "%s at 0x%x with a sampler not from a sampler table", rdna_op_name(in.op),
-                            in.offset);
+        if (!emit_sampler(t, in, form.compare))
             return false;
-        }
         const char* uv = address_vector(t, addr, true, coord_at, coords);
         // Implicit LOD needs derivatives. Compute groups whose shape desktop can't take them in (1D
         // groups not a multiple of 4 threads, other groups with odd X or Y) have lone lanes in their
@@ -1376,8 +1482,8 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         emit(t, "}");
         return true;
     } else if (in.op == OP_IMAGE_GET_LOD) {
-        u32 samp = in.src[2].reg;
-        emit(t, "SamplerState smp_ = SamplerDescriptorHeap[%s >> 4];", sgpr(t, samp));
+        if (!emit_sampler(t, in, false))
+            return false;
         const char* uv = address_vector(t, addr, true, coord_at, coords);
         value = fmt(
             t,
