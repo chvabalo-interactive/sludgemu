@@ -276,6 +276,7 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice*, bool compute, const C
             info.group_id_mask = c.group_id_mask;
             info.thread_id_count = c.thread_id_count;
             info.lds_bytes = c.lds_bytes;
+            info.wave_size = c.wave32 ? 32 : 64;
             pso->programs[0] = shader_program_get(cs.code, (u32)cs.code_size, info);
             pso->translated = pso->programs[0] != nullptr;
         } else {

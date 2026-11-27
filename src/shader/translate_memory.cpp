@@ -489,21 +489,21 @@ static bool emit_buffer_atomic(Translator& t, const RdnaInst& in, const char* bu
     if (in.op == OP_BUFFER_ATOMIC_CMPSWAP) {
         const char* d1 = vgpr(t, in.dst[0].reg + 1);
         if (rtn)
-            emit(t, "uint o_ = 0u; if (EXEC) %s.InterlockedCompareExchange(%s, %s, %s, o_);", buf, addr, d1,
-                 d0);
+            emit(t, "uint o_ = 0u; if (%s) %s.InterlockedCompareExchange(%s, %s, %s, o_);", exec_cond(t), buf,
+                 addr, d1, d0);
         else
-            emit(t, "if (EXEC) %s.InterlockedCompareStore(%s, %s, %s);", buf, addr, d1, d0);
+            emit(t, "if (%s) %s.InterlockedCompareStore(%s, %s, %s);", exec_cond(t), buf, addr, d1, d0);
     } else if (in.op == OP_BUFFER_ATOMIC_INC || in.op == OP_BUFFER_ATOMIC_DEC) {
         const char* next = in.op == OP_BUFFER_ATOMIC_INC
                                ? fmt(t, "(cur_ >= %s ? 0u : cur_ + 1u)", d0)
                                : fmt(t, "((cur_ == 0u || cur_ > %s) ? %s : cur_ - 1u)", d0, d0);
         emit(t,
-             "uint o_ = 0u; if (EXEC) { uint cur_ = %s.Load(%s), prev_ = 0u; [allow_uav_condition] do { "
+             "uint o_ = 0u; if (%s) { uint cur_ = %s.Load(%s), prev_ = 0u; [allow_uav_condition] do { "
              "uint nxt_ = %s; %s.InterlockedCompareExchange(%s, cur_, nxt_, prev_); if (prev_ == cur_) { o_ "
              "= cur_; break; } cur_ = prev_; } while (true); }",
-             buf, addr, next, buf, addr);
+             exec_cond(t), buf, addr, next, buf, addr);
     } else if (in.op == OP_BUFFER_ATOMIC_SWAP) {
-        emit(t, "uint o_ = 0u; if (EXEC) %s.InterlockedExchange(%s, %s, o_);", buf, addr, d0);
+        emit(t, "uint o_ = 0u; if (%s) %s.InterlockedExchange(%s, %s, o_);", exec_cond(t), buf, addr, d0);
     } else {
         const char* fn = nullptr;
         const char* val = d0;
@@ -543,10 +543,10 @@ static bool emit_buffer_atomic(Translator& t, const RdnaInst& in, const char* bu
             return false;
         }
         if (rtn)
-            emit(t, "%s o_ = %s; if (EXEC) %s.%s(%s, %s, o_);", is_signed ? "int" : "uint",
-                 is_signed ? "0" : "0u", buf, fn, addr, val);
+            emit(t, "%s o_ = %s; if (%s) %s.%s(%s, %s, o_);", is_signed ? "int" : "uint",
+                 is_signed ? "0" : "0u", exec_cond(t), buf, fn, addr, val);
         else
-            emit(t, "if (EXEC) %s.%s(%s, %s);", buf, fn, addr, val);
+            emit(t, "if (%s) %s.%s(%s, %s);", exec_cond(t), buf, fn, addr, val);
     }
     if (rtn)
         write_vgpr(t, in, in.dst[0].reg, is_signed ? "(uint)o_" : "o_");
@@ -636,7 +636,7 @@ static bool emit_mtbuf_access(Translator& t, const RdnaInst& in, const char* buf
             emit(t, "%s |= (%s << %uu);", dst_w, enc, sh);
             bit_at += w;
         }
-        emit(t, "if (EXEC) %s.%s(%s, w_);", buf, k_store_fn[dwords], addr);
+        emit(t, "if (%s) %s.%s(%s, w_);", exec_cond(t), buf, k_store_fn[dwords], addr);
         return true;
     }
     emit(t, "uint%s w_ = %s.%s(%s);", dwords == 1 ? "" : fmt(t, "%u", dwords), buf, k_load_fn[dwords], addr);
@@ -962,7 +962,8 @@ static bool emit_heap_buffer_access(Translator& t, const RdnaInst& in, bool read
                     c[i] = "0.0f";
                 }
             }
-            emit(t, "if (EXEC) b_[%s] = float4(%s, %s, %s, %s);", element, c[0], c[1], c[2], c[3]);
+            emit(t, "if (%s) b_[%s] = float4(%s, %s, %s, %s);", exec_cond(t), element, c[0], c[1], c[2],
+                 c[3]);
             return true;
         }
         emit(t, "float4 r_ = b_[%s];", element);
@@ -990,11 +991,10 @@ static bool emit_heap_buffer_access(Translator& t, const RdnaInst& in, bool read
     if (store) {
         char list[96] = {};
         usize n = 0;
-        for (u32 i = 0; i < dwords; i++) {
-            n += (usize)snprintf(list + n, sizeof(list) - n, "%sv%u", i ? ", " : "", in.dst[0].reg + i);
-            use_vgpr(t, in.dst[0].reg + i);
-        }
-        emit(t, "if (EXEC) b_.%s(a_, %s%s%s);", k_store_fn[dwords],
+        for (u32 i = 0; i < dwords; i++)
+            n += (usize)snprintf(list + n, sizeof(list) - n, "%s%s", i ? ", " : "",
+                                 vgpr(t, in.dst[0].reg + i));
+        emit(t, "if (%s) b_.%s(a_, %s%s%s);", exec_cond(t), k_store_fn[dwords],
              dwords > 1 ? fmt(t, "uint%u(", dwords) : "", list, dwords > 1 ? ")" : "");
         return true;
     }
@@ -1075,13 +1075,11 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
                 char list[96] = {};
                 usize n = 0;
                 for (u32 i = 0; i < dwords; i++)
-                    n += (usize)snprintf(list + n, sizeof(list) - n, "%sv%u", i ? ", " : "",
-                                         in.dst[0].reg + i);
-                for (u32 i = 0; i < dwords; i++)
-                    use_vgpr(t, in.dst[0].reg + i);
+                    n += (usize)snprintf(list + n, sizeof(list) - n, "%s%s", i ? ", " : "",
+                                         vgpr(t, in.dst[0].reg + i));
                 data = fmt(t, "uint%u(%s)", dwords, list);
             }
-            emit(t, "if (EXEC) g_root%u.%s(a_, %s);", parameter, k_store_fn[dwords], data);
+            emit(t, "if (%s) g_root%u.%s(a_, %s);", exec_cond(t), parameter, k_store_fn[dwords], data);
         } else {
             write_loaded(t, in, dwords, fmt(t, "g_root%u.%s(a_)", parameter, k_load_fn[dwords]));
         }
@@ -1580,9 +1578,10 @@ static bool emit_image_atomic(Translator& t, const RdnaInst& in, const ImageAddr
         const char* compare = wide ? fmt(t, "((uint64_t)%s << 32 | %s)", vgpr(t, data + 3), vgpr(t, data + 2))
                                    : vgpr(t, data + 1);
         if (returns)
-            emit(t, "if (EXEC) InterlockedCompareExchange(tex_[at_], %s, %s, o_);", compare, value);
+            emit(t, "if (%s) InterlockedCompareExchange(tex_[at_], %s, %s, o_);", exec_cond(t), compare,
+                 value);
         else
-            emit(t, "if (EXEC) InterlockedCompareStore(tex_[at_], %s, %s);", compare, value);
+            emit(t, "if (%s) InterlockedCompareStore(tex_[at_], %s, %s);", exec_cond(t), compare, value);
     } else if (inc_dec) {
         // No typed atomic does these: a compare-exchange loop, which needs no typed load to start from
         // (the first exchange returns the texel unless it already holds the guess).
@@ -1590,9 +1589,9 @@ static bool emit_image_atomic(Translator& t, const RdnaInst& in, const ImageAddr
                                ? fmt(t, "c_ >= %s ? 0u : c_ + 1u", value)
                                : fmt(t, "(c_ == 0u || c_ > %s) ? %s : c_ - 1u", value, value);
         emit(t,
-             "if (EXEC) { uint c_ = 0u, p_; [allow_uav_condition] for (;;) { "
+             "if (%s) { uint c_ = 0u, p_; [allow_uav_condition] for (;;) { "
              "InterlockedCompareExchange(tex_[at_], c_, %s, p_); if (p_ == c_) break; c_ = p_; } o_ = c_; }",
-             next);
+             exec_cond(t), next);
     } else {
         const char* fn = nullptr;
         switch (in.op) {
@@ -1629,9 +1628,9 @@ static bool emit_image_atomic(Translator& t, const RdnaInst& in, const ImageAddr
         }
         // The exchange always returns the old value.
         if (returns || in.op == OP_IMAGE_ATOMIC_SWAP)
-            emit(t, "if (EXEC) %s(tex_[at_], %s, o_);", fn, value);
+            emit(t, "if (%s) %s(tex_[at_], %s, o_);", exec_cond(t), fn, value);
         else
-            emit(t, "if (EXEC) %s(tex_[at_], %s);", fn, value);
+            emit(t, "if (%s) %s(tex_[at_], %s);", exec_cond(t), fn, value);
     }
     if (returns) {
         write_vgpr(t, in, data, "(uint)o_");
@@ -1920,7 +1919,7 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
                     c[i] = fmt(t, source & 1 ? "f16tof32(%s >> 16)" : "f16tof32(%s & 0xffffu)", reg);
                 source++;
             }
-            emit(t, "if (EXEC) tex_[%s] = float4(%s, %s, %s, %s);", xy, c[0], c[1], c[2], c[3]);
+            emit(t, "if (%s) tex_[%s] = float4(%s, %s, %s, %s);", exec_cond(t), xy, c[0], c[1], c[2], c[3]);
             continue;
         } else if (resinfo) {
             if (!by_shadow)
@@ -1993,6 +1992,39 @@ static u8 access_flags(const RdnaInst& in) {
 
 // --- LDS ---------------------------------------------------------------------------------------------
 
+// ds_bpermute_b32 with exact lanes: each lane reads data0 of the lane its address names (in bytes);
+// lanes outside EXEC read as zero. The reads happen in every lane, before any lane writes (the
+// destination may be the data). With two lanes per thread both halves are done here: a lane may name
+// either half, so each reads both halves' value of the named desktop lane.
+static bool emit_bpermute(Translator& t, const RdnaInst& in, u32 offset) {
+    u32 addr = in.src[0].reg, data = in.src[1].reg, dst = in.dst[0].reg;
+    if (t.lanes == 1) {
+        emit(t,
+             "{ uint i_ = ((%s + %uu) >> 2) & 31u; uint r_ = WaveReadLaneAt(%s, i_); bool e_ = "
+             "WaveReadLaneAt(EXEC ? 1u : 0u, i_) != 0u;",
+             vgpr(t, addr), offset, vgpr(t, data));
+        t.depth++;
+        write_vgpr(t, in, dst, "(e_ ? r_ : 0u)");
+        t.depth--;
+        emit(t, "}");
+        return true;
+    }
+    emit(t, "{");
+    t.depth++;
+    for (u32 h = 0; h < 2; h++) {
+        emit(t, "uint i%u_ = ((%s + %uu) >> 2) & 63u;", h, vgpr_half(t, addr, h), offset);
+        emit(t,
+             "uint r%u_ = WaveReadLaneAt((i%u_ & 32u) != 0u ? %s : %s, i%u_ & 31u); bool e%u_ = "
+             "WaveReadLaneAt((i%u_ & 32u) != 0u ? s127 : s126, i%u_ & 31u) != 0u;",
+             h, h, vgpr_half(t, data, 1), vgpr_half(t, data, 0), h, h, h, h);
+    }
+    emit(t, "if (EXEC0) %s = e0_ ? r0_ : 0u; if (EXEC1) %s = e1_ ? r1_ : 0u;", vgpr_half(t, dst, 0),
+         vgpr_half(t, dst, 1));
+    t.depth--;
+    emit(t, "}");
+    return true;
+}
+
 static bool emit_lds(Translator& t, const RdnaInst& in) {
     if (in.mem.gds) {
         translator_fail(t, "GDS access at 0x%x", in.offset);
@@ -2005,41 +2037,41 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
     const char* d0 = vgpr(t, in.src[1].reg);
     switch (in.op) {
     case OP_DS_WRITE_B32:
-        emit(t, "if (EXEC) g_lds[(%s + %uu) >> 2] = %s;", addr, offset, d0);
+        emit(t, "if (%s) g_lds[(%s + %uu) >> 2] = %s;", exec_cond(t), addr, offset, d0);
         return true;
     case OP_DS_WRITE_B64:
-        emit(t, "if (EXEC) { g_lds[(%s + %uu) >> 2] = %s; g_lds[(%s + %uu) >> 2] = %s; }", addr, offset, d0,
-             addr, offset + 4, vgpr(t, in.src[1].reg + 1));
+        emit(t, "if (%s) { g_lds[(%s + %uu) >> 2] = %s; g_lds[(%s + %uu) >> 2] = %s; }", exec_cond(t), addr,
+             offset, d0, addr, offset + 4, vgpr(t, in.src[1].reg + 1));
         return true;
     case OP_DS_WRITE_B96:
         emit(t,
-             "if (EXEC) { uint a_ = (%s + %uu) >> 2; g_lds[a_] = %s; g_lds[a_ + 1u] = %s; g_lds[a_ + 2u] = "
+             "if (%s) { uint a_ = (%s + %uu) >> 2; g_lds[a_] = %s; g_lds[a_ + 1u] = %s; g_lds[a_ + 2u] = "
              "%s; }",
-             addr, offset, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[1].reg + 2));
+             exec_cond(t), addr, offset, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[1].reg + 2));
         return true;
     case OP_DS_WRITE_B128:
         emit(t,
-             "if (EXEC) { uint a_ = (%s + %uu) >> 2; g_lds[a_] = %s; g_lds[a_ + 1u] = %s; g_lds[a_ + 2u] = "
+             "if (%s) { uint a_ = (%s + %uu) >> 2; g_lds[a_] = %s; g_lds[a_ + 1u] = %s; g_lds[a_ + 2u] = "
              "%s; "
              "g_lds[a_ + 3u] = %s; }",
-             addr, offset, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[1].reg + 2),
+             exec_cond(t), addr, offset, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[1].reg + 2),
              vgpr(t, in.src[1].reg + 3));
         return true;
     case OP_DS_WRITE2_B32:
     case OP_DS_WRITE2ST64_B32: {
         u32 unit = in.op == OP_DS_WRITE2ST64_B32 ? 256 : 4;
-        emit(t, "if (EXEC) { g_lds[(%s + %uu) >> 2] = %s; g_lds[(%s + %uu) >> 2] = %s; }", addr, off0 * unit,
-             d0, addr, off1 * unit, vgpr(t, in.src[2].reg));
+        emit(t, "if (%s) { g_lds[(%s + %uu) >> 2] = %s; g_lds[(%s + %uu) >> 2] = %s; }", exec_cond(t), addr,
+             off0 * unit, d0, addr, off1 * unit, vgpr(t, in.src[2].reg));
         return true;
     }
     case OP_DS_WRITE2_B64:
     case OP_DS_WRITE2ST64_B64: {
         u32 unit = in.op == OP_DS_WRITE2ST64_B64 ? 512 : 8;
         emit(t,
-             "if (EXEC) { uint a0_ = (%s + %uu) >> 2, a1_ = (%s + %uu) >> 2; g_lds[a0_] = %s; g_lds[a0_ + "
+             "if (%s) { uint a0_ = (%s + %uu) >> 2, a1_ = (%s + %uu) >> 2; g_lds[a0_] = %s; g_lds[a0_ + "
              "1u] = %s; g_lds[a1_] = %s; g_lds[a1_ + 1u] = %s; }",
-             addr, off0 * unit, addr, off1 * unit, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[2].reg),
-             vgpr(t, in.src[2].reg + 1));
+             exec_cond(t), addr, off0 * unit, addr, off1 * unit, d0, vgpr(t, in.src[1].reg + 1),
+             vgpr(t, in.src[2].reg), vgpr(t, in.src[2].reg + 1));
         return true;
     }
     case OP_DS_WRITE_B8:
@@ -2053,13 +2085,13 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         // leave one lane's value, and no other wave sees the bytes cleared halfway. Every round lets one
         // of the conflicting lanes through.
         emit(t,
-             "if (EXEC) { uint ba_ = %s + %uu; uint i_ = ba_ >> 2; uint sh_ = (ba_ & %uu) * 8u; uint m_ = "
+             "if (%s) { uint ba_ = %s + %uu; uint i_ = ba_ >> 2; uint sh_ = (ba_ & %uu) * 8u; uint m_ = "
              "0x%xu << "
              "sh_; uint v_ = ((%s%s) & 0x%xu) << sh_; uint o_ = g_lds[i_]; [allow_uav_condition] for (;;) { "
              "uint p_; "
              "InterlockedCompareExchange(g_lds[i_], o_, (o_ & ~m_) | v_, p_); if (p_ == o_) break; o_ = p_; "
              "} }",
-             addr, offset, is_16 ? 2u : 3u, mask, d0, hi ? " >> 16" : "", mask);
+             exec_cond(t), addr, offset, is_16 ? 2u : 3u, mask, d0, hi ? " >> 16" : "", mask);
         return true;
     }
     case OP_DS_READ_B32:
@@ -2150,6 +2182,24 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         use_sgpr(t, SRC_M0);
         // The active lanes are counted before one of them does the add for the wave.
         const char* delta = in.op == OP_DS_APPEND ? "n_" : "(uint)(-(int)n_)";
+        if (t.lanes == 2) {
+            // Both halves: one add for the console wave's active lanes, by its first one; every lane gets
+            // the counter's old value (programs add their own position, with v_mbcnt).
+            emit(t, "{ uint b0_ = mask_bits(s126), b1_ = mask_bits(s127); uint n_ = countbits(b0_) + "
+                    "countbits(b1_); "
+                    "uint f_ = b0_ != 0u ? firstbitlow(b0_) : firstbitlow(b1_); uint o_ = 0u;");
+            t.depth++;
+            emit(t,
+                 "if (n_ != 0u && WaveGetLaneIndex() == (f_ & 31u)) InterlockedAdd(g_lds[((s124 & 0xffffu) + "
+                 "%uu) >> 2], %s, o_);",
+                 offset, delta);
+            emit(t, "o_ = WaveReadLaneAt(o_, f_ & 31u);");
+            emit(t, "if (EXEC0) %s = o_; if (EXEC1) %s = o_;", vgpr_half(t, in.dst[0].reg, 0),
+                 vgpr_half(t, in.dst[0].reg, 1));
+            t.depth--;
+            emit(t, "}");
+            return true;
+        }
         emit(t,
              "{ uint o_ = 0u; if (EXEC) { uint n_ = wave_count(s126); uint lane_ = wave_first(s126); "
              "if (WaveGetLaneIndex() == lane_) InterlockedAdd(g_lds[((s124 & 0xffffu) + %uu) >> 2], %s, o_); "
@@ -2213,17 +2263,20 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
             return false;
         }
         if (rtn) {
-            emit(t, "{ uint o_ = 0u; if (EXEC) %s(g_lds[(%s + %uu) >> 2], %s, o_);", fn, addr, offset, d0);
+            emit(t, "{ uint o_ = 0u; if (%s) %s(g_lds[(%s + %uu) >> 2], %s, o_);", exec_cond(t), fn, addr,
+                 offset, d0);
             t.depth++;
             write_vgpr(t, in, in.dst[0].reg, "o_");
             t.depth--;
             emit(t, "}");
         } else {
-            emit(t, "if (EXEC) %s(g_lds[(%s + %uu) >> 2], %s);", fn, addr, offset, d0);
+            emit(t, "if (%s) %s(g_lds[(%s + %uu) >> 2], %s);", exec_cond(t), fn, addr, offset, d0);
         }
         return true;
     }
     case OP_DS_BPERMUTE_B32:
+        if (t.exact)
+            return emit_bpermute(t, in, offset);
         // Read data0 from the lane addressed (in bytes) by this lane's address.
         write_vgpr(
             t, in, in.dst[0].reg,

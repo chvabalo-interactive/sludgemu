@@ -52,6 +52,9 @@ struct ConsoleComputeShader {
     u8 user_sgprs;
     u8 group_id_mask;
     u8 thread_id_count;
+    // Launched as wave32 (else wave64). Read from the bit all wave64 programs seen have clear; no
+    // wave32 program has confirmed it yet (the translator checks it against the code).
+    bool wave32;
     u32 lds_bytes;
 };
 

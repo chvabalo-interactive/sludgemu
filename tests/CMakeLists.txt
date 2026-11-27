@@ -8,6 +8,7 @@ add_executable(sludgemu_tests
     layout_test.cpp
     bcpack_test.cpp
     shader_translate_test.cpp
+    shader_lanes_test.cpp
     ${PROJECT_SOURCE_DIR}/src/common/log.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory_tracking.cpp
@@ -19,7 +20,8 @@ add_executable(sludgemu_tests
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xdsp.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xma.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xma_decoder.cpp
+    ${PROJECT_SOURCE_DIR}/src/gpu/agility.cpp
 )
 target_include_directories(sludgemu_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(sludgemu_tests PRIVATE sludge_options sludge_shader opus addrlib agility)
+target_link_libraries(sludgemu_tests PRIVATE sludge_options sludge_shader opus addrlib agility dxc d3d12)
 add_test(NAME memory COMMAND sludgemu_tests)

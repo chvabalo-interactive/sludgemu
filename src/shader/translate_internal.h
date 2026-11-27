@@ -85,6 +85,10 @@ struct TagState {
     // SGPRs holding a value known at translation time (moved from constants).
     u32 constant[128];
     u64 constant_known[2];
+    // Exact lanes: SGPRs nothing has written yet (0 in the translation; see merge_tag), and SGPRs
+    // holding data that is all clear or all set (uniform booleans): the same in mask form.
+    u64 unwritten[2];
+    u64 neutral[2];
     // Constant 32-bit values carried in vector registers (for MIMG texel offsets). Vector writes skip
     // lanes outside EXEC, so a value holds in every lane only if written while all lanes ran
     // (vgpr_exec == EXEC_ANY), or while reading under the EXEC it was written with.
@@ -152,8 +156,13 @@ struct SlotUse {
 
 #define SHADER_MAX_SLOT_USES 256
 
+// Masks a vector instruction reads as data: their bits are ballots, computed before the instruction
+// (outside its EXEC guards, where every lane takes part).
+#define SHADER_MAX_HOISTED 8
+
 struct Translator {
     const ShaderInfo* info;
+    const ShaderTarget* target;
     TranslatedShader* out;
     const u8* code;
     u32 code_size;
@@ -161,12 +170,13 @@ struct Translator {
     TagState* block_entry; // tags at each block's start
     bool* block_reached;   // per block: control can get there (the others aren't emitted)
     u8* xor_swap_role;     // per-instruction: 1 = start of 3-xor swap, 2 = swap continuation
-    u64* live_sgprs;       // per block, two words: scalar registers live at its start
-    TagState tags;         // tags before the instruction being emitted
-    u32 inst_offset;       // the instruction being emitted, for messages
-    bool copying;          // it copies registers as they are (copies_tags): descriptor addresses too
-    Text body;             // the program's statements; declarations are written around them
-    u32 depth;             // indentation of emitted statements
+    // SGPRs each block may read before writing them (directly or in blocks after it).
+    u64 (*live_in)[2];
+    TagState tags;   // tags before the instruction being emitted
+    u32 inst_offset; // the instruction being emitted, for messages
+    bool copying;    // it copies registers as they are (copies_tags): descriptor addresses too
+    Text body;       // the program's statements; declarations are written around them
+    u32 depth;       // indentation of emitted statements
     bool failed;
 
     u8 sgpr_used[128];
@@ -183,7 +193,19 @@ struct Translator {
     u8 target_compressed[8];
     bool needs_descriptor_info;
     bool uses_lds;
-    bool wave32;
+    bool wave32; // the console wave size
+    // Console lanes map exactly onto desktop lanes (compute, see translate.h): masks are tracked as
+    // masks or data and converted between, cross-lane operations reach the whole console wave. Without
+    // it (graphics) each desktop thread runs a console lane of whatever desktop wave it lands in.
+    bool exact;
+    u8 lanes; // console lanes per desktop thread: 2 for wave64 programs in exact mode, else 1
+    u8 half;  // the half (console lanes 32 * half + desktop lane) a per-lane instruction is emitted for
+    bool in_lane_op;  // emitting a per-lane instruction (inside its EXEC guards)
+    bool exec_bits;   // the scalar result being written is data: written to EXEC, it is converted
+    u32 wave_threads; // exact mode: threads per group, console waves per group
+    u32 group_waves;
+    u8 hoisted[SHADER_MAX_HOISTED]; // SGPRs (mask dwords) read as data by the instruction being emitted
+    u32 hoisted_count;
     bool dpp_active;
     bool dpp_has_mask;
     u64 root_used;       // root descriptor parameters read
@@ -228,6 +250,7 @@ bool join_converts(Tag tag);
 // register's slot where known (see find_slot_uses); `vector`: a vector register, whose lanes outside
 // EXEC hold no address to read.
 const char* register_data(Translator& t, Tag tag, const char* raw, u16 descriptor, bool vector);
+// An SGPR read as a value (register_data); with exact lanes, a mask reads as its bits.
 const char* sgpr_data(Translator& t, u32 reg);
 const char* vgpr_data(Translator& t, u32 reg);
 // Records which descriptors at known places the program writes, samples or uses as images through, and
@@ -237,6 +260,12 @@ u8 slot_use(const Translator& t, Tag tag, u16 index);
 // A v_readlane/v_writelane lane operand known at translation time (a literal or inline integer), in the
 // wave's lane range.
 bool constant_lane(const Translator& t, const RdnaOperand& o, u32* lane);
+// Exact lanes: whether a register holding `out` where a block ends goes into a block starting with
+// `entry` as a mask converted to its bits (see merge_tag in translate.cpp).
+bool edge_converts(const Translator& t, Tag out, Tag entry);
+bool sgpr_live_in(const Translator& t, u32 block, u32 reg);
+// Exact lanes: whether an SGPR holds data that reads the same as a mask (all bits clear or set).
+bool sgpr_neutral(const TagState& s, u32 reg);
 void emit_program(Translator& t);
 // For failure messages: why register `reg` (a VGPR if `vector`) holds nothing the translator can place
 // where the instruction being emitted reads it: the instruction that last wrote it in the block, or
@@ -255,6 +284,8 @@ const char* src_u32(Translator& t, const RdnaInst& in, u32 i, OperandType type =
 const char* src_f32(Translator& t, const RdnaInst& in, u32 i);
 const char* sgpr(Translator& t, u32 reg);
 const char* vgpr(Translator& t, u32 reg);
+// A vector register's variable for one half (two lanes per thread; the half is ignored otherwise).
+const char* vgpr_half(Translator& t, u32 reg, u32 half);
 // Writes a vector destination (EXEC-guarded, honoring SDWA destination selects).
 void write_vgpr(Translator& t, const RdnaInst& in, u32 reg, const char* value);
 // Writes a scalar destination dword; writes to null are dropped.
@@ -263,6 +294,22 @@ void write_sgpr(Translator& t, const RdnaOperand& dst, u32 part, const char* val
 const char* float_result(Translator& t, const RdnaInst& in, const char* value);
 // Lane mask registers in this wave size.
 u32 mask_dwords(const Translator& t);
+
+// The EXEC test for the lanes being emitted: one per half for two lanes per thread.
+const char* exec_cond(const Translator& t);
+// Operand `i` (dword `part`) in mask form: masks as they are, data bits converted to this lane's bit
+// broadcast.
+const char* mask_operand(Translator& t, const RdnaInst& in, u32 i, u32 part);
+// Operand `i` (dword `part`) as it is held, mask or data (moves keep the form, the tags follow).
+const char* raw_operand(Translator& t, const RdnaInst& in, u32 i, u32 part);
+// The value of a constant expression as operands are written ("0u", "0x%08xu").
+bool literal_value(const char* expr, u32* value);
+// A dword of bits in mask form (constants fold).
+const char* lane_mask_of(Translator& t, const char* bits);
+// Whether an SGPR holds a mask in this exact-mode program (EXEC always does).
+bool sgpr_is_mask(Translator& t, u32 reg);
+// The mask dword a per-lane instruction's lane mask result goes to (0 for one lane per thread).
+u32 lane_mask_part(const Translator& t);
 
 bool emit_alu(Translator& t, const RdnaInst& in);    // translate_alu.cpp
 bool emit_memory(Translator& t, const RdnaInst& in); // translate_memory.cpp

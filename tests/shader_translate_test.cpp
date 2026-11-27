@@ -146,7 +146,9 @@ enum : u32 {
     VOP3_WRITELANE = 0x361,
 };
 
-// A compute program with a resource table in s0 (all SRVs) and a sampler table in s1.
+// A compute program with a resource table in s0 (all SRVs) and a sampler table in s1. Launched as wave32
+// (these programs don't tell): one console lane per desktop thread, one variable per register. Wave64
+// lane mapping has tests of its own (shader_lanes_test.cpp).
 static ShaderInfo compute_info() {
     ShaderInfo info = {};
     info.stage = SHADER_COMPUTE;
@@ -166,6 +168,7 @@ static ShaderInfo compute_info() {
     info.threads[1] = 1;
     info.threads[2] = 1;
     info.thread_id_count = 1;
+    info.wave_size = 32;
     return info;
 }
 
@@ -195,12 +198,14 @@ static void sample(Asm& a, u32 ssamp) {
 }
 
 static TranslatedShader g_out;
+// A desktop device running waves of 32 lanes, which compute translation needs.
+static const ShaderTarget k_target = {32, 32};
 
 // With SLUDGE_TEST_HLSL=<dir>, each translation's HLSL is also written there (<n>_cs.hlsl), to check
 // that the desktop compiler takes it.
 static bool translate(const Asm& a, const ShaderInfo& info) {
     static u32 count = 0;
-    bool ok = shader_translate(a.w, a.n * 4, info, &g_out);
+    bool ok = shader_translate(a.w, a.n * 4, info, k_target, &g_out);
     const char* dir = getenv("SLUDGE_TEST_HLSL");
     if (ok && dir) {
         char path[300];

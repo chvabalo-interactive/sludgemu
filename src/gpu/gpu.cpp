@@ -62,6 +62,25 @@ bool gpu_int64_image_atomics() {
     return g_int64_image_atomics;
 }
 
+// The wave sizes the device runs, for shader translation: compute programs run console waves lane for
+// lane on desktop waves of 32 lanes (see shader/translate.h), so the device must be able to run those.
+static ShaderTarget shader_target(ID3D12Device* device) {
+    ShaderTarget target = {};
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1))) || !o1.WaveOps) {
+        LOG_E("gpu", "adapter lacks wave operations: compute shaders cannot be translated");
+        return target;
+    }
+    target.wave_min = (u8)(o1.WaveLaneCountMin < 255 ? o1.WaveLaneCountMin : 255);
+    target.wave_max = (u8)(o1.WaveLaneCountMax < 255 ? o1.WaveLaneCountMax : 255);
+    if (target.wave_min > 32 || target.wave_max < 32)
+        LOG_E("gpu", "adapter runs waves of %u-%u lanes, not 32: compute shaders cannot be translated",
+              target.wave_min, target.wave_max);
+    else
+        LOG_I("gpu", "waves of %u-%u lanes", target.wave_min, target.wave_max);
+    return target;
+}
+
 static void CALLBACK on_debug_message(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity,
                                       D3D12_MESSAGE_ID id, LPCSTR description, void*) {
     if (severity <= D3D12_MESSAGE_SEVERITY_ERROR)
@@ -256,7 +275,7 @@ static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
     if (g_options.debug_layer)
         route_debug_messages(g_device);
     watch_for_removal(g_device);
-    shader_programs_init();
+    shader_programs_init(shader_target(g_device));
     return TRUE;
 }
 

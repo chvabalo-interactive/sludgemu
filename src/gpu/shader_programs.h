@@ -42,8 +42,9 @@ struct ShaderProgram {
     ShaderInfo info;
 };
 
-// Starts the workers. Returns false if the shader compiler is missing.
-bool shader_programs_init();
+// Starts the workers, translating for a device that runs `target`. Returns false if the shader compiler
+// is missing.
+bool shader_programs_init(const ShaderTarget& target);
 
 // The program for `code` translated with `info`: an existing one, or a new one queued for building.
 // Programs live until shutdown. Returns nullptr only when out of memory.
