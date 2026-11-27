@@ -277,6 +277,22 @@ struct FailureCount {
     char example[64];
 };
 
+// A translation error without the instruction offsets in it (" at 0x1234"), so that failures group by
+// what they are.
+static void failure_reason(const char* error, char* out, usize size) {
+    usize n = 0;
+    for (const char* p = error; *p && n + 1 < size;) {
+        if (!strncmp(p, " at 0x", 6)) {
+            p += 6;
+            while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))
+                p++;
+            continue;
+        }
+        out[n++] = *p++;
+    }
+    out[n] = 0;
+}
+
 static int translate_all(const char* dir, const char* out_dir) {
     static u64 seen[1 << 16];
     static FailureCount failures[512];
@@ -328,10 +344,7 @@ static int translate_all(const char* dir, const char* out_dir) {
             } else {
                 // Group by reason, ignoring offsets.
                 char reason[160];
-                snprintf(reason, sizeof(reason), "%s", out.error);
-                char* at = strstr(reason, " at 0x");
-                if (at)
-                    *at = 0;
+                failure_reason(out.error, reason, sizeof(reason));
                 u32 k = 0;
                 while (k < failure_kinds && strcmp(failures[k].reason, reason) != 0)
                     k++;
@@ -363,7 +376,9 @@ static int translate_all(const char* dir, const char* out_dir) {
 }
 
 // Translates every program of a runtime dump again: code from <key>.bin, what the translator was told
-// from <key>.info (a ShaderInfo of this build).
+// from <key>.info (a ShaderInfo of this build). Each failure's error goes to <out dir>.failures.txt, and
+// the inline samplers of the programs that translate (which the HLSL doesn't show) to
+// <out dir>.samplers.txt.
 static int retranslate(const char* dir, const char* out_dir) {
     static FailureCount failures[512];
     u32 failure_kinds = 0, programs = 0, translated = 0;
@@ -374,6 +389,11 @@ static int retranslate(const char* dir, const char* out_dir) {
     if (find == INVALID_HANDLE_VALUE)
         return 1;
     CreateDirectoryA(out_dir, nullptr);
+    char list_path[MAX_PATH];
+    snprintf(list_path, sizeof(list_path), "%s.failures.txt", out_dir);
+    FILE* list = fopen(list_path, "w");
+    snprintf(list_path, sizeof(list_path), "%s.samplers.txt", out_dir);
+    FILE* sampler_list = fopen(list_path, "w");
     TranslatedShader out = {};
     do {
         char key[32] = {};
@@ -404,12 +424,21 @@ static int retranslate(const char* dir, const char* out_dir) {
                 fputs(out.hlsl.data, f);
                 fclose(f);
             }
+            for (u32 i = 0; i < out.sampler_count && sampler_list; i++) {
+                const InlineSampler& smp = out.samplers[i];
+                fprintf(
+                    sampler_list,
+                    "%s_%s: s%u filter 0x%x address %u %u %u aniso %u compare %u border %u unnormalized %u "
+                    "bias %g lod %g..%g\n",
+                    key, stage, i, smp.filter, smp.address[0], smp.address[1], smp.address[2],
+                    smp.max_anisotropy, smp.comparison, smp.border_color, smp.unnormalized ? 1 : 0,
+                    smp.mip_bias, smp.min_lod, smp.max_lod);
+            }
         } else {
+            if (list)
+                fprintf(list, "%s_%s: %s\n", key, stage, out.error);
             char reason[160];
-            snprintf(reason, sizeof(reason), "%s", out.error);
-            char* at = strstr(reason, " at 0x");
-            if (at)
-                *at = 0;
+            failure_reason(out.error, reason, sizeof(reason));
             u32 k = 0;
             while (k < failure_kinds && strcmp(failures[k].reason, reason) != 0)
                 k++;
@@ -424,6 +453,10 @@ static int retranslate(const char* dir, const char* out_dir) {
         free(code);
     } while (FindNextFileA(find, &fd));
     FindClose(find);
+    if (list)
+        fclose(list);
+    if (sampler_list)
+        fclose(sampler_list);
     out.hlsl.release();
     printf("%u programs, %u translated\n", programs, translated);
     for (;;) {
