@@ -303,7 +303,13 @@ static bool emit_scalar_op(Translator& t, const RdnaInst& in) {
     case OP_S_CMOVK_I32: {
         t.scc_used = true;
         const char* k = fmt(t, "0x%08xu", (u32)in.simm16);
-        if (t.exec_bits && d.kind == OPND_SPECIAL && is_exec_dword(d.reg))
+        bool exec = d.kind == OPND_SPECIAL && is_exec_dword(d.reg);
+        // Into a mask, the register would hold data on one outcome and the mask form on the other.
+        if (t.exact && !exec && sgpr_is_mask(t, d.reg)) {
+            translator_fail(t, "%s at 0x%x moves data over a lane mask", rdna_op_name(in.op), in.offset);
+            return false;
+        }
+        if (t.exec_bits && exec)
             k = lane_mask_of(t, k);
         emit(t, "if (scc) %s = %s;", sgpr(t, d.reg), k);
         return true;
