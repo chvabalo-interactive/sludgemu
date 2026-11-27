@@ -76,6 +76,7 @@ enum : u32 {
     SOP2_BFM_B64 = 37,
     SOP1_MOV_B32 = 3,
     SOP1_MOV_B64 = 4,
+    SOP1_CMOV_B64 = 6,
     SOP1_MOVRELD_B32 = 48,
     SOPK_MOVK_I32 = 0,
     SOPK_ADDK_I32 = 15,
@@ -464,6 +465,24 @@ static void test_changed_descriptors() {
         a.end();
         CHECK(translate(a, info));
         CHECK(hlsl_has("SamplerDescriptorHeap[s80 >> 4]"));
+    }
+    // A conditional move leaves either value: a constant sampler replaced by a heap one on some runs is
+    // neither, the same heap sampler moved over itself stays one.
+    for (u32 same = 0; same < 2; same++) {
+        u32 clamp[4] = {0x92, 0x00C00000, 0x14500000, 0};
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sop1(SOP1_MOV_B64, 24, 16);
+        a.sop1(SOP1_MOV_B64, 26, 18);
+        if (!same)
+            constant_sampler(a, 16, clamp);
+        a.sopc(SOPC_CMP_EQ_U32, 0, ZERO);
+        a.sop1(SOP1_CMOV_B64, 16, 24);
+        a.sop1(SOP1_CMOV_B64, 18, 26);
+        sample(a, 16);
+        a.end();
+        CHECK(translate(a, info) == (same != 0));
+        CHECK(same ? hlsl_has("SamplerDescriptorHeap[s16 >> 4]") : error_has("sampler of unknown origin"));
     }
     // Buffers: a raw view ignores a new record count, not a moved base address.
     for (u32 moved = 0; moved < 2; moved++) {

@@ -447,6 +447,29 @@ static void clear_spill(const Translator& t, TagState& s, const RdnaOperand& o, 
 
 static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx);
 
+// A register's tag where two paths join: what both agree on, a heap tag modified on either path, or
+// nothing.
+static Tag merged_tag(Tag a, Tag b) {
+    if (a == b)
+        return a;
+    if (tag_kind(a) == TAG_HEAP && tag_kind(b) == TAG_HEAP && ((a ^ b) & ~HEAP_MODIFIED) == 0)
+        return (Tag)(a | HEAP_MODIFIED);
+    return TAG_NONE;
+}
+
+// A conditional move (s_cmov) of a value with `tag`, `descriptor` and maybe a constant into one dword of
+// `dst`: the register then holds either value, so it keeps only what both have, as at a join.
+static void conditional_move(TagState& s, const RdnaOperand& dst, u32 part, Tag tag, u32 descriptor,
+                             bool known, u32 value) {
+    u32 old_value = 0;
+    bool old_known = constant_of(s, dst, part, &old_value);
+    u32 old_descriptor = descriptor_of(s, dst, part);
+    set_tag(s, dst, part, merged_tag(tag_of(s, dst, part), tag));
+    set_descriptor(s, dst, part, old_descriptor == descriptor ? descriptor : NO_DESCRIPTOR);
+    if (known && old_known && value == old_value)
+        set_constant(s, dst, part, value);
+}
+
 void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx) {
     // A three-XOR swap moves tags and constants as a whole; folding its steps one by one would undo it.
     bool swap = inst_idx != ~0u && t.xor_swap_role && t.xor_swap_role[inst_idx] != 0;
@@ -496,14 +519,20 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     }
     switch (in.op) {
     case OP_S_MOV_B32:
-    case OP_S_CMOV_B32:
-        set_tag(s, in.dst[0], 0, tag_of(s, in.src[0]));
-        set_descriptor(s, in.dst[0], 0, descriptor_of(s, in.src[0]));
-        if (is_exec(in.src[0]))
-            set_tag(s, in.dst[0], 0, make_tag(TAG_MASK, 0));
-        if (in.op == OP_S_MOV_B32 && constant_of(s, in.src[0], 0, &value))
+    case OP_S_CMOV_B32: {
+        Tag tag = is_exec(in.src[0]) ? make_tag(TAG_MASK, 0) : tag_of(s, in.src[0]);
+        u32 descriptor = descriptor_of(s, in.src[0]);
+        bool known = constant_of(s, in.src[0], 0, &value);
+        if (in.op == OP_S_CMOV_B32) {
+            conditional_move(s, in.dst[0], 0, tag, descriptor, known, value);
+            return;
+        }
+        set_tag(s, in.dst[0], 0, tag);
+        set_descriptor(s, in.dst[0], 0, descriptor);
+        if (known)
             set_constant(s, in.dst[0], 0, value);
         return;
+    }
     case OP_V_MOV_B32:
     case OP_V_READFIRSTLANE_B32: {
         bool raw = !in.has_sdwa && !in.has_dpp && !in.src[0].abs && !in.src[0].neg && !in.omod && !in.clamp;
@@ -596,12 +625,21 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     case OP_S_MOV_B64:
     case OP_S_CMOV_B64: {
         u32 values[2];
-        bool constant = in.op == OP_S_MOV_B64 && constant_of(s, in.src[0], 0, &values[0]) &&
-                        constant_of(s, in.src[0], 1, &values[1]);
+        bool constant = constant_of(s, in.src[0], 0, &values[0]) && constant_of(s, in.src[0], 1, &values[1]);
+        bool mask = mask_source(s, in.src[0]);
+        Tag tags[2];
+        u32 descriptors[2];
         for (u32 i = 0; i < 2; i++) {
-            set_tag(s, in.dst[0], i,
-                    mask_source(s, in.src[0]) ? make_tag(TAG_MASK, 0) : tag_of(s, in.src[0], i));
-            set_descriptor(s, in.dst[0], i, descriptor_of(s, in.src[0], i));
+            tags[i] = mask ? make_tag(TAG_MASK, 0) : tag_of(s, in.src[0], i);
+            descriptors[i] = descriptor_of(s, in.src[0], i);
+        }
+        for (u32 i = 0; i < 2; i++) {
+            if (in.op == OP_S_CMOV_B64) {
+                conditional_move(s, in.dst[0], i, tags[i], descriptors[i], constant, values[i]);
+                continue;
+            }
+            set_tag(s, in.dst[0], i, tags[i]);
+            set_descriptor(s, in.dst[0], i, descriptors[i]);
             if (constant)
                 set_constant(s, in.dst[0], i, values[i]);
         }
@@ -742,16 +780,6 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     }
 }
 
-// A register's tag where two paths join: what both agree on, a heap tag modified on either path, or
-// nothing.
-static Tag merged_tag(Tag a, Tag b) {
-    if (a == b)
-        return a;
-    if (tag_kind(a) == TAG_HEAP && tag_kind(b) == TAG_HEAP && ((a ^ b) & ~HEAP_MODIFIED) == 0)
-        return (Tag)(a | HEAP_MODIFIED);
-    return TAG_NONE;
-}
-
 static bool merge_tag(Tag& into, Tag from) {
     Tag m = merged_tag(into, from);
     if (m == into)
@@ -879,10 +907,11 @@ static bool touches(const RdnaInst& in, u32 reg, u32 width) {
     for (u32 d = 0; d < 2; d++)
         if (overlaps(in.dst[d], reg, width))
             return true;
-    for (u32 k = 0; k < in.num_src; k++)
-        if (overlaps(in.src[k], reg, width))
-            return true;
     bool vcc = reg <= SRC_VCC_HI && SRC_VCC_LO < reg + width;
+    for (u32 k = 0; k < in.num_src; k++)
+        if (overlaps(in.src[k], reg, width) ||
+            (vcc && in.src[k].kind == OPND_SPECIAL && in.src[k].reg == SRC_VCCZ))
+            return true;
     return vcc && (in.op == OP_S_CBRANCH_VCCZ || in.op == OP_S_CBRANCH_VCCNZ || in.op == OP_V_DIV_FMAS_F32 ||
                    in.op == OP_V_DIV_FMAS_F64);
 }
