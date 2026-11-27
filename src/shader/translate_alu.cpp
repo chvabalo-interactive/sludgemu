@@ -19,11 +19,42 @@ static void set_scc(Translator& t, const char* condition) {
     emit(t, "scc = %s;", condition);
 }
 
+static bool is_exec_dword(u32 reg) {
+    reg &= 127;
+    return reg == SRC_EXEC_LO || reg == SRC_EXEC_HI;
+}
+
+static bool writes_exec_dword(const RdnaOperand& d) {
+    if (d.kind != OPND_SPECIAL)
+        return false;
+    for (u32 k = 0; k < (d.count ? d.count : 1u); k++)
+        if (is_exec_dword(d.reg + k))
+            return true;
+    return false;
+}
+
 static void write64(Translator& t, const RdnaOperand& dst, const char* value) {
     emit(t, "{ uint64_t r_ = %s;", value);
     t.depth++;
     write_sgpr(t, dst, 0, "(uint)r_");
     write_sgpr(t, dst, 1, "(uint)(r_ >> 32)");
+    t.depth--;
+    emit(t, "}");
+}
+
+// A 64-bit result and SCC = (result != 0). Data written to EXEC with exact lanes becomes the mask form,
+// which SCC must not be read back from (it would differ from lane to lane): it comes from the value.
+static void write64_scc(Translator& t, const RdnaOperand& dst, const char* value) {
+    if (!(t.exec_bits && writes_exec_dword(dst))) {
+        write64(t, dst, value);
+        set_scc(t, fmt(t, "(%s | %s) != 0u", sgpr(t, dst.reg), sgpr(t, dst.reg + 1)));
+        return;
+    }
+    emit(t, "{ uint64_t r_ = %s;", value);
+    t.depth++;
+    write_sgpr(t, dst, 0, "(uint)r_");
+    write_sgpr(t, dst, 1, "(uint)(r_ >> 32)");
+    set_scc(t, "r_ != 0ull");
     t.depth--;
     emit(t, "}");
 }
@@ -75,20 +106,6 @@ static const char* logic_expr(Translator& t, RdnaOp op, const char* a, const cha
     default:
         return "0u";
     }
-}
-
-static bool is_exec_dword(u32 reg) {
-    reg &= 127;
-    return reg == SRC_EXEC_LO || reg == SRC_EXEC_HI;
-}
-
-static bool writes_exec_dword(const RdnaOperand& d) {
-    if (d.kind != OPND_SPECIAL)
-        return false;
-    for (u32 k = 0; k < (d.count ? d.count : 1u); k++)
-        if (is_exec_dword(d.reg + k))
-            return true;
-    return false;
 }
 
 // Exact lanes: whether a scalar source holds a mask (constants are data).
@@ -394,10 +411,10 @@ static bool emit_scalar_op(Translator& t, const RdnaInst& in) {
         break;
     case OP_S_ADDK_I32:
         emit(t, "{ uint a_ = %s, b_ = 0x%08xu, r_ = a_ + b_; scc = ((~(a_ ^ b_)) & (a_ ^ r_)) >> 31 != 0u;",
-             sgpr(t, d.reg), (u32)in.simm16);
+             sgpr_data(t, d.reg), (u32)in.simm16);
         break;
     case OP_S_MULK_I32:
-        emit(t, "{ uint r_ = %s * 0x%08xu;", sgpr(t, d.reg), (u32)in.simm16);
+        emit(t, "{ uint r_ = %s * 0x%08xu;", sgpr_data(t, d.reg), (u32)in.simm16);
         break;
     case OP_S_MIN_I32:
     case OP_S_MAX_I32:
@@ -473,10 +490,10 @@ static bool emit_scalar_op(Translator& t, const RdnaInst& in) {
         emit(t, "{ uint r_ = (uint)abs((int)%s); scc = r_ != 0u;", src(t, in, 0));
         break;
     case OP_S_BITSET0_B32:
-        emit(t, "{ uint r_ = %s & ~(1u << (%s & 31u));", sgpr(t, d.reg), src(t, in, 0));
+        emit(t, "{ uint r_ = %s & ~(1u << (%s & 31u));", sgpr_data(t, d.reg), src(t, in, 0));
         break;
     case OP_S_BITSET1_B32:
-        emit(t, "{ uint r_ = %s | (1u << (%s & 31u));", sgpr(t, d.reg), src(t, in, 0));
+        emit(t, "{ uint r_ = %s | (1u << (%s & 31u));", sgpr_data(t, d.reg), src(t, in, 0));
         break;
     case OP_S_BCNT0_I32_B32:
     case OP_S_BCNT0_I32_B64:
@@ -557,18 +574,16 @@ static bool emit_scalar_op(Translator& t, const RdnaInst& in) {
         const char* r = in.op == OP_S_LSHL_B64   ? fmt(t, "(%s << %s)", v, s)
                         : in.op == OP_S_LSHR_B64 ? fmt(t, "(%s >> %s)", v, s)
                                                  : fmt(t, "(uint64_t)((int64_t)%s >> %s)", v, s);
-        write64(t, d, r);
-        set_scc(t, fmt(t, "(%s | %s) != 0u", sgpr(t, d.reg), sgpr(t, d.reg + 1)));
+        write64_scc(t, d, r);
         return true;
     }
     case OP_S_BFE_U64: {
         const char* c = src(t, in, 1);
-        write64(t, d,
-                fmt(t,
-                    "((%s >> (%s & 63u)) & ((((%s >> 16) & 127u) >= 64u) ? 0xffffffffffffffffull : "
-                    "(((uint64_t)1 << ((%s >> 16) & 127u)) - 1)))",
-                    src64(t, in, 0), c, c, c));
-        set_scc(t, fmt(t, "(%s | %s) != 0u", sgpr(t, d.reg), sgpr(t, d.reg + 1)));
+        write64_scc(t, d,
+                    fmt(t,
+                        "((%s >> (%s & 63u)) & ((((%s >> 16) & 127u) >= 64u) ? 0xffffffffffffffffull : "
+                        "(((uint64_t)1 << ((%s >> 16) & 127u)) - 1)))",
+                        src64(t, in, 0), c, c, c));
         return true;
     }
     case OP_S_BFM_B64: {
@@ -645,7 +660,7 @@ static bool emit_scalar_op(Translator& t, const RdnaInst& in) {
         u32 k = (u32)(in.op - OP_S_CMPK_EQ_I32);
         bool is_signed = k < 6;
         u32 imm = is_signed ? (u32)in.simm16 : (u32)(u16)in.simm16;
-        set_scc(t, fmt(t, "%s%s %s %s0x%08xu", is_signed ? "(int)" : "", sgpr(t, d.reg), k_ops[k % 6],
+        set_scc(t, fmt(t, "%s%s %s %s0x%08xu", is_signed ? "(int)" : "", sgpr_data(t, d.reg), k_ops[k % 6],
                        is_signed ? "(int)" : "", imm));
         return true;
     }

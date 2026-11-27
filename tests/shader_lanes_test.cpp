@@ -111,6 +111,50 @@ static const u32 k_waves_program[] = {
     0xbf810000,                         // s_endpgm
 };
 
+// Program C: one console wave of 64 lanes, regions as in program A. Masks read as data by scalar
+// instructions that name them as their destination, data written to EXEC by a 64-bit shift (and its
+// SCC), a uniform boolean changed by s_addk and used as a mask, a mask joined with data and kept by a
+// conditional move.
+static const u32 k_forms_program[] = {
+    0xbe8203c1,             // s_mov_b32 s2, -1
+    0xbe830380,             // s_mov_b32 s3, 0
+    0xd7650001, 0x020100c1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+    0xd7660001, 0x020202c1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+    0x34040282,             // v_lshlrev_b32_e32 v2, 2, v1
+    0xd4c4000a, 0x02020284, // v_cmp_gt_u32_e64 s[10:11], 4, v1
+    0xb48a000f,             // s_cmpk_eq_u32 s10, 0xf
+    0x850c8987,             // s_cselect_b32 s12, 7, 9
+    0xd5010004, 0x00290280, // v_cndmask_b32_e64 v4, 0, 1, s[10:11]
+    0xe0701000, 0x80000402, // buffer_store_dword v4, v2, s[0:3], 0 offen
+    0x7e08020c,             // v_mov_b32_e32 v4, s12
+    0xe0701100, 0x80000402, // buffer_store_dword v4, v2, s[0:3], 0 offen offset:256
+    0xbf068080,             // s_cmp_eq_u32 0, 0
+    0x859480c1,             // s_cselect_b64 s[20:21], -1, 0
+    0xb7940006,             // s_addk_i32 s20, 0x6
+    0xbe962414,             // s_and_saveexec_b64 s[22:23], s[20:21]
+    0xe0701200, 0x80000102, // buffer_store_dword v1, v2, s[0:3], 0 offen offset:512
+    0xbefe04c1,             // s_mov_b64 exec, -1
+    0xbe9803a1,             // s_mov_b32 s24, 33
+    0x8ffe1883,             // s_lshl_b64 exec, 3, s24
+    0x85198d8b,             // s_cselect_b32 s25, 11, 13
+    0xe0701300, 0x80000102, // buffer_store_dword v1, v2, s[0:3], 0 offen offset:768
+    0xbefe04c1,             // s_mov_b64 exec, -1
+    0x7e080219,             // v_mov_b32_e32 v4, s25
+    0xe0701400, 0x80000402, // buffer_store_dword v4, v2, s[0:3], 0 offen offset:1024
+    0xbe9e0381,             // s_mov_b32 s30, 1
+    0xbf06801e,             // s_cmp_eq_u32 s30, 0
+    0xbf850003,             // s_cbranch_scc1 3 (to the s_movk)
+    0xd4c4001a, 0x02020284, // v_cmp_gt_u32_e64 s[26:27], 4, v1
+    0xbf820002,             // s_branch 2 (past the s_movk)
+    0xb01a0055,             // s_movk_i32 s26, 0x55
+    0xb01b0000,             // s_movk_i32 s27, 0x0
+    0xbf06821e,             // s_cmp_eq_u32 s30, 2
+    0xbe9a051e,             // s_cmov_b32 s26, s30
+    0x7e08021a,             // v_mov_b32_e32 v4, s26
+    0xe0701500, 0x80000402, // buffer_store_dword v4, v2, s[0:3], 0 offen offset:1280
+    0xbf810000,             // s_endpgm
+};
+
 #define UNWRITTEN    0xDEADBEEFu // what the output buffer starts with
 #define OUTPUT_BYTES 4096
 
@@ -149,6 +193,26 @@ static u32 lanes_expected(u32 r, u32 i) {
         return i < 10 || (i >= 50 && i < 60) ? 100 : UNWRITTEN;
     case 15: // v_readlane with the lane in an SGPR (45)
         return 45 * 3;
+    default:
+        return UNWRITTEN;
+    }
+}
+
+// What program C stores in region `r` for lane `i`.
+static u32 forms_expected(u32 r, u32 i) {
+    switch (r) {
+    case 0: // the compare (lanes 0-3) is still a mask after s_cmpk read it
+        return i < 4 ? 1 : 0;
+    case 1: // s_cmpk compared the compare's bits (0xf): the same SCC in every lane
+        return 7;
+    case 2: // EXEC = -1 + 6 in the low dword (lanes 0 and 2), all set in the high one
+        return i == 0 || i == 2 || i >= 32 ? i : UNWRITTEN;
+    case 3: // EXEC = 3 << 33: lanes 33 and 34
+        return i == 33 || i == 34 ? i : UNWRITTEN;
+    case 4: // that shift's SCC (nonzero) in every lane
+        return 11;
+    case 5: // the compare's bits, joined with data and not moved over
+        return 0xF;
     default:
         return UNWRITTEN;
     }
@@ -439,7 +503,21 @@ void test_shader_lanes() {
     } else {
         g_failures++;
     }
-    printf("shader lanes: 2 programs run on the GPU (waves of %u-%u lanes)\n", b.target.wave_min,
+    if (run_program(b, k_forms_program, sizeof(k_forms_program), compute_info(64, 0), out)) {
+        for (u32 r = 0; r < 16; r++)
+            for (u32 i = 0; i < 64; i++) {
+                u32 want = forms_expected(r, i);
+                if (out[r * 64 + i] != want) {
+                    printf("FAIL shader lanes: program C region %u lane %u: 0x%x, expected 0x%x\n", r, i,
+                           out[r * 64 + i], want);
+                    g_failures++;
+                    break;
+                }
+            }
+    } else {
+        g_failures++;
+    }
+    printf("shader lanes: 3 programs run on the GPU (waves of %u-%u lanes)\n", b.target.wave_min,
            b.target.wave_max);
     bench_release(b);
 }

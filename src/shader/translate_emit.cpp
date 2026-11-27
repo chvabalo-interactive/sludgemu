@@ -115,7 +115,7 @@ static bool is_scalar_register(const RdnaOperand& o) {
 // An SGPR read as data. With exact lanes a mask is read as its bits, with a ballot: inline in scalar
 // code, before the instruction for per-lane ones (see hoist_mask_reads; under their EXEC guards not all
 // lanes would take part).
-static const char* sgpr_data(Translator& t, u32 reg) {
+const char* sgpr_data(Translator& t, u32 reg) {
     reg &= 127;
     if (!t.exact || !sgpr_is_mask(t, reg))
         return sgpr(t, reg);

@@ -185,11 +185,13 @@ static bool constant_of(const TagState& s, const RdnaOperand& o, u32 part, u32* 
 }
 
 // Constants are known in SGPRs and in the special scalar registers (VCC: a cleared mask, see
-// merge_tag).
+// merge_tag), except EXEC: compares and saveexec write it without naming it.
 static void set_constant(TagState& s, const RdnaOperand& o, u32 part, u32 value) {
     if (o.kind != OPND_SGPR && !(o.kind == OPND_SPECIAL && o.reg < 128 && o.reg != SRC_NULL))
         return;
     u32 reg = (o.reg + part) & 127;
+    if (reg == SRC_EXEC_LO || reg == SRC_EXEC_HI)
+        return;
     s.constant[reg] = value;
     s.constant_known[reg / 64] |= 1ull << (reg % 64);
 }
@@ -449,6 +451,57 @@ static void clear_spill(const Translator& t, TagState& s, const RdnaOperand& o, 
     memset(s.spill_desc[slot], 0xFF, sizeof(s.spill_desc[slot]));
 }
 
+// Whether an instruction writes its destination: all do but the SOPK forms whose register field is only
+// read (compares, hardware register and counter writes) or unused.
+static bool writes_destination(const RdnaInst& in) {
+    if (in.enc != ENC_SOPK)
+        return true;
+    switch (in.op) {
+    case OP_S_MOVK_I32:
+    case OP_S_CMOVK_I32:
+    case OP_S_ADDK_I32:
+    case OP_S_MULK_I32:
+    case OP_S_GETREG_B32:
+    case OP_S_CALL_B64:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Instructions that read their destination: conditional moves (which may keep it), bit sets, SOPK
+// arithmetic and compares, hardware register and counter writes.
+static bool reads_destination(const RdnaInst& in) {
+    if (in.op >= OP_S_CMPK_EQ_I32 && in.op <= OP_S_CMPK_LE_U32)
+        return true;
+    if (in.op >= OP_S_WAITCNT_VSCNT && in.op <= OP_S_WAITCNT_LGKMCNT)
+        return true;
+    switch (in.op) {
+    case OP_S_CMOV_B32:
+    case OP_S_CMOV_B64:
+    case OP_S_CMOVK_I32:
+    case OP_S_ADDK_I32:
+    case OP_S_MULK_I32:
+    case OP_S_BITSET0_B32:
+    case OP_S_BITSET0_B64:
+    case OP_S_BITSET1_B32:
+    case OP_S_BITSET1_B64:
+    case OP_S_SETREG_B32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Lane mask results: compares, carries (VOP2 and VOP3 second destinations) and saveexec.
+static bool writes_lane_mask(const RdnaInst& in, u32 d) {
+    RdnaEncoding base = rdna_op_encoding(in.op);
+    return base == ENC_VOPC || (d == 1 && (in.enc == ENC_VOP3 || base == ENC_VOP2)) ||
+           (in.op >= OP_S_AND_SAVEEXEC_B64 && in.op <= OP_S_XNOR_SAVEEXEC_B64) ||
+           (in.op >= OP_S_ANDN1_SAVEEXEC_B64 && in.op <= OP_S_ANDN2_WREXEC_B64) ||
+           (in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ANDN2_WREXEC_B32);
+}
+
 static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx);
 
 // Exact lanes: a scalar operand dword that is all clear or all set, the same as data and as a mask.
@@ -530,11 +583,18 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
             u64 kb = (s.constant_known[b / 64] >> (b % 64)) & 1ull;
             s.constant_known[a / 64] = (s.constant_known[a / 64] & ~(1ull << (a % 64))) | (kb << (a % 64));
             s.constant_known[b / 64] = (s.constant_known[b / 64] & ~(1ull << (b % 64))) | (ka << (b % 64));
+            u64 na = (s.neutral[a / 64] >> (a % 64)) & 1ull;
+            u64 nb = (s.neutral[b / 64] >> (b % 64)) & 1ull;
+            s.neutral[a / 64] = (s.neutral[a / 64] & ~(1ull << (a % 64))) | (nb << (a % 64));
+            s.neutral[b / 64] = (s.neutral[b / 64] & ~(1ull << (b % 64))) | (na << (b % 64));
             return;
         }
         if (role == 2)
             return;
     }
+    // A register only read keeps what is known about it.
+    if (!writes_destination(in))
+        return;
     switch (in.op) {
     case OP_S_MOV_B32:
     case OP_S_CMOV_B32:
@@ -571,15 +631,17 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
         set_constant(s, in.dst[0], 0, (u32)(s32)in.simm16);
         return;
-    case OP_S_ADDK_I32:
+    case OP_S_ADDK_I32: {
+        // The sum keeps the register's tag (an offset stays one), but is data, not a mask.
+        Tag tag = tag_of(s, in.dst[0]);
+        u32 base = 0;
+        bool known = in.dst[0].kind == OPND_SGPR && sgpr_constant(s, in.dst[0].reg, &base);
+        set_tag(s, in.dst[0], 0, tag_kind(tag) == TAG_MASK ? TAG_NONE : tag);
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
-        if (in.dst[0].kind == OPND_SGPR)
-            s.unwritten[(in.dst[0].reg & 127) / 64] &= ~(1ull << ((in.dst[0].reg & 127) % 64));
-        if (in.dst[0].kind == OPND_SGPR && sgpr_constant(s, in.dst[0].reg, &value))
-            s.constant[in.dst[0].reg & 127] += (u32)(s32)in.simm16;
-        else if (in.dst[0].kind == OPND_SGPR)
-            s.constant_known[(in.dst[0].reg & 127) / 64] &= ~(1ull << ((in.dst[0].reg & 127) % 64));
+        if (known)
+            set_constant(s, in.dst[0], 0, base + (u32)(s32)in.simm16);
         return;
+    }
     case OP_S_SWAPPC_B64: // the fetch subroutine: the return address, and the inputs it loads
         for (u32 i = 0; i < 2; i++) {
             set_tag(s, in.dst[0], i, TAG_NONE);
@@ -726,10 +788,11 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     case OP_S_NOT_B32:
     case OP_S_CSELECT_B32:
     case OP_S_WQM_B32: {
-        // With exact lanes, bit replication (of wave32 masks into wave64 ones) works on data.
-        bool mask = mask_source(t, s, in.src[0]) || (in.num_src > 1 && mask_source(t, s, in.src[1])) ||
-                    mask_register(t, in.dst[0]) || in.op == OP_S_WQM_B64 || in.op == OP_S_WQM_B32 ||
-                    (in.op == OP_S_BITREPLICATE_B64_B32 && !t.exact);
+        // With exact lanes, bit replication (of wave32 masks into wave64 ones) works on data: a mask
+        // source is read as its bits, and the result is bits.
+        bool sources = mask_source(t, s, in.src[0]) || (in.num_src > 1 && mask_source(t, s, in.src[1]));
+        bool mask = mask_register(t, in.dst[0]) || in.op == OP_S_WQM_B64 || in.op == OP_S_WQM_B32 ||
+                    (in.op == OP_S_BITREPLICATE_B64_B32 ? !t.exact : sources);
         u32 parts = in.dst[0].count;
         for (u32 i = 0; i < parts; i++) {
             set_tag(s, in.dst[0], i, mask ? make_tag(TAG_MASK, 0) : TAG_NONE);
@@ -768,16 +831,11 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
         break;
     }
     // Compares and saveexec write masks; everything else writes plain values.
-    RdnaEncoding base = rdna_op_encoding(in.op);
     for (u32 d = 0; d < 2; d++) {
         const RdnaOperand& dst = in.dst[d];
         if (dst.kind == OPND_NONE)
             continue;
-        bool mask = base == ENC_VOPC || (d == 1 && in.enc == ENC_VOP3) ||
-                    (in.op >= OP_S_AND_SAVEEXEC_B64 && in.op <= OP_S_XNOR_SAVEEXEC_B64) ||
-                    (in.op >= OP_S_ANDN1_SAVEEXEC_B64 && in.op <= OP_S_ANDN2_WREXEC_B64) ||
-                    (in.op >= OP_S_AND_SAVEEXEC_B32 && in.op <= OP_S_ANDN2_WREXEC_B32) ||
-                    (base == ENC_VOP2 && d == 1);
+        bool mask = writes_lane_mask(in, d);
         u32 count = (mask && t.wave32) ? 1 : dst.count;
         for (u32 i = 0; i < count; i++) {
             clear_spill(t, s, dst, i);
@@ -1014,19 +1072,29 @@ static void find_spill_vgprs(Translator& t) {
 
 // --- scalar register liveness ------------------------------------------------------------------------
 
-static void mark_sgprs(u64 set[2], const RdnaOperand& o) {
+static void mark_sgprs(u64 set[2], const RdnaOperand& o, u32 count) {
+    if (o.kind == OPND_SPECIAL && o.reg == SRC_VCCZ) {
+        set[SRC_VCC_LO / 64] |= 3ull << (SRC_VCC_LO % 64);
+        return;
+    }
     bool scalar = o.kind == OPND_SGPR || (o.kind == OPND_SPECIAL && o.reg < 128 && o.reg != SRC_NULL);
     if (!scalar)
         return;
-    for (u32 k = 0; k < (o.count ? o.count : 1u); k++) {
+    for (u32 k = 0; k < count; k++) {
         u32 reg = (o.reg + k) & 127;
         set[reg / 64] |= 1ull << (reg % 64);
     }
 }
 
+static u32 operand_count(const RdnaOperand& o) {
+    return o.count ? o.count : 1u;
+}
+
 // Where SGPRs are live: only there do masks need converting at joins (see emit_edge_conversions).
-// Reads not named by operands (VCC by its branches, M0 by LDS and interpolation) count as reads of
-// everything that might be one; unmodelled writes just keep registers live longer.
+// Reads not named by operands (VCC by its branches, M0 by LDS and interpolation, the destination of
+// conditional moves, bit sets and SOPK arithmetic and compares) count as reads of everything that might
+// be one; unmodelled writes just keep registers live longer, and writes that may not happen
+// (conditional moves) are reads as well.
 static bool analyze_liveness(Translator& t) {
     const Program& p = t.program;
     t.live_in = (u64(*)[2])calloc(p.block_count, sizeof(u64[2]));
@@ -1042,13 +1110,20 @@ static bool analyze_liveness(Translator& t) {
             const RdnaInst& in = p.insts[i];
             u64 reads[2] = {}, writes[2] = {};
             for (u32 j = 0; j < in.num_src; j++)
-                mark_sgprs(reads, in.src[j]);
+                mark_sgprs(reads, in.src[j], operand_count(in.src[j]));
             if (in.op == OP_S_CBRANCH_VCCZ || in.op == OP_S_CBRANCH_VCCNZ)
                 reads[SRC_VCC_LO / 64] |= 3ull << (SRC_VCC_LO % 64);
             if (in.enc == ENC_DS || in.enc == ENC_VINTRP)
                 reads[SRC_M0 / 64] |= 1ull << (SRC_M0 % 64);
-            for (u32 d = 0; d < 2; d++)
-                mark_sgprs(writes, in.dst[d]);
+            if (reads_destination(in))
+                mark_sgprs(reads, in.dst[0], operand_count(in.dst[0]));
+            for (u32 d = 0; d < 2 && writes_destination(in); d++) {
+                // Wave32 lane masks are one dword, whatever the operand says.
+                u32 count = operand_count(in.dst[d]);
+                if (t.wave32 && writes_lane_mask(in, d))
+                    count = 1;
+                mark_sgprs(writes, in.dst[d], count);
+            }
             for (u32 w = 0; w < 2; w++) {
                 use[b][w] |= reads[w] & ~def[b][w];
                 def[b][w] |= writes[w];

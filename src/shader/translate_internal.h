@@ -230,6 +230,8 @@ const char* exec_cond(const Translator& t);
 // Operand `i` (dword `part`) in mask form: masks as they are, data bits converted to this lane's bit
 // broadcast.
 const char* mask_operand(Translator& t, const RdnaInst& in, u32 i, u32 part);
+// An SGPR read as data: with exact lanes, a mask reads as its bits.
+const char* sgpr_data(Translator& t, u32 reg);
 // Operand `i` (dword `part`) as it is held, mask or data (moves keep the form, the tags follow).
 const char* raw_operand(Translator& t, const RdnaInst& in, u32 i, u32 part);
 // The value of a constant expression as operands are written ("0u", "0x%08xu").
