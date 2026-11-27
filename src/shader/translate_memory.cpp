@@ -1754,8 +1754,7 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     ViewAccess access;
     if (!view_access(t, in, rsrc, form.store || is_image_atomic(in.op), sampled, &access))
         return false;
-    const char* const* k_rw = k_rw_texture_types;
-    if (access == VIEW_BY_SHADOW && !k_rw[m.dim][0])
+    if (access == VIEW_BY_SHADOW && !k_rw_texture_types[m.dim][0])
         access = VIEW_READ_ONLY; // no read-write views of multisampled images
     // Loads and size queries work through either kind of view: with the shadow's kind deciding, both are
     // emitted, and the results are written after.
@@ -1772,11 +1771,11 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     for (ViewPass v = view_begin(access, rsrc); view_next(t, v);) {
         bool uav = v.read_write;
         if (uav) {
-            if (!k_rw[m.dim][0]) {
+            if (!k_rw_texture_types[m.dim][0]) {
                 translator_fail(t, "storage image of dimension %u", m.dim);
                 return false;
             }
-            emit(t, "%s<float4> tex_ = ResourceDescriptorHeap[%s];", k_rw[m.dim], resource);
+            emit(t, "%s<float4> tex_ = ResourceDescriptorHeap[%s];", k_rw_texture_types[m.dim], resource);
         } else {
             emit(t, "%s<float4> tex_ = ResourceDescriptorHeap[%s];", k_texture_types[m.dim], resource);
         }
