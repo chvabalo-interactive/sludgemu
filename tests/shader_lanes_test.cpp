@@ -2,7 +2,10 @@
 // the comments) are translated, compiled and run on the desktop device, and what they store is checked
 // against what the console computes. Covers the lane mapping of wave64 programs onto desktop waves
 // (see shader/translate.h): cross-lane reads and writes across the halves, whole-mask queries, masks
-// written as data, DPP row masks, LDS append, console wave numbering in groups of several waves.
+// written as data, DPP row masks, LDS append, console wave numbering in groups of several waves. And
+// control flow as the translator structures it: EXEC skip-overs, if/else on EXEC, scalar loops,
+// waterfall loops, loops lanes leave one by one, jumps out of several loops, and the dispatcher that
+// takes the graphs it can't structure.
 // Skipped without a D3D12 device that runs waves of 32 lanes.
 
 #include <stdlib.h>
@@ -155,6 +158,213 @@ static const u32 k_forms_program[] = {
     0xbf810000,             // s_endpgm
 };
 
+// Program D: control flow, one console wave of 64 lanes, regions as in program A (see flow_expected).
+static const u32 k_flow_program[] = {
+    0xbe8203c1,             // 0x0: s_mov_b32 s2, -1
+    0xbe830380,             // 0x4: s_mov_b32 s3, 0
+    0xd7650001, 0x020100c1, // 0x8: v_mbcnt_lo_u32_b32 v1, -1, 0
+    0xd7660001, 0x020202c1, // 0x10: v_mbcnt_hi_u32_b32 v1, -1, v1
+    0x34040282,             // 0x18: v_lshlrev_b32 v2, 2, v1
+    0xd7600017, 0x02010b01, // 0x1c: v_readlane_b32 s23, v1, 5
+    0x7e080287,             // 0x24: v_mov_b32 v4, 7
+    0x7d880294,             // 0x28: v_cmp_gt_u32 vcc, 20, v1
+    0xbe8a246a,             // 0x2c: s_and_saveexec_b64 s[10:11], vcc
+    0xbf880002,             // 0x30: s_cbranch_execz (to 0x3c)
+    0x4a0802ff, 0x00000064, // 0x34: v_add_nc_u32 v4, 0x64, v1
+    0x88fe0a7e,             // 0x3c: s_or_b64 exec, exec, s[10:11]
+    0xe0701000, 0x80000402, // 0x40: buffer_store_dword v4, v2, s[0:3], 0 offen
+    0xbe94038b,             // 0x48: s_mov_b32 s20, 11
+    0x7d880280,             // 0x4c: v_cmp_gt_u32 vcc, 0, v1
+    0xbe8a246a,             // 0x50: s_and_saveexec_b64 s[10:11], vcc
+    0xbf880001,             // 0x54: s_cbranch_execz (to 0x5c)
+    0xbe9403b7,             // 0x58: s_mov_b32 s20, 55
+    0x88fe0a7e,             // 0x5c: s_or_b64 exec, exec, s[10:11]
+    0x7e080214,             // 0x60: v_mov_b32 v4, s20
+    0xe0701100, 0x80000402, // 0x64: buffer_store_dword v4, v2, s[0:3], 0 offen offset:256
+    0x7e080280,             // 0x6c: v_mov_b32 v4, 0
+    0x7d8802a8,             // 0x70: v_cmp_gt_u32 vcc, 40, v1
+    0xbe8a246a,             // 0x74: s_and_saveexec_b64 s[10:11], vcc
+    0x898a0a7e,             // 0x78: s_xor_b64 s[10:11], exec, s[10:11]
+    0xbf880001,             // 0x7c: s_cbranch_execz (to 0x84)
+    0x7e080281,             // 0x80: v_mov_b32 v4, 1
+    0xbe8a250a,             // 0x84: s_or_saveexec_b64 s[10:11], s[10:11]
+    0x89fe0a7e,             // 0x88: s_xor_b64 exec, exec, s[10:11]
+    0xbf880001,             // 0x8c: s_cbranch_execz (to 0x94)
+    0x7e080282,             // 0x90: v_mov_b32 v4, 2
+    0x88fe0a7e,             // 0x94: s_or_b64 exec, exec, s[10:11]
+    0xe0701200, 0x80000402, // 0x98: buffer_store_dword v4, v2, s[0:3], 0 offen offset:512
+    0xbe940380,             // 0xa0: s_mov_b32 s20, 0
+    0xbe950380,             // 0xa4: s_mov_b32 s21, 0
+    0x80151415,             // 0xa8: s_add_u32 s21, s21, s20
+    0x80148114,             // 0xac: s_add_u32 s20, s20, 1
+    0xbf0a8a14,             // 0xb0: s_cmp_lt_u32 s20, 10
+    0xbf85fffc,             // 0xb4: s_cbranch_scc1 (to 0xa8)
+    0x7e080215,             // 0xb8: v_mov_b32 v4, s21
+    0xe0701300, 0x80000402, // 0xbc: buffer_store_dword v4, v2, s[0:3], 0 offen offset:768
+    0x360a0283,             // 0xc4: v_and_b32 v5, 3, v1
+    0x7e080280,             // 0xc8: v_mov_b32 v4, 0
+    0xbe960380,             // 0xcc: s_mov_b32 s22, 0
+    0xbe8c047e,             // 0xd0: s_mov_b64 s[12:13], exec
+    0x7e280505,             // 0xd4: v_readfirstlane_b32 s20, v5
+    0x7d840a14,             // 0xd8: v_cmp_eq_u32 vcc, s20, v5
+    0xbe8e246a,             // 0xdc: s_and_saveexec_b64 s[14:15], vcc
+    0x93158a14,             // 0xe0: s_mul_i32 s21, s20, 10
+    0xd5250004, 0x02010215, // 0xe4: v_add_nc_u32 v4, s21, 1
+    0x80168116,             // 0xec: s_add_u32 s22, s22, 1
+    0x89fe0e7e,             // 0xf0: s_xor_b64 exec, exec, s[14:15]
+    0xbf89fff7,             // 0xf4: s_cbranch_execnz (to 0xd4)
+    0xbefe040c,             // 0xf8: s_mov_b64 exec, s[12:13]
+    0xe0701400, 0x80000402, // 0xfc: buffer_store_dword v4, v2, s[0:3], 0 offen offset:1024
+    0x7e080216,             // 0x104: v_mov_b32 v4, s22
+    0xe0701500, 0x80000402, // 0x108: buffer_store_dword v4, v2, s[0:3], 0 offen offset:1280
+    0xbe940380,             // 0x110: s_mov_b32 s20, 0
+    0xbe9803ff, 0x000003e8, // 0x114: s_mov_b32 s24, 0x3e8
+    0x80148114,             // 0x11c: s_add_u32 s20, s20, 1
+    0xbf061714,             // 0x120: s_cmp_eq_u32 s20, s23
+    0xbf850004,             // 0x124: s_cbranch_scc1 (to 0x138)
+    0xbf0aff14, 0x00000064, // 0x128: s_cmp_lt_u32 s20, 0x64
+    0xbf85fffa,             // 0x130: s_cbranch_scc1 (to 0x11c)
+    0xbe980382,             // 0x134: s_mov_b32 s24, 2
+    0x80181418,             // 0x138: s_add_u32 s24, s24, s20
+    0x7e080218,             // 0x13c: v_mov_b32 v4, s24
+    0xe0701600, 0x80000402, // 0x140: buffer_store_dword v4, v2, s[0:3], 0 offen offset:1536
+    0xbe940380,             // 0x148: s_mov_b32 s20, 0
+    0xbe990380,             // 0x14c: s_mov_b32 s25, 0
+    0xbf098414,             // 0x150: s_cmp_ge_u32 s20, 4
+    0xbf850007,             // 0x154: s_cbranch_scc1 (to 0x174)
+    0x80148114,             // 0x158: s_add_u32 s20, s20, 1
+    0xbe950380,             // 0x15c: s_mov_b32 s21, 0
+    0x80158115,             // 0x160: s_add_u32 s21, s21, 1
+    0x80198119,             // 0x164: s_add_u32 s25, s25, 1
+    0xbf061415,             // 0x168: s_cmp_eq_u32 s21, s20
+    0xbf85fff8,             // 0x16c: s_cbranch_scc1 (to 0x150)
+    0xbf82fffb,             // 0x170: s_branch (to 0x160)
+    0x7e080219,             // 0x174: v_mov_b32 v4, s25
+    0xe0701700, 0x80000402, // 0x178: buffer_store_dword v4, v2, s[0:3], 0 offen offset:1792
+    0x7e0c0280,             // 0x180: v_mov_b32 v6, 0
+    0xbe900480,             // 0x184: s_mov_b64 s[16:17], 0
+    0x4a0c0c81,             // 0x188: v_add_nc_u32 v6, 1, v6
+    0x7d8c0306,             // 0x18c: v_cmp_ge_u32 vcc, v6, v1
+    0x8890106a,             // 0x190: s_or_b64 s[16:17], vcc, s[16:17]
+    0x8afe107e,             // 0x194: s_andn2_b64 exec, exec, s[16:17]
+    0xbf89fffb,             // 0x198: s_cbranch_execnz (to 0x188)
+    0x88fe107e,             // 0x19c: s_or_b64 exec, exec, s[16:17]
+    0xe0701800, 0x80000602, // 0x1a0: buffer_store_dword v6, v2, s[0:3], 0 offen offset:2048
+    0xbf810000,             // 0x1a8: s_endpgm
+};
+// Program D for wave32: the same with 32-bit masks, its if/else splitting at lane 12.
+static const u32 k_flow32_program[] = {
+    0xbe8203c1,             // 0x0: s_mov_b32 s2, -1
+    0xbe830380,             // 0x4: s_mov_b32 s3, 0
+    0xd7650001, 0x020100c1, // 0x8: v_mbcnt_lo_u32_b32 v1, -1, 0
+    0x34040282,             // 0x10: v_lshlrev_b32 v2, 2, v1
+    0xd7600017, 0x02010b01, // 0x14: v_readlane_b32 s23, v1, 5
+    0x7e080287,             // 0x1c: v_mov_b32 v4, 7
+    0x7d880294,             // 0x20: v_cmp_gt_u32 vcc_lo, 20, v1
+    0xbe8a3c6a,             // 0x24: s_and_saveexec_b32 s10, vcc_lo
+    0xbf880002,             // 0x28: s_cbranch_execz (to 0x34)
+    0x4a0802ff, 0x00000064, // 0x2c: v_add_nc_u32 v4, 0x64, v1
+    0x887e0a7e,             // 0x34: s_or_b32 exec_lo, exec_lo, s10
+    0xe0701000, 0x80000402, // 0x38: buffer_store_dword v4, v2, s[0:3], 0 offen
+    0xbe94038b,             // 0x40: s_mov_b32 s20, 11
+    0x7d880280,             // 0x44: v_cmp_gt_u32 vcc_lo, 0, v1
+    0xbe8a3c6a,             // 0x48: s_and_saveexec_b32 s10, vcc_lo
+    0xbf880001,             // 0x4c: s_cbranch_execz (to 0x54)
+    0xbe9403b7,             // 0x50: s_mov_b32 s20, 55
+    0x887e0a7e,             // 0x54: s_or_b32 exec_lo, exec_lo, s10
+    0x7e080214,             // 0x58: v_mov_b32 v4, s20
+    0xe0701100, 0x80000402, // 0x5c: buffer_store_dword v4, v2, s[0:3], 0 offen offset:256
+    0x7e080280,             // 0x64: v_mov_b32 v4, 0
+    0x7d88028c,             // 0x68: v_cmp_gt_u32 vcc_lo, 12, v1
+    0xbe8a3c6a,             // 0x6c: s_and_saveexec_b32 s10, vcc_lo
+    0x890a0a7e,             // 0x70: s_xor_b32 s10, exec_lo, s10
+    0xbf880001,             // 0x74: s_cbranch_execz (to 0x7c)
+    0x7e080281,             // 0x78: v_mov_b32 v4, 1
+    0xbe8a3d0a,             // 0x7c: s_or_saveexec_b32 s10, s10
+    0x897e0a7e,             // 0x80: s_xor_b32 exec_lo, exec_lo, s10
+    0xbf880001,             // 0x84: s_cbranch_execz (to 0x8c)
+    0x7e080282,             // 0x88: v_mov_b32 v4, 2
+    0x887e0a7e,             // 0x8c: s_or_b32 exec_lo, exec_lo, s10
+    0xe0701200, 0x80000402, // 0x90: buffer_store_dword v4, v2, s[0:3], 0 offen offset:512
+    0xbe940380,             // 0x98: s_mov_b32 s20, 0
+    0xbe950380,             // 0x9c: s_mov_b32 s21, 0
+    0x80151415,             // 0xa0: s_add_u32 s21, s21, s20
+    0x80148114,             // 0xa4: s_add_u32 s20, s20, 1
+    0xbf0a8a14,             // 0xa8: s_cmp_lt_u32 s20, 10
+    0xbf85fffc,             // 0xac: s_cbranch_scc1 (to 0xa0)
+    0x7e080215,             // 0xb0: v_mov_b32 v4, s21
+    0xe0701300, 0x80000402, // 0xb4: buffer_store_dword v4, v2, s[0:3], 0 offen offset:768
+    0x360a0283,             // 0xbc: v_and_b32 v5, 3, v1
+    0x7e080280,             // 0xc0: v_mov_b32 v4, 0
+    0xbe960380,             // 0xc4: s_mov_b32 s22, 0
+    0xbe8c037e,             // 0xc8: s_mov_b32 s12, exec_lo
+    0x7e280505,             // 0xcc: v_readfirstlane_b32 s20, v5
+    0x7d840a14,             // 0xd0: v_cmp_eq_u32 vcc_lo, s20, v5
+    0xbe8e3c6a,             // 0xd4: s_and_saveexec_b32 s14, vcc_lo
+    0x93158a14,             // 0xd8: s_mul_i32 s21, s20, 10
+    0xd5250004, 0x02010215, // 0xdc: v_add_nc_u32 v4, s21, 1
+    0x80168116,             // 0xe4: s_add_u32 s22, s22, 1
+    0x897e0e7e,             // 0xe8: s_xor_b32 exec_lo, exec_lo, s14
+    0xbf89fff7,             // 0xec: s_cbranch_execnz (to 0xcc)
+    0xbefe030c,             // 0xf0: s_mov_b32 exec_lo, s12
+    0xe0701400, 0x80000402, // 0xf4: buffer_store_dword v4, v2, s[0:3], 0 offen offset:1024
+    0x7e080216,             // 0xfc: v_mov_b32 v4, s22
+    0xe0701500, 0x80000402, // 0x100: buffer_store_dword v4, v2, s[0:3], 0 offen offset:1280
+    0xbe940380,             // 0x108: s_mov_b32 s20, 0
+    0xbe9803ff, 0x000003e8, // 0x10c: s_mov_b32 s24, 0x3e8
+    0x80148114,             // 0x114: s_add_u32 s20, s20, 1
+    0xbf061714,             // 0x118: s_cmp_eq_u32 s20, s23
+    0xbf850004,             // 0x11c: s_cbranch_scc1 (to 0x130)
+    0xbf0aff14, 0x00000064, // 0x120: s_cmp_lt_u32 s20, 0x64
+    0xbf85fffa,             // 0x128: s_cbranch_scc1 (to 0x114)
+    0xbe980382,             // 0x12c: s_mov_b32 s24, 2
+    0x80181418,             // 0x130: s_add_u32 s24, s24, s20
+    0x7e080218,             // 0x134: v_mov_b32 v4, s24
+    0xe0701600, 0x80000402, // 0x138: buffer_store_dword v4, v2, s[0:3], 0 offen offset:1536
+    0xbe940380,             // 0x140: s_mov_b32 s20, 0
+    0xbe990380,             // 0x144: s_mov_b32 s25, 0
+    0xbf098414,             // 0x148: s_cmp_ge_u32 s20, 4
+    0xbf850007,             // 0x14c: s_cbranch_scc1 (to 0x16c)
+    0x80148114,             // 0x150: s_add_u32 s20, s20, 1
+    0xbe950380,             // 0x154: s_mov_b32 s21, 0
+    0x80158115,             // 0x158: s_add_u32 s21, s21, 1
+    0x80198119,             // 0x15c: s_add_u32 s25, s25, 1
+    0xbf061415,             // 0x160: s_cmp_eq_u32 s21, s20
+    0xbf85fff8,             // 0x164: s_cbranch_scc1 (to 0x148)
+    0xbf82fffb,             // 0x168: s_branch (to 0x158)
+    0x7e080219,             // 0x16c: v_mov_b32 v4, s25
+    0xe0701700, 0x80000402, // 0x170: buffer_store_dword v4, v2, s[0:3], 0 offen offset:1792
+    0x7e0c0280,             // 0x178: v_mov_b32 v6, 0
+    0xbe900380,             // 0x17c: s_mov_b32 s16, 0
+    0x4a0c0c81,             // 0x180: v_add_nc_u32 v6, 1, v6
+    0x7d8c0306,             // 0x184: v_cmp_ge_u32 vcc_lo, v6, v1
+    0x8810106a,             // 0x188: s_or_b32 s16, vcc_lo, s16
+    0x8a7e107e,             // 0x18c: s_andn2_b32 exec_lo, exec_lo, s16
+    0xbf89fffb,             // 0x190: s_cbranch_execnz (to 0x180)
+    0x887e107e,             // 0x194: s_or_b32 exec_lo, exec_lo, s16
+    0xe0701800, 0x80000602, // 0x198: buffer_store_dword v6, v2, s[0:3], 0 offen offset:2048
+    0xbf810000,             // 0x1a0: s_endpgm
+};
+// Program E: a loop entered at two blocks, which only the dispatcher takes.
+static const u32 k_irreducible_program[] = {
+    0xbe8203c1,             // 0x0: s_mov_b32 s2, -1
+    0xbe830380,             // 0x4: s_mov_b32 s3, 0
+    0xd7650001, 0x020100c1, // 0x8: v_mbcnt_lo_u32_b32 v1, -1, 0
+    0xd7660001, 0x020202c1, // 0x10: v_mbcnt_hi_u32_b32 v1, -1, v1
+    0x34040282,             // 0x18: v_lshlrev_b32 v2, 2, v1
+    0xd7600017, 0x02010b01, // 0x1c: v_readlane_b32 s23, v1, 5
+    0xbe9a0380,             // 0x24: s_mov_b32 s26, 0
+    0xbf068517,             // 0x28: s_cmp_eq_u32 s23, 5
+    0xbf850001,             // 0x2c: s_cbranch_scc1 (to 0x34)
+    0x801a8a1a,             // 0x30: s_add_u32 s26, s26, 10
+    0x801a811a,             // 0x34: s_add_u32 s26, s26, 1
+    0xbf0a9e1a,             // 0x38: s_cmp_lt_u32 s26, 30
+    0xbf85fffc,             // 0x3c: s_cbranch_scc1 (to 0x30)
+    0x7e08021a,             // 0x40: v_mov_b32 v4, s26
+    0xe0701000, 0x80000402, // 0x44: buffer_store_dword v4, v2, s[0:3], 0 offen
+    0xbf810000,             // 0x4c: s_endpgm
+};
+
 #define UNWRITTEN    0xDEADBEEFu // what the output buffer starts with
 #define OUTPUT_BYTES 4096
 
@@ -193,6 +403,35 @@ static u32 lanes_expected(u32 r, u32 i) {
         return i < 10 || (i >= 50 && i < 60) ? 100 : UNWRITTEN;
     case 15: // v_readlane with the lane in an SGPR (45)
         return 45 * 3;
+    default:
+        return UNWRITTEN;
+    }
+}
+
+// What program D stores in region `r` for lane `i` of a wave of `lanes`, its if/else taking the lanes
+// below `then_lanes`.
+static u32 flow_expected(u32 r, u32 i, u32 lanes, u32 then_lanes) {
+    if (i >= lanes)
+        return UNWRITTEN;
+    switch (r) {
+    case 0: // an EXEC skip-over: lanes 0-19 add 100
+        return i < 20 ? i + 100 : 7;
+    case 1: // a skip-over no lane takes: its scalar write doesn't happen
+        return 11;
+    case 2: // if/else on EXEC
+        return i < then_lanes ? 1 : 2;
+    case 3: // a counted scalar loop: 0 + 1 + ... + 9
+        return 45;
+    case 4: // a waterfall loop over lane & 3
+        return (i & 3) * 10 + 1;
+    case 5: // its trip count
+        return 4;
+    case 6: // a loop leaving straight to the join at s20 = 5 (not through the block setting 2)
+        return 1005;
+    case 7: // the inner loop going on with the outer one: 1 + 2 + 3 + 4
+        return 10;
+    case 8: // lanes leaving a loop one by one
+        return i > 1 ? i : 1;
     default:
         return UNWRITTEN;
     }
@@ -369,14 +608,25 @@ static void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RE
     list->ResourceBarrier(1, &rb);
 }
 
-// Translates `code` with `info` and runs one group of it; `out` gets the output buffer. False if any
-// step failed (reported).
-static bool run_program(GpuBench& b, const u32* code, u32 size, const ShaderInfo& info, u32* out) {
+// Translates `code` with `info` and runs one group of it; `out` gets the output buffer. With `expect`,
+// the HLSL must hold that text (with a leading '!': must not). False if any step failed (reported).
+static bool run_program(GpuBench& b, const u32* code, u32 size, const ShaderInfo& info, u32* out,
+                        const char* expect = nullptr) {
     TranslatedShader t = {};
     if (!shader_translate(code, size, info, b.target, &t)) {
         printf("FAIL shader lanes: translation failed: %s\n", t.error);
         t.hlsl.release();
         return false;
+    }
+    if (expect) {
+        bool absent = expect[0] == '!';
+        const char* text = absent ? expect + 1 : expect;
+        if ((strstr(t.hlsl.data, text) != nullptr) == absent) {
+            printf("FAIL shader lanes: the translation %s \"%s\"\n%s\n", absent ? "has" : "lacks", text,
+                   t.hlsl.data);
+            t.hlsl.release();
+            return false;
+        }
     }
     DxcBuffer source = {t.hlsl.data, t.hlsl.length, DXC_CP_UTF8};
     const wchar_t* args[] = {L"-E", L"main", L"-T", L"cs_6_6", L"-O3", L"-HV", L"2021"};
@@ -517,7 +767,41 @@ void test_shader_lanes() {
     } else {
         g_failures++;
     }
-    printf("shader lanes: 3 programs run on the GPU (waves of %u-%u lanes)\n", b.target.wave_min,
+    // Program D, wave64 and wave32: structured, with jumps out of several statements (go_; the
+    // dispatcher has none).
+    for (u32 w = 0; w < 2; w++) {
+        bool wave64 = w == 0;
+        ShaderInfo info = compute_info(wave64 ? 64 : 32, 0);
+        info.wave_size = wave64 ? 64 : 32;
+        const u32* code = wave64 ? k_flow_program : k_flow32_program;
+        u32 size = wave64 ? sizeof(k_flow_program) : sizeof(k_flow32_program);
+        if (!run_program(b, code, size, info, out, "go_ = ")) {
+            g_failures++;
+            continue;
+        }
+        for (u32 r = 0; r < 16; r++)
+            for (u32 i = 0; i < 64; i++) {
+                u32 want = flow_expected(r, i, wave64 ? 64 : 32, wave64 ? 40 : 12);
+                if (out[r * 64 + i] != want) {
+                    printf("FAIL shader lanes: program D (wave%u) region %u lane %u: 0x%x, expected 0x%x\n",
+                           wave64 ? 64 : 32, r, i, out[r * 64 + i], want);
+                    g_failures++;
+                    break;
+                }
+            }
+    }
+    if (run_program(b, k_irreducible_program, sizeof(k_irreducible_program), compute_info(64, 0), out,
+                    "blocks dispatched")) {
+        for (u32 i = 0; i < 64; i++)
+            if (out[i] != 34) {
+                printf("FAIL shader lanes: program E lane %u: 0x%x, expected 34\n", i, out[i]);
+                g_failures++;
+                break;
+            }
+    } else {
+        g_failures++;
+    }
+    printf("shader lanes: 6 programs run on the GPU (waves of %u-%u lanes)\n", b.target.wave_min,
            b.target.wave_max);
     bench_release(b);
 }
