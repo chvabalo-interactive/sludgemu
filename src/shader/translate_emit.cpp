@@ -308,6 +308,8 @@ void write_vgpr(Translator& t, const RdnaInst& in, u32 reg, const char* value) {
         else
             value = bits;
     }
+    if (strcmp(value, dst) == 0)
+        return; // a move onto itself (v_mov v1, v1 and the like)
     emit(t, t.dpp_has_mask ? "if (%s && dpp_en_) %s = %s;" : "if (%s) %s = %s;", exec_cond(t), dst, value);
 }
 
@@ -321,7 +323,10 @@ void write_sgpr(Translator& t, const RdnaOperand& dst, u32 part, const char* val
     u32 reg = (dst.reg + part) & 127;
     if (t.exec_bits && (reg == SRC_EXEC_LO || reg == SRC_EXEC_HI))
         value = lane_mask_of(t, value);
-    emit(t, "%s = %s;", sgpr(t, reg), value);
+    const char* name = sgpr(t, reg);
+    if (strcmp(value, name) == 0)
+        return; // a move onto itself
+    emit(t, "%s = %s;", name, value);
 }
 
 // --- pixel shader input VGPRs ------------------------------------------------------------------------
