@@ -558,7 +558,7 @@ static void clear_spill(const Translator& t, TagState& s, const RdnaOperand& o, 
 }
 
 // Lane mask results: compares, carries (VOP2 and VOP3 second destinations) and saveexec.
-static bool writes_lane_mask(const RdnaInst& in, u32 d) {
+bool writes_lane_mask(const RdnaInst& in, u32 d) {
     RdnaEncoding base = rdna_op_encoding(in.op);
     return base == ENC_VOPC || (d == 1 && (in.enc == ENC_VOP3 || base == ENC_VOP2)) ||
            (in.op >= OP_S_AND_SAVEEXEC_B64 && in.op <= OP_S_XNOR_SAVEEXEC_B64) ||
@@ -1322,6 +1322,16 @@ static bool xor_operands(const RdnaInst& in, u32* dst, u32* s0, u32* s1, u32* wi
     *width = in.op == OP_S_XOR_B64 ? 2 : 1;
     return xor_register(in.dst[0], *width, dst) && xor_register(in.src[0], *width, s0) &&
            xor_register(in.src[1], *width, s1);
+}
+
+bool xor_swap_registers(const Translator& t, u32 inst_idx, u32* a, u32* b, u32* width) {
+    u32 d, s0, s1;
+    if (!t.xor_swap_role || t.xor_swap_role[inst_idx] != 1 ||
+        !xor_operands(t.program.insts[inst_idx], &d, &s0, &s1, width))
+        return false;
+    *a = d;
+    *b = d == s0 ? s1 : s0;
+    return true;
 }
 
 static bool overlaps(const RdnaOperand& o, u32 reg, u32 width) {

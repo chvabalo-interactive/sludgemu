@@ -277,6 +277,12 @@ bool sgpr_live_in(const Translator& t, u32 block, u32 reg);
 // Exact lanes: whether an SGPR holds data that reads the same as a mask (all bits clear or set).
 bool sgpr_neutral(const TagState& s, u32 reg);
 bool picks_registers_at_run_time(RdnaOp op);
+// Whether destination `d` is a lane mask result (compares, carries, saveexec): one dword in wave32,
+// whatever the operand says.
+bool writes_lane_mask(const RdnaInst& in, u32 d);
+// The registers [a, a + width) and [b, b + width) a recognized three-XOR swap exchanges, at its first
+// XOR (see find_xor_swaps); false for any other instruction.
+bool xor_swap_registers(const Translator& t, u32 inst_idx, u32* a, u32* b, u32* width);
 // Decides which vector writes may write every lane: those whose lanes outside EXEC nothing reads before
 // they are overwritten. translate_lanes.cpp
 bool analyze_lane_writes(Translator& t);

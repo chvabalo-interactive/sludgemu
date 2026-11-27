@@ -67,9 +67,14 @@ enum : u32 {
     HELD_INSIDE = 0x40000000u,
 };
 
+// SGPRs parked in lanes of spill VGPRs (v_writelane/v_readlane at constant lanes) keep what they hold,
+// in the first SPILL_HELD lanes used.
+#define SPILL_HELD 32
+#define HELD_SLOTS (128 + SPILL_HELD)
+
 struct ExecState {
     ExecChain chain;
-    u32 held[128]; // per SGPR
+    u32 held[HELD_SLOTS]; // per SGPR, then per spill lane
 };
 
 static u32 held_version(u32 held) {
@@ -102,7 +107,7 @@ static void drop_version(ExecState& s, u32 v) {
         memmove(&s.chain.version[at], &s.chain.version[at + 1], (s.chain.depth - at - 1) * sizeof(u32));
         s.chain.depth--;
     }
-    for (u32 r = 0; r < 128; r++)
+    for (u32 r = 0; r < HELD_SLOTS; r++)
         if (s.held[r] != NO_VERSION && held_version(s.held[r]) == v)
             s.held[r] = NO_VERSION;
 }
@@ -185,11 +190,6 @@ static bool is_saveexec(RdnaOp op) {
            (op >= OP_S_AND_SAVEEXEC_B32 && op <= OP_S_ANDN2_WREXEC_B32);
 }
 
-static bool is_scalar_alu(const RdnaInst& in) {
-    RdnaEncoding base = rdna_op_encoding(in.op);
-    return base == ENC_SOP1 || base == ENC_SOP2 || base == ENC_SOPK || base == ENC_SOPC || base == ENC_SOPP;
-}
-
 // The masking forms of this wave size: 64-bit operations for wave64, 32-bit ones for wave32.
 static bool mask_op(const Translator& t, RdnaOp op, RdnaOp op64, RdnaOp op32) {
     return op == (t.wave32 ? op32 : op64);
@@ -199,15 +199,14 @@ static u32 inside(u32 held) {
     return held == NO_VERSION ? NO_VERSION : held | HELD_INSIDE;
 }
 
-// What an instruction leaves in its scalar destination (see held_of), from the state before it.
+// What a masking instruction of this wave size leaves in its scalar destination (see held_of), from the
+// state before it.
 static u32 result_held(const Translator& t, const ExecState& s, const RdnaInst& in, u32 cur) {
     const RdnaOperand& a = in.src[0];
     const RdnaOperand& b = in.src[1];
     if (mask_op(t, in.op, OP_S_AND_SAVEEXEC_B64, OP_S_AND_SAVEEXEC_B32) ||
         mask_op(t, in.op, OP_S_OR_SAVEEXEC_B64, OP_S_OR_SAVEEXEC_B32))
         return cur;
-    if (mask_op(t, in.op, OP_S_MOV_B64, OP_S_MOV_B32))
-        return is_exec_operand(a) ? cur : held_of(t, s, a);
     if (mask_op(t, in.op, OP_S_AND_B64, OP_S_AND_B32)) {
         if (is_exec_operand(a) || is_exec_operand(b))
             return inside(cur);
@@ -220,6 +219,46 @@ static u32 result_held(const Translator& t, const ExecState& s, const RdnaInst& 
     if (rdna_op_encoding(in.op) == ENC_VOPC && !is_cmpx(in))
         return inside(cur);
     return NO_VERSION;
+}
+
+// Moves copy what each source dword holds, whatever their width (masks of wave64 are register pairs,
+// spilled and reloaded in pieces; EXEC's dwords hold its version). Returns whether `in` is such a move.
+static bool copy_held(const Translator& t, ExecState& s, const RdnaInst& in, u32 cur) {
+    if ((in.op != OP_S_MOV_B32 && in.op != OP_S_MOV_B64) || !is_mask_register(in.dst[0]))
+        return false;
+    const RdnaOperand& src = in.src[0];
+    u32 dwords = in.op == OP_S_MOV_B64 ? 2 : 1;
+    u32 copied[2] = {NO_VERSION, NO_VERSION};
+    for (u32 k = 0; k < dwords; k++) {
+        u32 reg = (src.reg + k) & 127;
+        if (src.kind == OPND_SPECIAL && (reg == SRC_EXEC_LO || reg == SRC_EXEC_HI))
+            copied[k] = reg == SRC_EXEC_LO || !t.wave32 ? cur : NO_VERSION;
+        else if (is_mask_register(src) || (src.kind == OPND_SPECIAL && reg == SRC_VCC_HI))
+            copied[k] = s.held[reg];
+    }
+    for (u32 k = 0; k < dwords; k++)
+        s.held[(in.dst[0].reg + k) & 127] = copied[k];
+    return true;
+}
+
+static u32 count_bits(u64 v) {
+    u32 n = 0;
+    for (; v; v &= v - 1)
+        n++;
+    return n;
+}
+
+// The held slot of the spill VGPR lane a v_writelane/v_readlane at a constant lane accesses, or ~0u.
+static u32 spill_held_slot(const Translator& t, const RdnaInst& in) {
+    const RdnaOperand& v = in.op == OP_V_WRITELANE_B32 ? in.dst[0] : in.src[0];
+    u32 lane;
+    if (v.kind != OPND_VGPR || t.spill_slot[v.reg & 255] == 0xFF || !constant_lane(t, in.src[1], &lane))
+        return ~0u;
+    u32 slot = t.spill_slot[v.reg & 255];
+    u32 index = count_bits(t.spill_lanes[slot] & ((1ull << lane) - 1));
+    for (u32 k = 0; k < slot; k++)
+        index += count_bits(t.spill_lanes[k]);
+    return index < SPILL_HELD ? 128 + index : ~0u;
 }
 
 // EXEC becomes what `held` says: a version of the chain again, or a mask inside one. False if it names
@@ -240,7 +279,7 @@ static void exec_transfer(const Translator& t, ExecState& s, const RdnaInst& in,
     u32 cur = current(s.chain);
     // A call: nothing is known about what it leaves.
     if (in.op == OP_S_SWAPPC_B64 || in.op == OP_S_CALL_B64) {
-        for (u32 r = 0; r < 128; r++)
+        for (u32 r = 0; r < HELD_SLOTS; r++)
             s.held[r] = NO_VERSION;
         restart(s, made);
         return;
@@ -251,19 +290,43 @@ static void exec_transfer(const Translator& t, ExecState& s, const RdnaInst& in,
     u32 held_a = in.num_src > 0 ? held_of(t, s, a) : NO_VERSION;
     u32 held_b = in.num_src > 1 ? held_of(t, s, b) : NO_VERSION;
     u32 result = result_held(t, s, in, cur);
-    // Destination SGPRs lose what they held (VCC too: vector instructions write it without naming it).
+    bool exec_dst = writes_exec_register(in);
+    u32 swap_a, swap_b, swap_width;
+    if (!exec_dst && copy_held(t, s, in, cur))
+        return;
+    if (in.op == OP_V_WRITELANE_B32 || in.op == OP_V_READLANE_B32) {
+        // Spills and reloads of SGPRs keep what they hold.
+        u32 slot = spill_held_slot(t, in);
+        if (in.op == OP_V_WRITELANE_B32) {
+            if (slot != ~0u)
+                s.held[slot] = is_mask_register(a) ? s.held[a.reg & 127] : NO_VERSION;
+            return;
+        }
+        if (is_mask_register(in.dst[0]) && !exec_dst) {
+            s.held[in.dst[0].reg & 127] = slot != ~0u ? s.held[slot] : NO_VERSION;
+            return;
+        }
+    }
+    if (xor_swap_registers(t, index, &swap_a, &swap_b, &swap_width)) {
+        // The first XOR of a swap exchanges the registers (the other two leave them alone).
+        for (u32 k = 0; k < swap_width; k++) {
+            u32 held = s.held[(swap_a + k) & 127];
+            s.held[(swap_a + k) & 127] = s.held[(swap_b + k) & 127];
+            s.held[(swap_b + k) & 127] = held;
+        }
+        return;
+    }
+    if (t.xor_swap_role && t.xor_swap_role[index] == 2)
+        return;
+    // Destination SGPRs lose what they held (the decoder names implicit VCC writes as destinations).
     for (u32 d = 0; d < 2; d++) {
         const RdnaOperand& o = in.dst[d];
         if (o.kind != OPND_SGPR && !(o.kind == OPND_SPECIAL && o.reg < 128))
             continue;
-        for (u32 k = 0; k < (o.count ? o.count : 1u); k++)
+        u32 count = t.wave32 && writes_lane_mask(in, d) ? 1u : o.count ? o.count : 1u;
+        for (u32 k = 0; k < count; k++)
             s.held[(o.reg + k) & 127] = NO_VERSION;
     }
-    if (!is_scalar_alu(in)) {
-        s.held[SRC_VCC_LO] = NO_VERSION;
-        s.held[SRC_VCC_HI] = NO_VERSION;
-    }
-    bool exec_dst = writes_exec_register(in);
     if (result != NO_VERSION && !exec_dst)
         set_held(t, s, in.dst[0], result);
     if (!exec_dst && !is_saveexec(in.op) && !is_cmpx(in))
@@ -276,8 +339,12 @@ static void exec_transfer(const Translator& t, ExecState& s, const RdnaInst& in,
     bool exec_a = is_exec_operand(a), exec_b = in.num_src > 1 && is_exec_operand(b);
     if (!whole) {
         restart(s, made);
-    } else if (mask_op(t, in.op, OP_S_AND_SAVEEXEC_B64, OP_S_AND_SAVEEXEC_B32) || is_cmpx(in)) {
-        narrow(s, made); // EXEC & source
+    } else if (mask_op(t, in.op, OP_S_AND_SAVEEXEC_B64, OP_S_AND_SAVEEXEC_B32) || is_cmpx(in) ||
+               mask_op(t, in.op, OP_S_ANDN1_WREXEC_B64, OP_S_ANDN1_WREXEC_B32)) {
+        narrow(s, made); // EXEC & source, EXEC & ~source
+    } else if (mask_op(t, in.op, OP_S_ANDN2_WREXEC_B64, OP_S_ANDN2_WREXEC_B32)) {
+        if (!set_exec_from(s, inside(held_a), made)) // source & ~EXEC
+            restart(s, made);
     } else if (mask_op(t, in.op, OP_S_OR_SAVEEXEC_B64, OP_S_OR_SAVEEXEC_B32) && is_minus_one(a)) {
         s.chain.all = true;
     } else if (mask_op(t, in.op, OP_S_MOV_B64, OP_S_MOV_B32)) {
@@ -303,6 +370,11 @@ static void exec_transfer(const Translator& t, ExecState& s, const RdnaInst& in,
     } else {
         restart(s, made);
     }
+    // WREXEC writes the new EXEC to its destination as well.
+    if ((mask_op(t, in.op, OP_S_ANDN1_WREXEC_B64, OP_S_ANDN1_WREXEC_B32) ||
+         mask_op(t, in.op, OP_S_ANDN2_WREXEC_B64, OP_S_ANDN2_WREXEC_B32)) &&
+        current(s.chain) != NO_VERSION)
+        set_held(t, s, d, current(s.chain));
 }
 
 // What an SGPR holding `held` on a path with chain `own` holds as far as the joined chain `joined_chain`
@@ -380,7 +452,7 @@ static bool exec_merge(ExecState& into, const ExecState& from, u32 block) {
         into.chain.version[n] = joined;
         into.chain.depth = (u8)(n + 1);
     }
-    for (u32 r = 0; r < 128; r++)
+    for (u32 r = 0; r < HELD_SLOTS; r++)
         into.held[r] = merged_held(into.chain, old.chain, into.held[r], from.chain, from.held[r], joined);
     return !same_chain(old.chain, into.chain) || memcmp(old.held, into.held, sizeof(old.held)) != 0;
 }
@@ -512,7 +584,10 @@ static void vector_reads(const RdnaInst& in, VectorWrite write, u8* regs) {
 // --- the analysis ------------------------------------------------------------------------------------
 
 struct LaneAnalysis {
-    ExecState* entry;  // per block: EXEC state where it starts
+    u32* pred_first; // per block (and one more): where its predecessors start in `preds`
+    u32* preds;
+    ExecState* exit; // per block: EXEC state where it ends
+    ExecState* entry; // per block: EXEC state where it starts
     bool* reached;     // per block
     ExecChain* chains; // snapshots of the chain
     u32 chain_count;
@@ -604,51 +679,67 @@ static u32 add_chain(LaneAnalysis& a, const ExecChain& c) {
     return a.chain_count++;
 }
 
+static bool same_state(const ExecState& a, const ExecState& b) {
+    return same_chain(a.chain, b.chain) && memcmp(a.held, b.held, sizeof(a.held)) == 0;
+}
+
+// EXEC states where blocks start: recomputed each round from what the paths into each block bring now
+// (keeping earlier rounds' states would mix in the versions of loop iterations before the join's own
+// version was known). False if it doesn't settle.
 static bool forward(const Translator& t, LaneAnalysis& a) {
     const Program& p = t.program;
-    ExecState& start = a.entry[0];
-    memset(&start, 0, sizeof(start));
+    ExecState start = {};
     bool whole_waves = t.exact && t.wave_threads % (t.wave32 ? 32u : 64u) == 0;
     start.chain.version[0] = whole_waves ? ALL_VERSION : START_VERSION;
     start.chain.depth = 1;
-    a.reached[0] = true;
-    ExecState* s = (ExecState*)malloc(sizeof(ExecState));
+    ExecState* s = (ExecState*)malloc(sizeof(ExecState) * 2);
     if (!s)
         return false;
-    // Joins only shorten chains, turn versions into the join's own and forget copies: this settles.
-    for (bool changed = true; changed;) {
-        changed = false;
+    ExecState& in = s[0];
+    ExecState& state = s[1];
+    bool settled = false;
+    for (u32 round = 0; round < 100 && !settled; round++) {
+        settled = true;
         for (u32 b = 0; b < p.block_count; b++) {
-            if (!a.reached[b])
-                continue;
-            *s = a.entry[b];
-            for (u32 i = p.blocks[b].first; i < p.blocks[b].end; i++)
-                exec_transfer(t, *s, p.insts[i], i);
-            for (u32 k = 0; k < 2; k++) {
-                s32 n = p.blocks[b].next[k];
-                if (n < 0)
+            bool any = b == 0;
+            if (any)
+                in = start;
+            for (u32 k = a.pred_first[b]; k < a.pred_first[b + 1]; k++) {
+                u32 from = a.preds[k];
+                if (!a.reached[from])
                     continue;
-                if (!a.reached[n]) {
-                    a.entry[n] = *s;
-                    a.reached[n] = true;
-                    changed = true;
-                } else if (exec_merge(a.entry[n], *s, (u32)n)) {
-                    changed = true;
-                }
+                if (!any)
+                    in = a.exit[from];
+                else
+                    exec_merge(in, a.exit[from], b);
+                any = true;
             }
+            if (!any || (a.reached[b] && same_state(in, a.entry[b])))
+                continue;
+            a.entry[b] = in;
+            a.reached[b] = true;
+            settled = false;
+            state = in;
+            for (u32 i = p.blocks[b].first; i < p.blocks[b].end; i++)
+                exec_transfer(t, state, p.insts[i], i);
+            a.exit[b] = state;
         }
+    }
+    if (!settled) {
+        free(s);
+        return false;
     }
     // Snapshots of the chain around every instruction.
     for (u32 b = 0; b < p.block_count; b++) {
         if (!a.reached[b])
             continue;
-        *s = a.entry[b];
-        u32 at = add_chain(a, s->chain);
+        state = a.entry[b];
+        u32 at = add_chain(a, state.chain);
         for (u32 i = p.blocks[b].first; i < p.blocks[b].end; i++) {
             a.chain_before[i] = at;
-            exec_transfer(t, *s, p.insts[i], i);
+            exec_transfer(t, state, p.insts[i], i);
             if (changes_exec(p.insts[i]))
-                at = add_chain(a, s->chain);
+                at = add_chain(a, state.chain);
             a.chain_after[i] = at;
         }
     }
@@ -711,6 +802,31 @@ static bool backward(Translator& t, LaneAnalysis& a) {
     return true;
 }
 
+// Fills the predecessor lists from the blocks' successors.
+static bool find_predecessors(const Program& p, LaneAnalysis& a) {
+    a.pred_first = (u32*)calloc(p.block_count + 1, sizeof(u32));
+    a.preds = (u32*)calloc(p.block_count * 2 + 1, sizeof(u32));
+    if (!a.pred_first || !a.preds)
+        return false;
+    for (u32 b = 0; b < p.block_count; b++)
+        for (u32 k = 0; k < 2; k++)
+            if (p.blocks[b].next[k] >= 0)
+                a.pred_first[p.blocks[b].next[k] + 1]++;
+    for (u32 b = 0; b < p.block_count; b++)
+        a.pred_first[b + 1] += a.pred_first[b];
+    u32* fill = (u32*)calloc(p.block_count, sizeof(u32));
+    if (!fill)
+        return false;
+    for (u32 b = 0; b < p.block_count; b++)
+        for (u32 k = 0; k < 2; k++) {
+            s32 n = p.blocks[b].next[k];
+            if (n >= 0)
+                a.preds[a.pred_first[n] + fill[n]++] = b;
+        }
+    free(fill);
+    return true;
+}
+
 bool analyze_lane_writes(Translator& t) {
     const Program& p = t.program;
     t.lane_write = (u8*)calloc(p.count + 1, 1);
@@ -725,24 +841,28 @@ bool analyze_lane_writes(Translator& t) {
     u32 snapshots = p.block_count + 1;
     for (u32 i = 0; i < p.count; i++)
         snapshots += changes_exec(p.insts[i]) ? 1u : 0u;
+    a.exit = (ExecState*)calloc(p.block_count, sizeof(ExecState));
     a.entry = (ExecState*)calloc(p.block_count, sizeof(ExecState));
     a.reached = (bool*)calloc(p.block_count, 1);
     a.chains = (ExecChain*)calloc(snapshots, sizeof(ExecChain));
     a.chain_before = (u32*)calloc(p.count, sizeof(u32));
     a.chain_after = (u32*)calloc(p.count, sizeof(u32));
     a.live = (u32(*)[256])calloc(p.block_count, sizeof(u32[256]));
-    bool ok = a.entry && a.reached && a.chains && a.chain_before && a.chain_after && a.live;
-    if (ok)
-        ok = forward(t, a);
-    if (ok && !backward(t, a))
-        memset(t.lane_write, 0, p.count + 1); // didn't settle: every write keeps its guard
+    // Out of memory, or an analysis that doesn't settle: every write keeps its guard.
+    bool ok = a.exit && a.entry && a.reached && a.chains && a.chain_before && a.chain_after && a.live &&
+              find_predecessors(p, a) && forward(t, a) && backward(t, a);
+    if (!ok)
+        memset(t.lane_write, 0, p.count + 1);
+    free(a.pred_first);
+    free(a.preds);
+    free(a.exit);
     free(a.entry);
     free(a.reached);
     free(a.chains);
     free(a.chain_before);
     free(a.chain_after);
     free(a.live);
-    return ok;
+    return true;
 }
 
 bool lane_write_replaces(const Translator& t, const RdnaInst& in) {
