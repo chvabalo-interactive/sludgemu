@@ -462,9 +462,19 @@ static void compile_and_finish(Worker& w, ShaderProgram* p, TranslatedShader& t,
 }
 
 // The worker has the program from here on: a thread waiting since before hurries it (it may run in
-// the background, as the program was asked for first by its creation).
+// the background, as the program was asked for first by its creation). A waiter that read the worker
+// before it was named here can't, and would sleep out its timeout while the build crawls at background
+// speed, so the worker raises itself for a program something waits for. The waiter marks `urgent`
+// under g_job_lock before it reads the worker, and the worker reads `urgent` under it after naming
+// itself: one of the two sees the other.
 static void start_program(Worker& w, ShaderProgram* p) {
-    InterlockedExchange(&p->worker, (long)job_token(w));
+    u32 token = job_token(w);
+    InterlockedExchange(&p->worker, (long)token);
+    AcquireSRWLockShared(&g_job_lock);
+    bool urgent = p->urgent;
+    ReleaseSRWLockShared(&g_job_lock);
+    if (urgent)
+        gpu_job_hurry(token);
     WakeByAddressAll((void*)&p->state);
 }
 
