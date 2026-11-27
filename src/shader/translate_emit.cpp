@@ -297,19 +297,35 @@ const char* float_result(Translator& t, const RdnaInst& in, const char* value) {
 
 void write_vgpr(Translator& t, const RdnaInst& in, u32 reg, const char* value) {
     const char* dst = vgpr(t, reg);
+    const RdnaOperand& d = in.dst[0];
+    u32 at = (reg - d.reg) & 255;
+    bool in_destination = d.kind == OPND_VGPR && at < (d.count ? d.count : 1u);
+    if (in_destination && at < 32)
+        t.lane_written |= 1u << at;
     if (in.has_sdwa && in.sdwa.dst_sel != SDWA_DWORD) {
         u32 sel = in.sdwa.dst_sel;
         u32 shift = sel <= SDWA_BYTE_3 ? sel * 8 : (sel - SDWA_WORD_0) * 16;
         u32 width = sel <= SDWA_BYTE_3 ? 8 : 16;
         u32 field = ((1u << width) - 1) << shift;
         const char* bits = fmt(t, "((%s << %u) & 0x%08xu)", value, shift, field);
-        if (in.sdwa.dst_unused == 2) // preserve the other bits
+        if (in.sdwa.dst_unused == 2) { // preserve the other bits
             value = fmt(t, "((%s & 0x%08xu) | %s)", dst, ~field, bits);
-        else
+            if (lane_write_replaces(t, in))
+                t.lane_check_failed = true;
+        } else {
             value = bits;
+        }
     }
     if (strcmp(value, dst) == 0)
         return; // a move onto itself (v_mov v1, v1 and the like)
+    if (t.write_all_lanes) {
+        // The lanes outside EXEC are never read again (see translate_lanes.cpp): write them all, so
+        // that the old value dies here. Only the destination the analysis knows may be written so.
+        if (!in_destination || t.dpp_has_mask)
+            t.lane_check_failed = true;
+        emit(t, "%s = %s;", dst, value);
+        return;
+    }
     emit(t, t.dpp_has_mask ? "if (%s && dpp_en_) %s = %s;" : "if (%s) %s = %s;", exec_cond(t), dst, value);
 }
 
@@ -686,12 +702,17 @@ void emit_block(Translator& t, u32 b) {
         const RdnaInst& in = t.program.insts[i];
         t.inst_offset = in.offset;
         t.copying = copies_tags(t, t.tags, in, i);
+        t.write_all_lanes = t.lane_write[i] != 0;
+        t.lane_written = 0;
         if (!t.exact || whole_wave(t, in))
             emit_instruction(t, in);
         else
             emit_lanes(t, in);
+        if (!lane_write_complete(t, in, t.lane_written))
+            t.lane_check_failed = true;
         tags_transfer(t, t.tags, in, i);
     }
+    t.write_all_lanes = false;
 }
 
 const char* branch_condition(Translator& t, const RdnaInst& in, bool negate) {

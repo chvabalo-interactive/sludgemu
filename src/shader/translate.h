@@ -8,7 +8,8 @@
 //   broadcast. Bitwise mask operations then work unchanged, and the operations that look at the
 //   whole mask (branches on EXECZ/VCCZ, bit counts) use wave intrinsics.
 // - Scalar branches are uniform, so desktop waves stay converged; vector instructions only write
-//   lanes whose EXEC bit is set. The blocks between branches become structured HLSL control flow:
+//   lanes whose EXEC bit is set, except where nothing reads the other lanes before they are written
+//   again (see translate_lanes.cpp). The blocks between branches become structured HLSL control flow:
 //   if/else, loops and labelled exits rebuilt from the dominator tree (see translate_flow.cpp).
 //
 // Compute programs run with console waves mapped exactly onto desktop waves, so that cross-lane

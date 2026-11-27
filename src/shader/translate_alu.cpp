@@ -10,8 +10,11 @@ static const char* src(Translator& t, const RdnaInst& in, u32 i, u32 part = 0) {
     return src_u32(t, in, i, TYPE_32, part);
 }
 
-// The destination register's old value, which accumulating and half-writing instructions read.
+// The destination register's old value, which accumulating and half-writing instructions read (the
+// lane analysis must know: see lane_write_replaces).
 static const char* dst_value(Translator& t, const RdnaInst& in) {
+    if (lane_write_replaces(t, in))
+        t.lane_check_failed = true;
     return vgpr_data(t, in.dst[0].reg);
 }
 

@@ -1346,7 +1346,7 @@ static bool touches(const RdnaInst& in, u32 reg, u32 width) {
                    in.op == OP_V_DIV_FMAS_F64);
 }
 
-static bool picks_registers_at_run_time(RdnaOp op) {
+bool picks_registers_at_run_time(RdnaOp op) {
     return op == OP_S_MOVRELS_B32 || op == OP_S_MOVRELS_B64 || op == OP_S_MOVRELD_B32 ||
            op == OP_S_MOVRELD_B64 || op == OP_S_MOVRELSD_2_B32 || op == OP_V_MOVRELD_B32 ||
            op == OP_V_MOVRELS_B32 || op == OP_V_MOVRELSD_B32 || op == OP_V_MOVRELSD_2_B32;
@@ -1590,7 +1590,7 @@ static bool analyze_tags(Translator& t) {
             }
         }
     }
-    return analyze_liveness(t);
+    return analyze_liveness(t) && analyze_lane_writes(t);
 }
 
 // --- failure details ---------------------------------------------------------------------------------
@@ -1691,6 +1691,7 @@ static void release(Translator& t) {
     free(t.block_reached);
     free(t.xor_swap_role);
     free(t.live_in);
+    free(t.lane_write);
     t.body.release();
 }
 
@@ -1720,8 +1721,10 @@ static bool choose_lanes(Translator& t) {
     return true;
 }
 
-bool shader_translate(const void* code, u32 size, const ShaderInfo& info, const ShaderTarget& target,
-                      TranslatedShader* out) {
+// One translation; with `keep_exec_guards`, every vector write keeps its EXEC guard. Sets `*recheck` if
+// emission found an instruction the lane analysis modelled wrongly.
+static bool translate_once(const void* code, u32 size, const ShaderInfo& info, const ShaderTarget& target,
+                           TranslatedShader* out, bool keep_exec_guards, bool* recheck) {
     Text keep = out->hlsl;
     memset(out, 0, sizeof(*out));
     out->hlsl = keep;
@@ -1732,6 +1735,7 @@ bool shader_translate(const void* code, u32 size, const ShaderInfo& info, const 
     t.out = out;
     t.code = (const u8*)code;
     t.code_size = size;
+    t.keep_exec_guards = keep_exec_guards;
     bool ok = decode_program(code, size, t.program, out->error, sizeof(out->error)) &&
               build_blocks(t.program, out->error, sizeof(out->error));
     if (ok) {
@@ -1744,6 +1748,17 @@ bool shader_translate(const void* code, u32 size, const ShaderInfo& info, const 
         emit_program(t);
         ok = !t.failed && !t.body.failed && !out->hlsl.failed;
     }
+    *recheck = t.lane_check_failed;
     release(t);
+    return ok;
+}
+
+bool shader_translate(const void* code, u32 size, const ShaderInfo& info, const ShaderTarget& target,
+                      TranslatedShader* out) {
+    bool recheck = false;
+    bool ok = translate_once(code, size, info, target, out, false, &recheck);
+    // The lane analysis is only an optimization: where emission disagrees with it, do without.
+    if (recheck)
+        ok = translate_once(code, size, info, target, out, true, &recheck);
     return ok;
 }

@@ -5,7 +5,8 @@
 // written as data, DPP row masks, LDS append, console wave numbering in groups of several waves. And
 // control flow as the translator structures it: EXEC skip-overs, if/else on EXEC, scalar loops,
 // waterfall loops, loops lanes leave one by one, jumps out of several loops, and the dispatcher that
-// takes the graphs it can't structure; random graphs of scalar jumps against a walk on the CPU.
+// takes the graphs it can't structure; random graphs of scalar jumps against a walk on the CPU. And the
+// lanes outside EXEC: which writes keep them (a later read sees them) and which write every lane.
 // Skipped without a D3D12 device that runs waves of 32 lanes.
 
 #include <stdlib.h>
@@ -365,6 +366,74 @@ static const u32 k_irreducible_program[] = {
     0xbf810000,             // 0x4c: s_endpgm
 };
 
+// Program G: writes under EXEC that skip lanes later reads see, and ones whose skipped lanes nothing reads
+// (temporaries, translated to write every lane; see shader/translate_lanes.cpp). Regions as in program A.
+static const u32 k_lane_writes_program[] = {
+    0xbe8203c1,             // 0x0: s_mov_b32 s2, -1
+    0xbe830380,             // 0x4: s_mov_b32 s3, 0
+    0xd7650001, 0x020100c1, // 0x8: v_mbcnt_lo_u32_b32 v1, -1, 0
+    0xd7660001, 0x020202c1, // 0x10: v_mbcnt_hi_u32_b32 v1, -1, v1
+    0x34040282,             // 0x18: v_lshlrev_b32 v2, 2, v1
+    0x4a0802ff, 0x00000064, // 0x1c: v_add_nc_u32 v4, 0x64, v1
+    0x7d880294,             // 0x24: v_cmp_gt_u32 vcc, 20, v1
+    0xbe8a246a,             // 0x28: s_and_saveexec_b64 s[10:11], vcc
+    0x7e080287,             // 0x2c: v_mov_b32 v4, 7 (the else lanes read the old value)
+    0x7e0a0283,             // 0x30: v_mov_b32 v5, 3 (temporaries)
+    0x4a0c0b05,             // 0x34: v_add_nc_u32 v6, v5, v5
+    0x4a080d04,             // 0x38: v_add_nc_u32 v4, v4, v6
+    0x8afe7e0a,             // 0x3c: s_andn2_b64 exec, s[10:11], exec
+    0x4a080881,             // 0x40: v_add_nc_u32 v4, 1, v4
+    0xbefe040a,             // 0x44: s_mov_b64 exec, s[10:11]
+    0xe0701000, 0x80000402, // 0x48: buffer_store_dword v4, v2, s[0:3], 0 offen
+    0x340e0281,             // 0x50: v_lshlrev_b32 v7, 1, v1
+    0xbefe0481,             // 0x54: s_mov_b64 exec, 1
+    0x7e0e02b7,             // 0x58: v_mov_b32 v7, 55 (lane 1 is read below)
+    0xbefe04c1,             // 0x5c: s_mov_b64 exec, -1
+    0xd7600005, 0x02010307, // 0x60: v_readlane_b32 s5, v7, 1
+    0xd7600006, 0x02010107, // 0x68: v_readlane_b32 s6, v7, 0
+    0x80050605,             // 0x70: s_add_u32 s5, s5, s6
+    0x7e100205,             // 0x74: v_mov_b32 v8, s5
+    0xe0701100, 0x80000802, // 0x78: buffer_store_dword v8, v2, s[0:3], 0 offen offset:256
+    0x4a1202ff, 0x000001f4, // 0x80: v_add_nc_u32 v9, 0x1f4, v1
+    0xbefc03c1,             // 0x88: s_mov_b32 m0, -1
+    0x7e140280,             // 0x8c: v_mov_b32 v10, 0
+    0x7e1602ff, 0x0000004d, // 0x90: v_mov_b32 v11, 0x4d
+    0xd8340000, 0x00000b0a, // 0x98: ds_write_b32 v10, v11
+    0x7d88028a,             // 0xa0: v_cmp_gt_u32 vcc, 10, v1
+    0xbe8c246a,             // 0xa4: s_and_saveexec_b64 s[12:13], vcc
+    0xd8d80000, 0x0900000a, // 0xa8: ds_read_b32 v9, v10 (the other lanes are read below)
+    0x88fe0c7e,             // 0xb0: s_or_b64 exec, exec, s[12:13]
+    0xe0701200, 0x80000902, // 0xb4: buffer_store_dword v9, v2, s[0:3], 0 offen offset:512
+    0x7e180281,             // 0xbc: v_mov_b32 v12, 1
+    0x7d8802a0,             // 0xc0: v_cmp_gt_u32 vcc, 32, v1
+    0xbe8e246a,             // 0xc4: s_and_saveexec_b64 s[14:15], vcc
+    0x7e180282,             // 0xc8: v_mov_b32 v12, 2 (whole-wave code reads lane 40)
+    0xbe9025c1,             // 0xcc: s_or_saveexec_b64 s[16:17], -1
+    0xd7600007, 0x0201510c, // 0xd0: v_readlane_b32 s7, v12, 40
+    0xd7600008, 0x0201070c, // 0xd8: v_readlane_b32 s8, v12, 3
+    0xbefe0410,             // 0xe0: s_mov_b64 exec, s[16:17]
+    0x88fe0e7e,             // 0xe4: s_or_b64 exec, exec, s[14:15]
+    0x8f078407,             // 0xe8: s_lshl_b32 s7, s7, 4
+    0x80070807,             // 0xec: s_add_u32 s7, s7, s8
+    0x7e1a0207,             // 0xf0: v_mov_b32 v13, s7
+    0xe0701300, 0x80000d02, // 0xf4: buffer_store_dword v13, v2, s[0:3], 0 offen offset:768
+    0x361c0283,             // 0xfc: v_and_b32 v14, 3, v1
+    0x7e1e0280,             // 0x100: v_mov_b32 v15, 0
+    0xbe92047e,             // 0x104: s_mov_b64 s[18:19], exec
+    0xbf820001,             // 0x108: s_branch (to 0x110)
+    0xbefe0416,             // 0x10c: s_mov_b64 exec, s[22:23]
+    0x7e28050e,             // 0x110: v_readfirstlane_b32 s20, v14
+    0x7d841c14,             // 0x114: v_cmp_eq_u32 vcc, s20, v14
+    0xbe96246a,             // 0x118: s_and_saveexec_b64 s[22:23], vcc
+    0x16200283,             // 0x11c: v_mul_u32_u24 v16, 3, v1 (a temporary)
+    0x4a1e2014,             // 0x120: v_add_nc_u32 v15, s20, v16 (each pass writes some lanes)
+    0x8a967e16,             // 0x124: s_andn2_b64 s[22:23], s[22:23], exec
+    0xbf85fff8,             // 0x128: s_cbranch_scc1 (to 0x10c)
+    0xbefe0412,             // 0x12c: s_mov_b64 exec, s[18:19]
+    0xe0701400, 0x80000f02, // 0x130: buffer_store_dword v15, v2, s[0:3], 0 offen offset:1024
+    0xbf810000,             // 0x138: s_endpgm
+};
+
 #define UNWRITTEN    0xDEADBEEFu // what the output buffer starts with
 #define OUTPUT_BYTES 4096
 
@@ -452,6 +521,24 @@ static u32 forms_expected(u32 r, u32 i) {
         return 11;
     case 5: // the compare's bits, joined with data and not moved over
         return 0xF;
+    default:
+        return UNWRITTEN;
+    }
+}
+
+// What program G stores in region `r` for lane `i`.
+static u32 lane_writes_expected(u32 r, u32 i) {
+    switch (r) {
+    case 0: // then (lanes 0-19) 7 + 6, else the value from before plus 1
+        return i < 20 ? 13 : 101 + i;
+    case 1: // lane 1 keeps 2 * 1 while lane 0 gets 55
+        return 57;
+    case 2: // the LDS value in lanes 0-9, the others keep theirs
+        return i < 10 ? 0x4d : 500 + i;
+    case 3: // whole-wave reads: lane 40 kept 1, lane 3 got 2
+        return 18;
+    case 4: // a waterfall loop over lane & 3, each pass writing its lanes
+        return (i & 3) + 3 * i;
     default:
         return UNWRITTEN;
     }
@@ -608,19 +695,20 @@ static void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RE
     list->ResourceBarrier(1, &rb);
 }
 
-// Translates `code` with `info` and runs one group of it; `out` gets the output buffer. With `expect`,
-// the HLSL must hold that text (with a leading '!': must not). False if any step failed (reported).
+// Translates `code` with `info` and runs one group of it; `out` gets the output buffer. With `expect`
+// (a list ending in nullptr), the HLSL must hold each text (with a leading '!': must not). False if any
+// step failed (reported).
 static bool run_program(GpuBench& b, const u32* code, u32 size, const ShaderInfo& info, u32* out,
-                        const char* expect = nullptr) {
+                        const char* const* expect = nullptr) {
     TranslatedShader t = {};
     if (!shader_translate(code, size, info, b.target, &t)) {
         printf("FAIL shader lanes: translation failed: %s\n", t.error);
         t.hlsl.release();
         return false;
     }
-    if (expect) {
-        bool absent = expect[0] == '!';
-        const char* text = absent ? expect + 1 : expect;
+    for (u32 e = 0; expect && expect[e]; e++) {
+        bool absent = expect[e][0] == '!';
+        const char* text = absent ? expect[e] + 1 : expect[e];
         if ((strstr(t.hlsl.data, text) != nullptr) == absent) {
             printf("FAIL shader lanes: the translation %s \"%s\"\n%s\n", absent ? "has" : "lacks", text,
                    t.hlsl.data);
@@ -911,7 +999,8 @@ void test_shader_lanes() {
         info.wave_size = wave64 ? 64 : 32;
         const u32* code = wave64 ? k_flow_program : k_flow32_program;
         u32 size = wave64 ? sizeof(k_flow_program) : sizeof(k_flow32_program);
-        if (!run_program(b, code, size, info, out, "go_ = ")) {
+        static const char* const k_go[] = {"go_ = ", nullptr};
+        if (!run_program(b, code, size, info, out, k_go)) {
             g_failures++;
             continue;
         }
@@ -926,13 +1015,40 @@ void test_shader_lanes() {
                 }
             }
     }
+    static const char* const k_dispatched[] = {"blocks dispatched", nullptr};
     if (run_program(b, k_irreducible_program, sizeof(k_irreducible_program), compute_info(64, 0), out,
-                    "blocks dispatched")) {
+                    k_dispatched)) {
         for (u32 i = 0; i < 64; i++)
             if (out[i] != 34) {
                 printf("FAIL shader lanes: program E lane %u: 0x%x, expected 34\n", i, out[i]);
                 g_failures++;
                 break;
+            }
+    } else {
+        g_failures++;
+    }
+    // Program G: which writes keep their EXEC guards (both halves are emitted alike; the first is checked).
+    static const char* const k_guards[] = {
+        "if (EXEC0) v4_0 = 0x00000007u;",  // the else lanes read the old value
+        "!if (EXEC0) v5_0 = ",             // temporaries of the then side
+        "!if (EXEC0) v6_0 = ",
+        "if (EXEC0) v7_0 = 0x00000037u;",  // v_readlane reads a lane outside EXEC
+        "if (EXEC0) v9_0 = g_lds[",        // a load whose other lanes are read after the join
+        "if (EXEC0) v12_0 = 0x00000002u;", // whole-wave code reads the other lanes
+        "if (EXEC0) v15_0 = ",             // waterfall passes each write their lanes
+        "!if (EXEC0) v16_0 = ",            // a temporary of the passes
+        nullptr,
+    };
+    if (run_program(b, k_lane_writes_program, sizeof(k_lane_writes_program), compute_info(64, 64), out, k_guards)) {
+        for (u32 r = 0; r < 16; r++)
+            for (u32 i = 0; i < 64; i++) {
+                u32 want = lane_writes_expected(r, i);
+                if (out[r * 64 + i] != want) {
+                    printf("FAIL shader lanes: program G region %u lane %u: 0x%x, expected 0x%x\n", r, i,
+                           out[r * 64 + i], want);
+                    g_failures++;
+                    break;
+                }
             }
     } else {
         g_failures++;
@@ -962,7 +1078,7 @@ void test_shader_lanes() {
             break;
         }
     }
-    printf("shader lanes: %u programs run on the GPU (waves of %u-%u lanes)\n", 6 + graphs, b.target.wave_min,
+    printf("shader lanes: %u programs run on the GPU (waves of %u-%u lanes)\n", 7 + graphs, b.target.wave_min,
            b.target.wave_max);
     bench_release(b);
 }

@@ -1440,6 +1440,13 @@ static bool implicit_lod_usable(const Translator& t) {
     return one_d ? n[0] % 4 == 0 : n[0] % 2 == 0 && n[1] % 2 == 0;
 }
 
+bool image_reads_neighbours(const Translator& t, RdnaOp op) {
+    if (op == OP_IMAGE_GET_LOD)
+        return implicit_lod_usable(t);
+    ImageForm f = image_form(op);
+    return (f.sample || f.gather) && !f.lod && !f.lod_zero && !f.grad && implicit_lod_usable(t);
+}
+
 // A finite float as an HLSL literal.
 static const char* float_literal(Translator& t, f32 value) {
     char digits[32];

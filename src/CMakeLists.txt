@@ -12,6 +12,7 @@ set(SLUDGE_SHADER_SOURCES
     shader/translate.cpp
     shader/translate_emit.cpp
     shader/translate_flow.cpp
+    shader/translate_lanes.cpp
     shader/translate_alu.cpp
     shader/translate_memory.cpp
     shader/console_pipeline.h

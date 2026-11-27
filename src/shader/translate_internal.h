@@ -223,6 +223,15 @@ struct Translator {
     SlotUse slot_uses[SHADER_MAX_SLOT_USES];
     u32 slot_use_count;
 
+    // Vector writes that may write every lane (see translate_lanes.cpp): per instruction, and for the
+    // instruction being emitted. keep_exec_guards turns the analysis off; lane_check_failed: emission
+    // found an instruction the analysis modelled wrongly (translation starts over without it).
+    u8* lane_write;
+    bool keep_exec_guards;
+    bool write_all_lanes;
+    bool lane_check_failed;
+    u32 lane_written; // destination registers write_vgpr wrote for the instruction being emitted
+
     // Scratch strings for operand expressions (a ring: an expression stays valid for a while).
     char ring[32][320];
     u32 ring_at;
@@ -267,6 +276,16 @@ bool edge_converts(const Translator& t, Tag out, Tag entry);
 bool sgpr_live_in(const Translator& t, u32 block, u32 reg);
 // Exact lanes: whether an SGPR holds data that reads the same as a mask (all bits clear or set).
 bool sgpr_neutral(const TagState& s, u32 reg);
+bool picks_registers_at_run_time(RdnaOp op);
+// Decides which vector writes may write every lane: those whose lanes outside EXEC nothing reads before
+// they are overwritten. translate_lanes.cpp
+bool analyze_lane_writes(Translator& t);
+// Whether the analysis takes an instruction's vector write to replace its destination outright (not
+// reading the old value): emission must not read it then (see lane_check_failed).
+bool lane_write_replaces(const Translator& t, const RdnaInst& in);
+// Whether emission wrote every destination register the analysis takes an instruction to write
+// (`written`: a bit per register, from write_vgpr).
+bool lane_write_complete(const Translator& t, const RdnaInst& in, u32 written);
 void emit_program(Translator& t);
 // A block's instructions; t.tags ends as the state where it ends. translate_emit.cpp
 void emit_block(Translator& t, u32 b);
@@ -323,6 +342,9 @@ u32 lane_mask_part(const Translator& t);
 
 bool emit_alu(Translator& t, const RdnaInst& in);    // translate_alu.cpp
 bool emit_memory(Translator& t, const RdnaInst& in); // translate_memory.cpp
+// Whether an image instruction's translation takes derivatives across the quad (an implicit LOD): it
+// reads its address registers in the neighbouring lanes too. translate_memory.cpp
+bool image_reads_neighbours(const Translator& t, RdnaOp op);
 // A vertex shader's call of the driver's fetch subroutine (see ShaderInfo::fetch_vgpr): its loads, in
 // line. translate_memory.cpp
 bool emit_fetch_subroutine(Translator& t, const RdnaInst& in);

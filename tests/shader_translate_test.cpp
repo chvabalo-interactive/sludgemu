@@ -732,7 +732,7 @@ static void test_descriptor_values() {
         a.global_load(GLOBAL_LOAD_DWORD, 4, 2, 8);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("if (EXEC) v4 = g_descriptor_info.Load(v2 + 0x8u);"));
+        CHECK(hlsl_has("v4 = g_descriptor_info.Load(v2 + 0x8u);"));
     }
     {
         // The second half of a slot is an image descriptor's dwords 4-7.
@@ -814,7 +814,7 @@ static void test_descriptor_values() {
         a.end();
         CHECK(translate(a, info));
         CHECK(hlsl_has("{ uint a_ = v2 + 0x4u;"));
-        CHECK(hlsl_has("if (EXEC) v3 = g_descriptor_info.Load2(a_).y;"));
+        CHECK(hlsl_has("v3 = g_descriptor_info.Load2(a_).y;"));
     }
     {
         // A slot loaded four dwords at a time on one path and eight on the other is still the table's
@@ -868,8 +868,8 @@ static void test_long_branches() {
         CHECK(translate(a, info));
         // The long branch and the trampoline in line in the else arm, the padding left out.
         CHECK(hlsl_has("if (wave_any(s126)) {"));
-        CHECK(hlsl_before("if (EXEC) v1 = 0x00000001u;", "} else {"));
-        CHECK(hlsl_before("} else {", "if (EXEC) v1 = 0x00000002u;"));
+        CHECK(hlsl_before("v1 = 0x00000001u;", "} else {"));
+        CHECK(hlsl_before("} else {", "v1 = 0x00000002u;"));
         CHECK(!hlsl_has("0x00000003u"));
         CHECK(!hlsl_has("switch (pc)"));
     }
@@ -887,7 +887,7 @@ static void test_long_branches() {
         CHECK(translate(a, info));
         // The long branches and the trampoline skipped over, the join after them.
         CHECK(hlsl_has("if (!wave_any(s126)) {"));
-        CHECK(hlsl_before("if (EXEC) v1 = 0x00000002u;", "if (EXEC) v1 = 0x00000001u;"));
+        CHECK(hlsl_before("v1 = 0x00000002u;", "v1 = 0x00000001u;"));
     }
     {
         // A jump to an address loaded from memory isn't a long branch.
@@ -930,8 +930,8 @@ static void test_control_flow() {
         a.vop1(VOP1_MOV_B32, 2, ZERO + 2); // 0x0C
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_before("if (!scc) {", "if (EXEC) v1 = 0x00000001u;"));
-        CHECK(hlsl_before("}", "if (EXEC) v2 = 0x00000002u;"));
+        CHECK(hlsl_before("if (!scc) {", "v1 = 0x00000001u;"));
+        CHECK(hlsl_before("}", "v2 = 0x00000002u;"));
         CHECK(!hlsl_has("switch") && !hlsl_has("for (;;)"));
     }
     {
@@ -945,7 +945,7 @@ static void test_control_flow() {
         a.end();
         CHECK(translate(a, info));
         CHECK(hlsl_before("[loop] for (;;) {", "if (!scc) break;"));
-        CHECK(hlsl_before("if (!scc) break;", "if (EXEC) v1 = s20;"));
+        CHECK(hlsl_before("if (!scc) break;", "v1 = s20;"));
         CHECK(!hlsl_has("continue"));
     }
     {
@@ -962,7 +962,7 @@ static void test_control_flow() {
         a.end();
         CHECK(translate(a, info));
         CHECK(hlsl_before("switch (0u) { default: // break: to 0x18", "if (scc) break;"));
-        CHECK(hlsl_before("if (scc) break;", "if (EXEC) v1 = 0x00000001u;"));
+        CHECK(hlsl_before("if (scc) break;", "v1 = 0x00000001u;"));
         CHECK(!hlsl_has("go_"));
     }
     {
@@ -981,7 +981,7 @@ static void test_control_flow() {
         CHECK(translate(a, info));
         CHECK(hlsl_has("uint go_ = 0u;"));
         CHECK(hlsl_before("if (scc) { go_ = ", "if (go_ == "));
-        CHECK(hlsl_before("if (go_ == ", "if (EXEC) v1 = 0x00000002u;"));
+        CHECK(hlsl_before("if (go_ == ", "v1 = 0x00000002u;"));
     }
     {
         // A loop entered at two blocks: the dispatcher.
