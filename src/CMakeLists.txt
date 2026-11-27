@@ -133,6 +133,8 @@ add_executable(sludgemu WIN32
     gpu/shader_programs.cpp
     gpu/shader_cache.h
     gpu/shader_cache.cpp
+    gpu/shader_schedule.h
+    gpu/shader_schedule.cpp
     gpu/formats.h
     gpu/formats.cpp
     gpu/console_layout.h
