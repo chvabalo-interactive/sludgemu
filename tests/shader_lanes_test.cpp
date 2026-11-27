@@ -5,7 +5,7 @@
 // written as data, DPP row masks, LDS append, console wave numbering in groups of several waves. And
 // control flow as the translator structures it: EXEC skip-overs, if/else on EXEC, scalar loops,
 // waterfall loops, loops lanes leave one by one, jumps out of several loops, and the dispatcher that
-// takes the graphs it can't structure.
+// takes the graphs it can't structure; random graphs of scalar jumps against a walk on the CPU.
 // Skipped without a D3D12 device that runs waves of 32 lanes.
 
 #include <stdlib.h>
@@ -697,6 +697,142 @@ static bool run_program(GpuBench& b, const u32* code, u32 size, const ShaderInfo
     return true;
 }
 
+// Programs F: random control flow graphs, run on the GPU and walked on the CPU. Each block mixes its
+// number into a path hash (s12 = s12 * 31 + block + 1), steps a random sequence (s11) and sets SCC from
+// one of its bits, then ends in a jump (unconditional, on SCC clear or set, to any block before or after
+// it, or to the end), the end of the program, or falls through. The program stores both registers at its
+// end: any block reached out of order changes the hash. Graphs come reducible or not, with loops nested
+// and left in all ways, so they reach every placement the structured emission has (and the dispatcher).
+#define GRAPH_MAX_BLOCKS  40
+#define GRAPH_BLOCK_WORDS 12   // fixed, so that jump offsets follow from block numbers
+#define GRAPH_MAX_STEPS   3000 // blocks the CPU walk takes before it gives a graph up as endless
+#define GRAPH_PROGRAMS    200
+
+enum GraphEnd : u8 { END_BRANCH, END_SCC0, END_SCC1, END_PROGRAM, END_FALL };
+
+struct RandomGraph {
+    u32 blocks;
+    u32 seed; // s11 at the start
+    GraphEnd end[GRAPH_MAX_BLOCKS];
+    u32 target[GRAPH_MAX_BLOCKS]; // jumps: the block, or `blocks` for the program's end
+};
+
+static u32 g_graph_random = 0x2545F491u;
+
+static u32 graph_random(u32 range) {
+    g_graph_random = g_graph_random * 1103515245u + 12345u;
+    return (g_graph_random >> 8) % range;
+}
+
+static void make_graph(RandomGraph& g) {
+    g.blocks = 2 + graph_random(GRAPH_MAX_BLOCKS - 1);
+    g.seed = graph_random(0x7FFFFFFF) | 1;
+    u32 back = graph_random(5); // in 8: how often a jump goes back
+    for (u32 b = 0; b < g.blocks; b++) {
+        static const GraphEnd k_ends[10] = {END_BRANCH, END_BRANCH, END_SCC0, END_SCC0,    END_SCC0,
+                                            END_SCC1,   END_SCC1,   END_SCC1, END_PROGRAM, END_FALL};
+        g.end[b] = k_ends[graph_random(10)];
+        if (b + 1 == g.blocks && g.end[b] == END_FALL)
+            g.end[b] = END_PROGRAM;
+        g.target[b] = graph_random(8) < back ? graph_random(b + 1) : b + 1 + graph_random(g.blocks - b);
+    }
+}
+
+// The bit of s11 block b sets SCC from.
+static u32 graph_bit(u32 b) {
+    return 16 + b % 8;
+}
+
+// What the program stores: false if it doesn't end within GRAPH_MAX_STEPS blocks.
+static bool walk_graph(const RandomGraph& g, u32* hash, u32* sequence) {
+    u32 h = 0, s = g.seed, b = 0;
+    for (u32 step = 0; step < GRAPH_MAX_STEPS; step++) {
+        h = h * 31 + b + 1;
+        s = s * 1103515245u + 12345u;
+        bool scc = ((s >> graph_bit(b)) & 1) != 0;
+        u32 next = b + 1;
+        switch (g.end[b]) {
+        case END_BRANCH:
+            next = g.target[b];
+            break;
+        case END_SCC0:
+            next = scc ? b + 1 : g.target[b];
+            break;
+        case END_SCC1:
+            next = scc ? g.target[b] : b + 1;
+            break;
+        case END_PROGRAM:
+            next = g.blocks;
+            break;
+        case END_FALL:
+            break;
+        }
+        if (next >= g.blocks) {
+            *hash = h;
+            *sequence = s;
+            return true;
+        }
+        b = next;
+    }
+    return false;
+}
+
+// Assembles the graph; returns the size in bytes.
+static u32 assemble_graph(const RandomGraph& g, u32* code) {
+    u32 n = 0;
+    code[n++] = 0xbe8203c1; // s_mov_b32 s2, -1
+    code[n++] = 0xbe830380; // s_mov_b32 s3, 0
+    code[n++] = 0xd7650001; // v_mbcnt_lo_u32_b32 v1, -1, 0
+    code[n++] = 0x020100c1;
+    code[n++] = 0xd7660001; // v_mbcnt_hi_u32_b32 v1, -1, v1
+    code[n++] = 0x020202c1;
+    code[n++] = 0x34040282; // v_lshlrev_b32 v2, 2, v1
+    code[n++] = 0xbe8b03ff; // s_mov_b32 s11, seed
+    code[n++] = g.seed;
+    code[n++] = 0xbe8c0380; // s_mov_b32 s12, 0
+    u32 first = n;
+    u32 end = first + g.blocks * GRAPH_BLOCK_WORDS; // the store at the end
+    for (u32 b = 0; b < g.blocks; b++) {
+        code[n++] = 0x930cff0c; // s_mul_i32 s12, s12, 31
+        code[n++] = 31;
+        code[n++] = 0x800cff0c; // s_add_u32 s12, s12, b + 1
+        code[n++] = b + 1;
+        code[n++] = 0x930bff0b; // s_mul_i32 s11, s11, 1103515245
+        code[n++] = 1103515245u;
+        code[n++] = 0x800bff0b; // s_add_u32 s11, s11, 12345
+        code[n++] = 12345;
+        code[n++] = 0x900d000b | (128 + graph_bit(b)) << 8; // s_lshr_b32 s13, s11, bit
+        code[n++] = 0x870d810d;                             // s_and_b32 s13, s13, 1
+        code[n++] = 0xbf06810d;                             // s_cmp_eq_u32 s13, 1
+        u32 to = g.end[b] == END_PROGRAM || g.target[b] >= g.blocks ? end
+                                                                    : first + g.target[b] * GRAPH_BLOCK_WORDS;
+        u32 offset = (u32)((s32)to - (s32)(n + 1)) & 0xFFFF; // in dwords from the next instruction
+        switch (g.end[b]) {
+        case END_BRANCH:
+        case END_PROGRAM:
+            code[n++] = 0xbf820000 | offset; // s_branch
+            break;
+        case END_SCC0:
+            code[n++] = 0xbf840000 | offset; // s_cbranch_scc0
+            break;
+        case END_SCC1:
+            code[n++] = 0xbf850000 | offset; // s_cbranch_scc1
+            break;
+        case END_FALL:
+            code[n++] = 0xbf800000; // s_nop 0
+            break;
+        }
+    }
+    code[n++] = 0x7e08020c; // v_mov_b32 v4, s12
+    code[n++] = 0xe0701000; // buffer_store_dword v4, v2, s[0:3], 0 offen
+    code[n++] = 0x80000402;
+    code[n++] = 0x7e08020b; // v_mov_b32 v4, s11
+    code[n++] = 0xe0701100; // buffer_store_dword v4, v2, s[0:3], 0 offen offset:256
+    code[n++] = 0x80000402;
+    code[n++] = 0xbf810000; // s_endpgm
+    return n * 4;
+}
+
 static ShaderInfo compute_info(u16 threads, u32 lds_bytes) {
     ShaderInfo info;
     memset(&info, 0, sizeof(info));
@@ -801,7 +937,32 @@ void test_shader_lanes() {
     } else {
         g_failures++;
     }
-    printf("shader lanes: 6 programs run on the GPU (waves of %u-%u lanes)\n", b.target.wave_min,
+    // Programs F: the first GRAPH_PROGRAMS random graphs that end.
+    static u32 code[16 + GRAPH_MAX_BLOCKS * GRAPH_BLOCK_WORDS + 8];
+    u32 graphs = 0;
+    while (graphs < GRAPH_PROGRAMS) {
+        RandomGraph g;
+        make_graph(g);
+        u32 hash, sequence;
+        if (!walk_graph(g, &hash, &sequence))
+            continue;
+        graphs++;
+        if (!run_program(b, code, assemble_graph(g, code), compute_info(64, 0), out)) {
+            g_failures++;
+            break;
+        }
+        bool same = true;
+        for (u32 i = 0; i < 64 && same; i++)
+            same = out[i] == hash && out[64 + i] == sequence;
+        if (!same) {
+            printf(
+                "FAIL shader lanes: random graph %u (%u blocks, seed 0x%x): 0x%x 0x%x, expected 0x%x 0x%x\n",
+                graphs - 1, g.blocks, g.seed, out[0], out[64], hash, sequence);
+            g_failures++;
+            break;
+        }
+    }
+    printf("shader lanes: %u programs run on the GPU (waves of %u-%u lanes)\n", 6 + graphs, b.target.wave_min,
            b.target.wave_max);
     bench_release(b);
 }
