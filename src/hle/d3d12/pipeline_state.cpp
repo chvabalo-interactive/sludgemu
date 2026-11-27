@@ -849,9 +849,14 @@ struct VariantJob {
     PipelineVariant* variant;
 };
 
+static void remember_variant(const ConsolePipelineState* pso, const PipelineOutputs& key);
+
 static void variant_job(void* context) {
     VariantJob* job = (VariantJob*)context;
     build_variant(job->pso, job->variant);
+    // Only what could be made is built ahead next time: a failure would only fail again.
+    if (job->variant->state == VARIANT_READY)
+        remember_variant(job->pso, job->variant->outputs);
     console_release(job->pso);
     free(job);
 }
@@ -867,8 +872,6 @@ static bool wait_variant(PipelineVariant* v) {
         WaitOnAddress(&v->state, &state, sizeof(state), INFINITE);
     }
 }
-
-static void remember_variant(const ConsolePipelineState* pso, const PipelineOutputs& key);
 
 // A new variant a draw needs, built on a worker ahead of other work.
 static PipelineVariant* request_variant(ConsolePipelineState* pso, const PipelineOutputs& key) {
@@ -888,9 +891,7 @@ static PipelineVariant* request_variant(ConsolePipelineState* pso, const Pipelin
         console_release(pso);
         free(job);
         finish_variant(v, nullptr, nullptr);
-        return v;
     }
-    remember_variant(pso, key);
     return v;
 }
 
@@ -1029,6 +1030,7 @@ static void append_record_job(void* context) {
     free(record);
 }
 
+// A variant made for a draw. Runs on the worker that made it.
 static void remember_variant(const ConsolePipelineState* pso, const PipelineOutputs& key) {
     if (!pso->identity)
         return;
@@ -1037,7 +1039,8 @@ static void remember_variant(const ConsolePipelineState* pso, const PipelineOutp
     ReleaseSRWLockExclusive(&g_known_lock);
     if (!added)
         return;
-    // To the log from a worker: the write may block, and this is a thread recording a command list.
+    // To the log in the background: the write may block (titles stream from disk all the time), and
+    // this worker's next urgent job may be what a draw waits for.
     CacheRecord* record = (CacheRecord*)calloc(1, sizeof(CacheRecord));
     if (!record)
         return;
