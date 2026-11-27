@@ -590,7 +590,8 @@ struct PipelineVariant {
 
 // A pipeline state: the console's packet for it (public; title code copies it into command lists)
 // and its translation: shader programs, fixed-function state and desktop pipelines, made when a
-// draw first uses a set of output formats (draws wait for them).
+// draw first uses a set of output formats (draws wait for them), or ahead of it where the formats
+// were drawn with before.
 struct ConsolePipelineState {
     ConsoleObjectHeader header;
     u32 packet[8];
@@ -600,6 +601,15 @@ struct ConsolePipelineState {
     bool translated;            // programs were requested (otherwise draws with it are skipped)
     ShaderProgram* programs[2]; // graphics: vertex, pixel (may be null); compute: compute
     PipelineFixedState fixed;
+
+    // Pipelines with the same programs and fixed-function state share it: what desktop pipelines
+    // drawn with are remembered by (0: not translated).
+    u64 identity;
+    // An equal pipeline (same identity and root signature) created earlier and still alive, whose
+    // desktop pipelines this one uses (referenced); or nullptr, and this one is listed for later ones.
+    ConsolePipelineState* twin;
+    ConsolePipelineState* next_listed; // in the list of pipelines later ones can be twins of
+    bool listed;
 
     // Variants are only added (under the lock), each filled in before the count that publishes it:
     // draws find theirs without locking.

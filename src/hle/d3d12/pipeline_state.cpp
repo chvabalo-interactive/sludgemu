@@ -6,6 +6,22 @@
 // targets: they are made on a worker thread when a draw first uses a set of formats, and the draw
 // waits for them (and for the programs). A console never skips a draw, and one pass of a multi-pass
 // effect left out looks broken where a late frame only looks late.
+//
+// So that draws seldom wait, the formats each pipeline was drawn with are remembered, in memory and in
+// the shader cache's record log, by the pipeline's identity (its programs and fixed-function state).
+// A pipeline created with an identity drawn with before, in this run or an earlier one, gets those
+// desktop pipelines made in the background once its programs are built. A pipeline equal to one
+// still alive (created again, or derived without changes) uses that one's desktop pipelines.
+//
+// (The formats aren't predicted from the console pipeline itself: its packet holds them only in
+// hardware encodings, which don't tell the desktop format of the view bound (sRGB or not, the stand-in
+// formats), and titles create tens of thousands of pipelines they never draw with; desktop pipelines
+// for all of them would cost minutes of driver compilation and gigabytes of memory.)
+//
+// Desktop pipelines themselves aren't kept on disk here: drivers keep compiled pipelines in disk
+// caches of their own, keyed by the same inputs, so remaking one drawn in an earlier run is quick. A
+// pipeline library (ID3D12PipelineLibrary) would duplicate that as one blob, written whole and thrown
+// away whenever the driver changes.
 
 #include <stddef.h>
 #include <stdio.h>
@@ -36,18 +52,26 @@ static const ConsoleClass k_pipeline_state_class = {
 static void* const* g_pipeline_state_table = nullptr;
 static ID3D12Device* g_device = nullptr;
 
+static void unlist_pipeline(ConsolePipelineState* pso);
+
 static void pipeline_state_destroy(void* object) {
     ConsolePipelineState* pso = (ConsolePipelineState*)object;
+    unlist_pipeline(pso);
+    if (pso->twin)
+        console_release(pso->twin);
     for (u32 i = 0; i < (u32)pso->variant_count; i++)
         gpu_retire(pso->variants[i].desktop);
     if (pso->root_signature)
         console_release(pso->root_signature);
 }
 
+static void load_known_variants();
+
 void console_pipeline_state_init() {
     g_pipeline_state_table = console_build_table("ID3D12PipelineState", k_pipeline_state_entries,
                                                  ARRAY_COUNT(k_pipeline_state_entries), nullptr, 0);
-    g_device = gpu_device();
+    g_device = gpu_device(); // opens the shader cache, which holds the variants drawn before
+    load_known_variants();
 }
 
 static ConsolePipelineState* new_pipeline_state(bool compute, void* root_signature, const void* packet,
@@ -231,6 +255,8 @@ static void decode_fixed_state(const u8* ctx, const u8* metadata, PipelineFixedS
 
 // --- creation ----------------------------------------------------------------------------------------
 
+static void pipeline_created(ConsolePipelineState* pso);
+
 static void request_graphics_programs(ConsolePipelineState* pso, const ConsoleSerializedPipeline* s,
                                       const ConsoleGraphicsShaders& g) {
     const ConsoleRootSignature* rs = pso->root_signature;
@@ -281,6 +307,7 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice*, bool compute, const C
             info.wave_size = c.wave32 ? 32 : 64;
             pso->programs[0] = shader_program_get(cs.code, (u32)cs.code_size, info);
             pso->translated = pso->programs[0] != nullptr;
+            pipeline_created(pso);
         } else {
             LOG_W_ONCE("d3d12",
                        "compute pipeline in an unknown serialized form; dispatches with it are skipped");
@@ -310,6 +337,7 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice*, bool compute, const C
     memcpy(f.element_per_instance, g.element_per_instance, sizeof(f.element_per_instance));
     memcpy(f.element_step_rate, g.element_step_rate, sizeof(f.element_step_rate));
     request_graphics_programs(pso, s, g);
+    pipeline_created(pso);
     return console_return(pso, iid, out);
 }
 
@@ -544,6 +572,7 @@ HRESULT console_create_pipeline_state(ConsoleDevice*, const D3D12_PIPELINE_STATE
             pso->fixed.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED)
             pso->fixed.topology_type = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pso->translated = request_stream_programs(pso, sp, &why);
+        pipeline_created(pso);
     }
     if (!pso->translated)
         LOG_W("d3d12",
@@ -620,6 +649,7 @@ HRESULT console_derive_pipeline_state(ConsoleDevice*, void* source, u32 count, c
             }
         }
     }
+    pipeline_created(pso);
     return console_return(pso, iid, out);
 }
 
@@ -832,6 +862,8 @@ static bool wait_variant(PipelineVariant* v) {
     }
 }
 
+static void remember_variant(const ConsolePipelineState* pso, const PipelineOutputs& key);
+
 // A new variant a draw needs, built on a worker ahead of other work.
 static PipelineVariant* request_variant(ConsolePipelineState* pso, const PipelineOutputs& key) {
     bool added;
@@ -852,6 +884,7 @@ static PipelineVariant* request_variant(ConsolePipelineState* pso, const Pipelin
         finish_variant(v, nullptr, nullptr);
         return v;
     }
+    remember_variant(pso, key);
     return v;
 }
 
@@ -874,6 +907,8 @@ static void report_wait(const ConsolePipelineState* pso, const LARGE_INTEGER& st
 
 ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs,
                                               ID3D12RootSignature** signature) {
+    if (pso && pso->twin)
+        pso = pso->twin;
     if (!pso || !desktop_signature_exists(pso))
         return nullptr;
     // What isn't made yet is waited for: the draw is late, never left out.
@@ -899,4 +934,256 @@ ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const P
         return nullptr;
     *signature = v->signature;
     return v->desktop;
+}
+
+// --- desktop pipelines drawn before ------------------------------------------------------------------
+
+// Every variant a draw adds is remembered by its pipeline's identity (in memory and in the shader
+// cache's record log); a pipeline created later with that identity gets the variant built ahead.
+#define KNOWN_CAPACITY     65536 // power of two; filled to half at most
+#define KNOWN_PER_PIPELINE 4     // built ahead at most (the rest of the variant slots stay for draws)
+
+static_assert(sizeof(PipelineOutputs) <= CACHE_RECORD_DATA_BYTES, "variants fit cache records");
+
+struct KnownVariant {
+    u64 identity; // 0: free
+    PipelineOutputs outputs;
+};
+
+static KnownVariant* g_known;
+static u32 g_known_count;
+static SRWLOCK g_known_lock = SRWLOCK_INIT;
+
+static u64 hash_u64(u64 h, u64 v) {
+    for (u32 i = 0; i < 8; i++) {
+        h ^= (v >> (8 * i)) & 0xFF;
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+// Under g_known_lock. False if known already or the table is full.
+static bool known_add(u64 identity, const PipelineOutputs& outputs) {
+    if (!g_known)
+        return false;
+    u32 slot = (u32)identity & (KNOWN_CAPACITY - 1);
+    for (; g_known[slot].identity; slot = (slot + 1) & (KNOWN_CAPACITY - 1))
+        if (g_known[slot].identity == identity &&
+            memcmp(&g_known[slot].outputs, &outputs, sizeof(outputs)) == 0)
+            return false;
+    if (g_known_count >= KNOWN_CAPACITY / 2) {
+        LOG_W_ONCE("d3d12", "more than %d desktop pipelines drawn; more aren't remembered",
+                   KNOWN_CAPACITY / 2);
+        return false;
+    }
+    g_known[slot].identity = identity;
+    g_known[slot].outputs = outputs;
+    g_known_count++;
+    return true;
+}
+
+static u32 known_find(u64 identity, PipelineOutputs* out) {
+    u32 count = 0;
+    AcquireSRWLockShared(&g_known_lock);
+    if (g_known) {
+        u32 slot = (u32)identity & (KNOWN_CAPACITY - 1);
+        for (; g_known[slot].identity && count < KNOWN_PER_PIPELINE; slot = (slot + 1) & (KNOWN_CAPACITY - 1))
+            if (g_known[slot].identity == identity)
+                out[count++] = g_known[slot].outputs;
+    }
+    ReleaseSRWLockShared(&g_known_lock);
+    return count;
+}
+
+static void load_known_variants() {
+    g_known = (KnownVariant*)calloc(KNOWN_CAPACITY, sizeof(KnownVariant));
+    CacheRecord* records = (CacheRecord*)malloc(KNOWN_CAPACITY / 2 * sizeof(CacheRecord));
+    if (!g_known || !records) {
+        free(records);
+        return;
+    }
+    u32 count = shader_cache_read_records(records, KNOWN_CAPACITY / 2);
+    u32 known = 0;
+    AcquireSRWLockExclusive(&g_known_lock);
+    for (u32 i = 0; i < count; i++) {
+        PipelineOutputs outputs;
+        memcpy(&outputs, records[i].data, sizeof(outputs));
+        known += records[i].id && known_add(records[i].id, outputs);
+    }
+    ReleaseSRWLockExclusive(&g_known_lock);
+    free(records);
+    if (known)
+        LOG_I("d3d12", "%u desktop pipelines drawn in earlier runs are built ahead when titles create them",
+              known);
+}
+
+static void append_record_job(void* context) {
+    CacheRecord* record = (CacheRecord*)context;
+    shader_cache_append_record(*record);
+    free(record);
+}
+
+static void remember_variant(const ConsolePipelineState* pso, const PipelineOutputs& key) {
+    if (!pso->identity)
+        return;
+    AcquireSRWLockExclusive(&g_known_lock);
+    bool added = known_add(pso->identity, key);
+    ReleaseSRWLockExclusive(&g_known_lock);
+    if (!added)
+        return;
+    // To the log from a worker: the write may block, and this is a thread recording a command list.
+    CacheRecord* record = (CacheRecord*)calloc(1, sizeof(CacheRecord));
+    if (!record)
+        return;
+    record->id = pso->identity;
+    memcpy(record->data, &key, sizeof(key));
+    if (!gpu_job_queue_background(append_record_job, record))
+        free(record);
+}
+
+// Field by field: the descriptions have padding, which titles leave as it was on their side.
+static u64 hash_fixed_state(const PipelineFixedState& f, u64 h) {
+    const D3D12_BLEND_DESC& b = f.blend;
+    h = hash_u64(h, b.AlphaToCoverageEnable);
+    h = hash_u64(h, b.IndependentBlendEnable);
+    for (u32 i = 0; i < 8; i++) {
+        const D3D12_RENDER_TARGET_BLEND_DESC& t = b.RenderTarget[i];
+        h = hash_u64(h, t.BlendEnable | (u64)t.LogicOpEnable << 1 | (u64)t.RenderTargetWriteMask << 2);
+        h = hash_u64(h, t.SrcBlend | (u64)t.DestBlend << 8 | (u64)t.BlendOp << 16 |
+                            (u64)t.SrcBlendAlpha << 24 | (u64)t.DestBlendAlpha << 32 |
+                            (u64)t.BlendOpAlpha << 40 | (u64)t.LogicOp << 48);
+    }
+    const D3D12_RASTERIZER_DESC& r = f.rasterizer;
+    h = hash_u64(h, r.FillMode | (u64)r.CullMode << 8 | (u64)r.FrontCounterClockwise << 16 |
+                        (u64)r.DepthClipEnable << 17 | (u64)r.MultisampleEnable << 18 |
+                        (u64)r.AntialiasedLineEnable << 19 | (u64)r.ConservativeRaster << 20 |
+                        (u64)r.ForcedSampleCount << 32);
+    u32 bits;
+    h = hash_u64(h, (u32)r.DepthBias);
+    memcpy(&bits, &r.DepthBiasClamp, 4);
+    h = hash_u64(h, bits);
+    memcpy(&bits, &r.SlopeScaledDepthBias, 4);
+    h = hash_u64(h, bits);
+    const D3D12_DEPTH_STENCIL_DESC& d = f.depth_stencil;
+    h = hash_u64(h, d.DepthEnable | (u64)d.DepthWriteMask << 1 | (u64)d.DepthFunc << 8 |
+                        (u64)d.StencilEnable << 16 | (u64)d.StencilReadMask << 24 |
+                        (u64)d.StencilWriteMask << 32);
+    const D3D12_DEPTH_STENCILOP_DESC* faces[2] = {&d.FrontFace, &d.BackFace};
+    for (const D3D12_DEPTH_STENCILOP_DESC* s : faces)
+        h = hash_u64(h, s->StencilFailOp | (u64)s->StencilDepthFailOp << 8 | (u64)s->StencilPassOp << 16 |
+                            (u64)s->StencilFunc << 24);
+    h = hash_u64(h, f.sample_mask);
+    h = hash_u64(h, f.topology_type | (u64)f.strip_cut << 8 | (u64)f.element_count << 16);
+    for (u32 i = 0; i < f.element_count && i < SHADER_MAX_VERTEX_ELEMENTS; i++) {
+        const VertexElement& e = f.elements[i];
+        h = hash_u64(h, e.slot | (u64)f.element_per_instance[i] << 8 | (u64)e.format << 16);
+        h = hash_u64(h, e.offset | (u64)f.element_step_rate[i] << 32);
+    }
+    return h;
+}
+
+static u64 pipeline_identity(const ConsolePipelineState* pso) {
+    u64 h = hash_u64(0xcbf29ce484222325ull, pso->compute);
+    for (u32 i = 0; i < 2; i++)
+        h = hash_u64(h, pso->programs[i] ? pso->programs[i]->key : 0);
+    if (!pso->compute)
+        h = hash_fixed_state(pso->fixed, h);
+    return h ? h : 1;
+}
+
+struct PrepareJob {
+    ConsolePipelineState* pso; // referenced for the job
+    u32 count;
+    PipelineOutputs outputs[KNOWN_PER_PIPELINE];
+};
+
+static void prepare_job(void* context) {
+    PrepareJob* job = (PrepareJob*)context;
+    ConsolePipelineState* pso = job->pso;
+    // The programs were queued before this job, in the same lane, so workers have started them (or
+    // finished). One still pending was requested first by another thread that hadn't queued it yet:
+    // the job goes to the back of the lane rather than wait for work it might be holding up.
+    for (u32 i = 0; i < 2; i++) {
+        if (pso->programs[i] && !shader_program_wait_started(pso->programs[i])) {
+            if (gpu_job_queue_background(prepare_job, job))
+                return;
+            break; // queue full: draws make the variants
+        }
+    }
+    if (programs_ready(pso) && desktop_signature_exists(pso)) {
+        for (u32 i = 0; i < job->count; i++) {
+            bool added;
+            PipelineVariant* v = add_variant(pso, job->outputs[i], &added);
+            if (added)
+                build_variant(pso, v);
+        }
+    }
+    console_release(pso);
+    free(job);
+}
+
+// Titles create the same pipeline several times over (deserialized again, derived without changes). A
+// pipeline equal to a live one uses that one's desktop pipelines: one set to make, and what a draw
+// with one waited for is ready for draws with the others.
+#define LISTED_BUCKETS 16384 // power of two
+
+static ConsolePipelineState* g_listed[LISTED_BUCKETS];
+static SRWLOCK g_listed_lock = SRWLOCK_INIT;
+
+// The live pipeline equal to `pso`, referenced; or nullptr, and `pso` is listed for later ones.
+static ConsolePipelineState* find_twin_or_list(ConsolePipelineState* pso) {
+    ConsolePipelineState** bucket = &g_listed[pso->identity & (LISTED_BUCKETS - 1)];
+    AcquireSRWLockExclusive(&g_listed_lock);
+    for (ConsolePipelineState* p = *bucket; p; p = p->next_listed) {
+        // The root signatures are the same object, kept alive by both. A pipeline being destroyed
+        // (no references left) is still listed until its destruction takes the lock.
+        if (p->identity == pso->identity && p->root_signature == pso->root_signature &&
+            p->compute == pso->compute && console_try_add_ref(p)) {
+            ReleaseSRWLockExclusive(&g_listed_lock);
+            return p;
+        }
+    }
+    pso->next_listed = *bucket;
+    pso->listed = true;
+    *bucket = pso;
+    ReleaseSRWLockExclusive(&g_listed_lock);
+    return nullptr;
+}
+
+static void unlist_pipeline(ConsolePipelineState* pso) {
+    if (!pso->listed)
+        return;
+    AcquireSRWLockExclusive(&g_listed_lock);
+    ConsolePipelineState** link = &g_listed[pso->identity & (LISTED_BUCKETS - 1)];
+    while (*link && *link != pso)
+        link = &(*link)->next_listed;
+    if (*link)
+        *link = pso->next_listed;
+    ReleaseSRWLockExclusive(&g_listed_lock);
+}
+
+// A new pipeline: its identity, then the twin it uses, or the variants drawn with that identity
+// before, queued for building behind its programs.
+static void pipeline_created(ConsolePipelineState* pso) {
+    if (!pso->translated)
+        return;
+    pso->identity = pipeline_identity(pso);
+    pso->twin = find_twin_or_list(pso);
+    if (pso->twin)
+        return;
+    PrepareJob found;
+    found.count = known_find(pso->identity, found.outputs);
+    if (!found.count)
+        return;
+    PrepareJob* job = (PrepareJob*)malloc(sizeof(PrepareJob));
+    if (!job || !console_try_add_ref(pso)) {
+        free(job);
+        return;
+    }
+    *job = found;
+    job->pso = pso;
+    if (!gpu_job_queue_background(prepare_job, job)) {
+        console_release(pso);
+        free(job);
+    }
 }
