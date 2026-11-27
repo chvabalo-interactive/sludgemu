@@ -921,6 +921,370 @@ static u32 assemble_graph(const RandomGraph& g, u32* code) {
     return n * 4;
 }
 
+// Programs H: random masking code, run on the GPU and simulated on the CPU. Vector ALU writes to v4-v11
+// under nested ifs (s_and_saveexec, a skip-over branch or not, an else side or not, the end restoring the
+// saved mask with s_or or s_mov), v_cmpx narrowing, loops lanes leave one by one, whole-wave code and
+// plain lane reads; the saved masks are used where s_and_saveexec put them, or copied, swapped with three
+// XORs or parked in spill lanes first. Every lane of v4-v13 is stored at the end, so a write that skips
+// its EXEC guard while some later read sees the lanes outside EXEC changes the stores (see
+// shader/translate_lanes.cpp). Skip-over branches jump over code that does nothing with EXEC empty (but
+// for whole-wave writes, left out there), so the CPU runs every instruction in order.
+#define MASKING_PROGRAMS  150 // of each wave size
+#define MASKING_MAX_WORDS 1024
+#define MASKING_DEPTH     4
+#define MASKING_REGIONS   10 // v4-v13
+#define MASKING_EXEC      126
+#define MASKING_VCC       106
+#define MASKING_SPILL     30 // the spill VGPR
+
+enum MaskHome : u8 { HOME_SAVED, HOME_COPY, HOME_SPILL };
+
+struct MaskFrame {
+    u64 saved;     // EXEC before the if
+    MaskHome home; // where the saved mask is now
+    bool else_done;
+    u32 skip;     // the skip-over branch still to point at the next else or end, or ~0u
+    bool skipped; // that branch jumps (EXEC is empty there)
+};
+
+struct MaskingProgram {
+    bool wave64;
+    u32 lanes;
+    u32 code[MASKING_MAX_WORDS];
+    u32 n;
+    u64 exec;
+    u32 v[16][64]; // the CPU's vector registers
+    MaskFrame frames[MASKING_DEPTH];
+    u32 depth;
+};
+
+// A vector ALU instruction: v_mov_b32 dst, k, or v_add_nc_u32 / v_xor_b32 / v_and_b32 dst, a or k, b.
+struct MaskAlu {
+    u32 op; // VOP2 opcode, or 0 for the move
+    u32 dst, a, b;
+    bool literal;
+    u32 k;
+};
+
+static void mask_put(MaskingProgram& m, u32 word) {
+    if (m.n < MASKING_MAX_WORDS)
+        m.code[m.n++] = word;
+}
+
+static u32 mask_sop1(const MaskingProgram& m, u32 op64, u32 op32, u32 dst, u32 src) {
+    return 0xBE800000u | dst << 16 | (m.wave64 ? op64 : op32) << 8 | src;
+}
+
+static u32 mask_sop2(const MaskingProgram& m, u32 op64, u32 op32, u32 dst, u32 a, u32 b) {
+    return 0x80000000u | (m.wave64 ? op64 : op32) << 23 | dst << 16 | b << 8 | a;
+}
+
+static u64 mask_all(const MaskingProgram& m) {
+    return m.wave64 ? ~0ull : 0xFFFFFFFFull;
+}
+
+static bool mask_on(u64 mask, u32 lane) {
+    return ((mask >> lane) & 1) != 0;
+}
+
+// SGPRs of nesting level d: where s_and_saveexec saves, and where the saved mask is copied or swapped.
+static u32 mask_save_reg(u32 d) {
+    return 20 + 2 * d;
+}
+
+static u32 mask_copy_reg(u32 d) {
+    return 40 + 2 * d;
+}
+
+// A vector register sources read: the lane number (v1) or v4-v13.
+static u32 mask_source() {
+    u32 r = graph_random(11);
+    return r == 0 ? 1 : 3 + r;
+}
+
+static MaskAlu mask_alu_random() {
+    static const u32 k_ops[4] = {0, 37, 29, 27}; // move, v_add_nc_u32, v_xor_b32, v_and_b32
+    MaskAlu a;
+    a.op = k_ops[graph_random(4)];
+    a.dst = 4 + graph_random(8);
+    a.a = mask_source();
+    a.b = mask_source();
+    a.literal = a.op == 0 || graph_random(2) == 0;
+    a.k = graph_random(0x7FFFFFFF);
+    return a;
+}
+
+static void mask_alu_emit(MaskingProgram& m, const MaskAlu& a) {
+    if (a.op == 0)
+        mask_put(m, 0x7E000000u | a.dst << 17 | 1u << 9 | 0xFF); // v_mov_b32 dst, k
+    else
+        mask_put(m, a.op << 25 | a.dst << 17 | a.b << 9 | (a.literal ? 0xFF : 256 + a.a));
+    if (a.literal)
+        mask_put(m, a.k);
+}
+
+static void mask_alu_run(MaskingProgram& m, const MaskAlu& a) {
+    for (u32 l = 0; l < m.lanes; l++) {
+        if (!mask_on(m.exec, l))
+            continue;
+        u32 x = a.literal ? a.k : m.v[a.a][l], y = m.v[a.b][l];
+        m.v[a.dst][l] = a.op == 0 ? a.k : a.op == 37 ? x + y : a.op == 29 ? x ^ y : x & y;
+    }
+}
+
+static void mask_alu(MaskingProgram& m) {
+    MaskAlu a = mask_alu_random();
+    mask_alu_emit(m, a);
+    mask_alu_run(m, a);
+}
+
+// v_readlane_b32 sdst, vsrc, lane; v_writelane_b32 vdst, ssrc, lane.
+static void mask_readlane(MaskingProgram& m, u32 sdst, u32 vsrc, u32 lane) {
+    mask_put(m, 0xD7600000u | sdst);
+    mask_put(m, (256 + vsrc) | (128 + lane) << 9 | 0x80u << 18);
+}
+
+static void mask_writelane(MaskingProgram& m, u32 vdst, u32 ssrc, u32 lane) {
+    mask_put(m, 0xD7610000u | vdst);
+    mask_put(m, ssrc | (128 + lane) << 9 | 0x80u << 18);
+}
+
+// v_add_nc_u32 dst, s50, dst after s50 = lane `lane` of `src`: a lane read's value used by the lanes in EXEC.
+static void mask_add_lane(MaskingProgram& m, u32 src, u32 lane) {
+    u32 dst = 4 + graph_random(8);
+    u32 value = m.v[src][lane];
+    mask_readlane(m, 50, src, lane);
+    mask_put(m, 37u << 25 | dst << 17 | dst << 9 | 50);
+    for (u32 l = 0; l < m.lanes; l++)
+        if (mask_on(m.exec, l))
+            m.v[dst][l] += value;
+}
+
+// A compare into VCC (clear outside EXEC): on the lane number, or on a bit of a register.
+static u64 mask_condition(MaskingProgram& m, u32 gt_op, u32 lt_op) {
+    u64 result = 0;
+    if (graph_random(3) != 0) {
+        u32 k = graph_random(m.lanes + 1);
+        bool gt = graph_random(2) == 0;
+        mask_put(m, 0x7C000000u | (gt ? gt_op : lt_op) << 17 | 1u << 9 | (128 + k));
+        for (u32 l = 0; l < m.lanes; l++)
+            if (mask_on(m.exec, l) && (gt ? k > l : k < l))
+                result |= 1ull << l;
+        return result;
+    }
+    u32 src = mask_source();
+    u32 bit = 1u << graph_random(6);
+    mask_put(m, 27u << 25 | 14u << 17 | src << 9 | (128 + bit)); // v_and_b32 v14, bit, src
+    for (u32 l = 0; l < m.lanes; l++)
+        if (mask_on(m.exec, l))
+            m.v[14][l] = m.v[src][l] & bit;
+    mask_put(m, 0x7C000000u | lt_op << 17 | 14u << 9 | 128); // 0 < v14
+    for (u32 l = 0; l < m.lanes; l++)
+        if (mask_on(m.exec, l) && m.v[14][l] != 0)
+            result |= 1ull << l;
+    return result;
+}
+
+static void mask_skip_over(MaskingProgram& m, MaskFrame& f) {
+    if (graph_random(2) == 0)
+        return;
+    f.skip = m.n;
+    f.skipped = m.exec == 0;
+    mask_put(m, 0xBF880000u); // s_cbranch_execz, pointed later
+}
+
+static void mask_skip_here(MaskingProgram& m, MaskFrame& f) {
+    if (f.skip != ~0u)
+        m.code[f.skip] |= (u32)(m.n - (f.skip + 1)) & 0xFFFF;
+    f.skip = ~0u;
+    f.skipped = false;
+}
+
+static void mask_if(MaskingProgram& m) {
+    u32 d = m.depth++;
+    MaskFrame& f = m.frames[d];
+    u64 vcc = mask_condition(m, 0xc4, 0xc1); // v_cmp_gt_u32, v_cmp_lt_u32
+    f.saved = m.exec;
+    f.home = HOME_SAVED;
+    f.else_done = false;
+    f.skip = ~0u;
+    f.skipped = false;
+    u32 save = mask_save_reg(d), copy = mask_copy_reg(d);
+    mask_put(m, mask_sop1(m, 36, 60, save, MASKING_VCC)); // s_and_saveexec
+    m.exec &= vcc;
+    switch (graph_random(5)) {
+    case 0: // s_mov to another register
+        mask_put(m, mask_sop1(m, 4, 3, copy, save));
+        f.home = HOME_COPY;
+        break;
+    case 1: // swapped with another register by three XORs
+        mask_put(m, mask_sop2(m, 19, 18, save, save, copy));
+        mask_put(m, mask_sop2(m, 19, 18, copy, copy, save));
+        mask_put(m, mask_sop2(m, 19, 18, save, save, copy));
+        f.home = HOME_COPY;
+        break;
+    case 2: // parked in spill lanes, the register then cleared
+        mask_writelane(m, MASKING_SPILL, save, 2 * d);
+        if (m.wave64)
+            mask_writelane(m, MASKING_SPILL, save + 1, 2 * d + 1);
+        mask_put(m, mask_sop1(m, 4, 3, save, 128));
+        f.home = HOME_SPILL;
+        break;
+    default:
+        break;
+    }
+    mask_skip_over(m, f);
+}
+
+// The register holding level d's saved mask, reloaded from its spill lanes if parked there.
+static u32 mask_saved(MaskingProgram& m, MaskFrame& f, u32 d) {
+    if (f.home == HOME_COPY)
+        return mask_copy_reg(d);
+    if (f.home == HOME_SPILL) {
+        mask_readlane(m, mask_save_reg(d), MASKING_SPILL, 2 * d);
+        if (m.wave64)
+            mask_readlane(m, mask_save_reg(d) + 1, MASKING_SPILL, 2 * d + 1);
+        f.home = HOME_SAVED;
+    }
+    return mask_save_reg(d);
+}
+
+static void mask_else(MaskingProgram& m) {
+    u32 d = m.depth - 1;
+    MaskFrame& f = m.frames[d];
+    mask_skip_here(m, f);
+    u32 saved = mask_saved(m, f, d);
+    mask_put(m, mask_sop2(m, 21, 20, MASKING_EXEC, saved, MASKING_EXEC)); // s_andn2 exec, saved, exec
+    m.exec = f.saved & ~m.exec;
+    f.else_done = true;
+    mask_skip_over(m, f);
+}
+
+static void mask_end_if(MaskingProgram& m) {
+    u32 d = m.depth - 1;
+    MaskFrame& f = m.frames[d];
+    mask_skip_here(m, f);
+    u32 saved = mask_saved(m, f, d);
+    if (graph_random(2) == 0)
+        mask_put(m, mask_sop2(m, 17, 16, MASKING_EXEC, MASKING_EXEC, saved)); // s_or exec, exec, saved
+    else
+        mask_put(m, mask_sop1(m, 4, 3, MASKING_EXEC, saved)); // s_mov exec, saved
+    m.exec = f.saved;
+    m.depth--;
+}
+
+// Whole-wave code: s_or_saveexec -1, maybe a write of every lane, a lane read, EXEC back. The write only
+// where no skip-over branch jumps past it (the only code here that does something with EXEC empty).
+static void mask_whole_wave(MaskingProgram& m) {
+    bool skipped = false;
+    for (u32 d = 0; d < m.depth; d++)
+        skipped = skipped || m.frames[d].skipped;
+    u64 saved = m.exec;
+    mask_put(m, mask_sop1(m, 37, 61, 30, 193));
+    m.exec = mask_all(m);
+    if (!skipped && graph_random(2) == 0)
+        mask_alu(m);
+    u32 src = mask_source(), lane = graph_random(m.lanes);
+    u32 value = m.v[src][lane];
+    mask_readlane(m, 50, src, lane);
+    mask_put(m, mask_sop1(m, 4, 3, MASKING_EXEC, 30));
+    m.exec = saved;
+    u32 dst = 4 + graph_random(8);
+    mask_put(m, 37u << 25 | dst << 17 | dst << 9 | 50); // v_add_nc_u32 dst, s50, dst
+    for (u32 l = 0; l < m.lanes; l++)
+        if (mask_on(m.exec, l))
+            m.v[dst][l] += value;
+}
+
+// A loop lanes leave one by one: v12 counts the passes, a lane leaves once it passes v13 = lane & k.
+static void mask_loop(MaskingProgram& m) {
+    u64 saved = m.exec;
+    u32 k = 1 + graph_random(7);
+    mask_put(m, mask_sop1(m, 4, 3, 60, MASKING_EXEC));
+    mask_put(m, 0x7E000000u | 12u << 17 | 1u << 9 | 128);     // v_mov_b32 v12, 0
+    mask_put(m, 27u << 25 | 13u << 17 | 1u << 9 | (128 + k)); // v_and_b32 v13, k, v1
+    for (u32 l = 0; l < m.lanes; l++)
+        if (mask_on(m.exec, l)) {
+            m.v[12][l] = 0;
+            m.v[13][l] = l & k;
+        }
+    u32 top = m.n;
+    MaskAlu body[3];
+    u32 count = 1 + graph_random(3);
+    for (u32 i = 0; i < count; i++) {
+        body[i] = mask_alu_random();
+        mask_alu_emit(m, body[i]);
+    }
+    mask_put(m, 37u << 25 | 12u << 17 | 12u << 9 | 129);                        // v_add_nc_u32 v12, 1, v12
+    mask_put(m, 0x7C000000u | 0xc4u << 17 | 13u << 9 | (256 + 12));             // v_cmp_gt_u32 vcc, v12, v13
+    mask_put(m, mask_sop2(m, 21, 20, MASKING_EXEC, MASKING_EXEC, MASKING_VCC)); // s_andn2 exec, exec, vcc
+    mask_put(m, 0xBF890000u | ((u32)(top - (m.n + 1)) & 0xFFFF));               // s_cbranch_execnz top
+    mask_put(m, mask_sop1(m, 4, 3, MASKING_EXEC, 60));
+    do {
+        for (u32 i = 0; i < count; i++)
+            mask_alu_run(m, body[i]);
+        u64 leave = 0;
+        for (u32 l = 0; l < m.lanes; l++)
+            if (mask_on(m.exec, l) && ++m.v[12][l] > m.v[13][l])
+                leave |= 1ull << l;
+        m.exec &= ~leave;
+    } while (m.exec != 0);
+    m.exec = saved;
+}
+
+static void make_masking(MaskingProgram& m, bool wave64) {
+    m.wave64 = wave64;
+    m.lanes = wave64 ? 64 : 32;
+    m.n = 0;
+    m.depth = 0;
+    m.exec = mask_all(m);
+    mask_put(m, 0xbe8203c1); // s_mov_b32 s2, -1
+    mask_put(m, 0xbe830380); // s_mov_b32 s3, 0
+    mask_put(m, 0xd7650001); // v_mbcnt_lo_u32_b32 v1, -1, 0
+    mask_put(m, 0x020100c1);
+    if (wave64) {
+        mask_put(m, 0xd7660001); // v_mbcnt_hi_u32_b32 v1, -1, v1
+        mask_put(m, 0x020202c1);
+    }
+    mask_put(m, 0x34040282); // v_lshlrev_b32 v2, 2, v1
+    for (u32 l = 0; l < m.lanes; l++)
+        m.v[1][l] = l;
+    for (u32 r = 4; r <= 14; r++) {
+        u32 k = graph_random(0x7FFFFFFF);
+        mask_put(m, 37u << 25 | r << 17 | 1u << 9 | 0xFF); // v_add_nc_u32 vr, k, v1
+        mask_put(m, k);
+        for (u32 l = 0; l < m.lanes; l++)
+            m.v[r][l] = k + l;
+    }
+    u32 steps = 20 + graph_random(50);
+    for (u32 s = 0; s < steps && m.n + 64 < MASKING_MAX_WORDS; s++) {
+        u32 pick = graph_random(16);
+        if (pick < 6 || (pick >= 9 && pick < 13 && m.depth == 0))
+            mask_alu(m);
+        else if (pick < 9)
+            m.depth < MASKING_DEPTH ? mask_if(m) : mask_alu(m);
+        else if (pick == 9)
+            m.frames[m.depth - 1].else_done ? mask_end_if(m) : mask_else(m);
+        else if (pick < 12)
+            mask_end_if(m);
+        else if (pick == 12)
+            m.exec &= mask_condition(m, 0xd4, 0xd1); // v_cmpx_gt_u32, v_cmpx_lt_u32 (inside an if)
+        else if (pick == 13)
+            mask_whole_wave(m);
+        else if (pick == 14)
+            mask_add_lane(m, mask_source(), graph_random(m.lanes));
+        else
+            mask_loop(m);
+    }
+    while (m.depth)
+        mask_end_if(m);
+    for (u32 r = 0; r < MASKING_REGIONS; r++) {
+        mask_put(m, 0xE0701000u | r * 256); // buffer_store_dword v(4 + r), v2, s[0:3], 0 offen offset:256r
+        mask_put(m, 0x80000002u | (4 + r) << 8);
+    }
+    mask_put(m, 0xbf810000); // s_endpgm
+}
+
 static ShaderInfo compute_info(u16 threads, u32 lds_bytes) {
     ShaderInfo info;
     memset(&info, 0, sizeof(info));
@@ -1030,21 +1394,22 @@ void test_shader_lanes() {
     // Program G: which writes keep the lanes outside EXEC (a select) and which write every lane (both
     // halves are emitted alike; the first is checked).
     static const char* const k_guards[] = {
-        "v4_0 = select(EXEC0, 0x00000007u, v4_0);",  // the else lanes read the old value
-        "v5_0 = 0x00000003u;",                       // temporaries of the then side
+        "v4_0 = select(EXEC0, 0x00000007u, v4_0);", // the else lanes read the old value
+        "v5_0 = 0x00000003u;",                      // temporaries of the then side
         "!v5_0 = select(",
         "!if (EXEC0) v5_0",
         "!v6_0 = select(",
         "!if (EXEC0) v6_0",
-        "v7_0 = select(EXEC0, 0x00000037u, v7_0);",  // v_readlane reads a lane outside EXEC
-        "v9_0 = select(EXEC0, g_lds[",               // a load whose other lanes are read after the join
+        "v7_0 = select(EXEC0, 0x00000037u, v7_0);",   // v_readlane reads a lane outside EXEC
+        "v9_0 = select(EXEC0, g_lds[",                // a load whose other lanes are read after the join
         "v12_0 = select(EXEC0, 0x00000002u, v12_0);", // whole-wave code reads the other lanes
-        "v15_0 = select(EXEC0, ",                    // waterfall passes each write their lanes
-        "!v16_0 = select(",                          // a temporary of the passes
+        "v15_0 = select(EXEC0, ",                     // waterfall passes each write their lanes
+        "!v16_0 = select(",                           // a temporary of the passes
         "!if (EXEC0) v16_0",
         nullptr,
     };
-    if (run_program(b, k_lane_writes_program, sizeof(k_lane_writes_program), compute_info(64, 64), out, k_guards)) {
+    if (run_program(b, k_lane_writes_program, sizeof(k_lane_writes_program), compute_info(64, 64), out,
+                    k_guards)) {
         for (u32 r = 0; r < 16; r++)
             for (u32 i = 0; i < 64; i++) {
                 u32 want = lane_writes_expected(r, i);
@@ -1083,7 +1448,34 @@ void test_shader_lanes() {
             break;
         }
     }
-    printf("shader lanes: %u programs run on the GPU (waves of %u-%u lanes)\n", 7 + graphs, b.target.wave_min,
-           b.target.wave_max);
+    // Programs H: random masking code of both wave sizes against the CPU.
+    static MaskingProgram masking;
+    u32 maskings = 0;
+    for (u32 i = 0; i < 2 * MASKING_PROGRAMS; i++) {
+        bool wave64 = i < MASKING_PROGRAMS;
+        make_masking(masking, wave64);
+        ShaderInfo info = compute_info(wave64 ? 64 : 32, 0);
+        info.wave_size = wave64 ? 64 : 32;
+        if (!run_program(b, masking.code, masking.n * 4, info, out)) {
+            g_failures++;
+            break;
+        }
+        maskings++;
+        bool same = true;
+        for (u32 r = 0; r < MASKING_REGIONS && same; r++)
+            for (u32 l = 0; l < masking.lanes && same; l++)
+                if (out[r * 64 + l] != masking.v[4 + r][l]) {
+                    printf(
+                        "FAIL shader lanes: masking program %u (wave%u) v%u lane %u: 0x%x, expected 0x%x\n",
+                        i, masking.lanes, 4 + r, l, out[r * 64 + l], masking.v[4 + r][l]);
+                    same = false;
+                }
+        if (!same) {
+            g_failures++;
+            break;
+        }
+    }
+    printf("shader lanes: %u programs run on the GPU (waves of %u-%u lanes)\n", 7 + graphs + maskings,
+           b.target.wave_min, b.target.wave_max);
     bench_release(b);
 }
