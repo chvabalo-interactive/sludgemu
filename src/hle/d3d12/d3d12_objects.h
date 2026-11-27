@@ -482,9 +482,9 @@ HRESULT console_create_command_signature(ConsoleDevice* device, const D3D12_COMM
 // A root signature. Translated shaders read the console's user data (the root arguments as they lie
 // in user SGPRs) from root constants, and root descriptors from root SRVs/UAVs; the desktop
 // signature has that layout (see shader/translate.h).
-#define ROOT_USER_DATA_SPACE        100 // root constants (b0) and root descriptors (t<n>/u<n>, n = parameter)
-#define ROOT_STATIC_SAMPLER_SPACE   102
-#define ROOT_MAX_SIGNATURE_VARIANTS 16
+#define ROOT_USER_DATA_SPACE      100 // root constants (b0) and root descriptors (t<n>/u<n>, n = parameter)
+#define ROOT_STATIC_SAMPLER_SPACE 102
+#define ROOT_MAX_SAMPLER_SETS     3 // stages with inline samplers in one pipeline
 
 struct ConsoleRootSignature {
     ConsoleObjectHeader header;
@@ -499,13 +499,18 @@ struct ConsoleRootSignature {
     u8 user_sgpr[ROOT_MAX_PARAMETERS];         // each parameter's first user SGPR
     s8 desktop_parameter[ROOT_MAX_PARAMETERS]; // root descriptors: their desktop root parameter
 
-    // Desktop signatures that also carry pipelines' inline samplers, by their samplers' hash.
+    // Desktop signatures that also carry pipelines' inline samplers: one per distinct set of sampler
+    // sets, found by hash and told apart by the sets themselves (kept flattened, see
+    // console_root_signature_desktop). Grows as pipelines bring new sets.
     SRWLOCK variant_lock;
     u32 variant_count;
+    u32 variant_capacity;
     struct SignatureVariant {
         u64 key;
+        u8* sets;
+        u32 sets_size;
         ID3D12RootSignature* desktop;
-    } variants[ROOT_MAX_SIGNATURE_VARIANTS];
+    }* variants;
 };
 
 // Programs' inline samplers, for the stage that sees them.

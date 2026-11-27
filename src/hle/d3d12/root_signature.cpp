@@ -4,6 +4,7 @@
 // console flags in the high bits that select console shader ABIs. Our serializer writes the
 // desktop format, since CreateRootSignature, also ours, is its only consumer.
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "common/log.h"
@@ -23,6 +24,10 @@ static const ConsoleClass k_root_signature_class = {
     "ID3D12RootSignature", k_root_signature_iids, ARRAY_COUNT(k_root_signature_iids), root_signature_destroy};
 
 static void* const* g_root_signature_table = nullptr;
+
+// Static sampler features the device may lack (D3D12 options 19 and 17).
+static bool g_aniso_point_mip_supported;
+static bool g_unnormalized_samplers_supported;
 
 // --- serialization -----------------------------------------------------------------------------------
 
@@ -70,8 +75,11 @@ HRESULT WINAPI console_serialize_root_signature(const D3D12_ROOT_SIGNATURE_DESC*
 
 static void root_signature_destroy(void* object) {
     ConsoleRootSignature* rs = (ConsoleRootSignature*)object;
-    for (u32 i = 0; i < rs->variant_count; i++)
+    for (u32 i = 0; i < rs->variant_count; i++) {
         gpu_retire(rs->variants[i].desktop);
+        free(rs->variants[i].sets);
+    }
+    free(rs->variants);
     if (rs->deserializer)
         rs->deserializer->Release();
 }
@@ -79,32 +87,77 @@ static void root_signature_destroy(void* object) {
 static HRESULT create_desktop_signature(ConsoleRootSignature* rs, const SamplerSet* sets, u32 set_count,
                                         ID3D12RootSignature** out);
 
+// The sets as one byte string (each set's visibility, count and samplers), which identifies a variant.
+static u32 flatten_sets(const SamplerSet* sets, u32 set_count, u8* out) {
+    u32 size = 0;
+    for (u32 i = 0; i < set_count; i++) {
+        u32 header[2] = {(u32)sets[i].visibility, sets[i].count};
+        memcpy(out + size, header, sizeof(header));
+        size += sizeof(header);
+        memcpy(out + size, sets[i].samplers, sets[i].count * sizeof(InlineSampler));
+        size += sets[i].count * (u32)sizeof(InlineSampler);
+    }
+    return size;
+}
+
+// Under the variant lock.
+static bool add_variant(ConsoleRootSignature* rs, u64 key, const u8* sets, u32 size,
+                        ID3D12RootSignature* desktop) {
+    if (rs->variant_count == rs->variant_capacity) {
+        u32 capacity = rs->variant_capacity ? rs->variant_capacity * 2 : 8;
+        void* grown = realloc(rs->variants, capacity * sizeof(*rs->variants));
+        if (!grown)
+            return false;
+        rs->variants = (ConsoleRootSignature::SignatureVariant*)grown;
+        rs->variant_capacity = capacity;
+    }
+    u8* copy = (u8*)malloc(size);
+    if (!copy)
+        return false;
+    memcpy(copy, sets, size);
+    rs->variants[rs->variant_count++] = {key, copy, size, desktop};
+    // Each variant means root signature switches between draws: worth knowing when there are many.
+    u32 n = rs->variant_count;
+    if (n >= 16 && (n & (n - 1)) == 0)
+        LOG_I("d3d12", "a root signature has %u sets of inline samplers", n);
+    return true;
+}
+
 ID3D12RootSignature* console_root_signature_desktop(ConsoleRootSignature* rs, const SamplerSet* sets,
                                                     u32 set_count) {
-    u64 key = 0xcbf29ce484222325ull; // FNV-1a over the sets
     u32 samplers = 0;
-    for (u32 i = 0; i < set_count; i++) {
+    for (u32 i = 0; i < set_count; i++)
         samplers += sets[i].count;
-        const u8* bytes[2] = {(const u8*)sets[i].samplers, (const u8*)&sets[i].visibility};
-        usize sizes[2] = {sets[i].count * sizeof(InlineSampler), sizeof(sets[i].visibility)};
-        for (u32 part = 0; part < 2; part++)
-            for (usize b = 0; b < sizes[part]; b++)
-                key = (key ^ bytes[part][b]) * 0x100000001b3ull;
-    }
     if (!samplers)
         return rs->desktop;
+    if (set_count > ROOT_MAX_SAMPLER_SETS) {
+        LOG_W_ONCE("d3d12", "pipeline with inline samplers in %u stages; pipelines skipped", set_count);
+        return nullptr;
+    }
+    for (u32 i = 0; i < set_count; i++) {
+        if (sets[i].count > SHADER_MAX_INLINE_SAMPLERS) {
+            LOG_W_ONCE("d3d12", "program with %u inline samplers; pipelines skipped", sets[i].count);
+            return nullptr;
+        }
+    }
+    u8 flat[ROOT_MAX_SAMPLER_SETS * (8 + SHADER_MAX_INLINE_SAMPLERS * sizeof(InlineSampler))];
+    u32 size = flatten_sets(sets, set_count, flat);
+    u64 key = 0xcbf29ce484222325ull; // FNV-1a
+    for (u32 b = 0; b < size; b++)
+        key = (key ^ flat[b]) * 0x100000001b3ull;
+
     AcquireSRWLockExclusive(&rs->variant_lock);
     ID3D12RootSignature* desktop = nullptr;
-    for (u32 i = 0; i < rs->variant_count && !desktop; i++)
-        if (rs->variants[i].key == key)
-            desktop = rs->variants[i].desktop;
-    if (!desktop) {
-        if (rs->variant_count == ROOT_MAX_SIGNATURE_VARIANTS)
-            LOG_W_ONCE("d3d12",
-                       "more than %d sets of inline samplers with one root signature; pipelines skipped",
-                       ROOT_MAX_SIGNATURE_VARIANTS);
-        else if (SUCCEEDED(create_desktop_signature(rs, sets, set_count, &desktop)))
-            rs->variants[rs->variant_count++] = {key, desktop};
+    for (u32 i = 0; i < rs->variant_count && !desktop; i++) {
+        const ConsoleRootSignature::SignatureVariant& v = rs->variants[i];
+        if (v.key == key && v.sets_size == size && memcmp(v.sets, flat, size) == 0)
+            desktop = v.desktop;
+    }
+    if (!desktop && SUCCEEDED(create_desktop_signature(rs, sets, set_count, &desktop)) &&
+        !add_variant(rs, key, flat, size, desktop)) {
+        LOG_E("d3d12", "out of memory for a root signature variant");
+        gpu_retire(desktop);
+        desktop = nullptr;
     }
     ReleaseSRWLockExclusive(&rs->variant_lock);
     return desktop;
@@ -113,6 +166,13 @@ ID3D12RootSignature* console_root_signature_desktop(ConsoleRootSignature* rs, co
 void console_root_signature_init() {
     g_root_signature_table = console_build_table("ID3D12RootSignature", k_root_signature_entries,
                                                  ARRAY_COUNT(k_root_signature_entries), nullptr, 0);
+    ID3D12Device13* device = gpu_device();
+    D3D12_FEATURE_DATA_D3D12_OPTIONS19 o19 = {};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &o19, sizeof(o19))))
+        g_aniso_point_mip_supported = o19.AnisoFilterWithPointMipSupported != FALSE;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS17 o17 = {};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS17, &o17, sizeof(o17))))
+        g_unnormalized_samplers_supported = o17.NonNormalizedCoordinateSamplersSupported != FALSE;
 }
 
 // The console's root parameters as user data for shader translation. Tables with more ranges than
@@ -221,9 +281,20 @@ static HRESULT create_desktop_signature(ConsoleRootSignature* rs, const SamplerS
     for (u32 i = 0; i < set_count; i++) {
         for (u32 k = 0; k < sets[i].count && sampler_count < ARRAY_COUNT(samplers); k++) {
             const InlineSampler& in = sets[i].samplers[k];
+            if (in.unnormalized && !g_unnormalized_samplers_supported) {
+                LOG_W_ONCE("d3d12", "the device has no static samplers with unnormalized coordinates; "
+                                    "pipelines using them are skipped");
+                return E_NOTIMPL;
+            }
             D3D12_STATIC_SAMPLER_DESC1& d = samplers[sampler_count++];
             d = {};
             d.Filter = (D3D12_FILTER)in.filter;
+            if ((in.filter & 0x7F) == D3D12_FILTER_MIN_MAG_ANISOTROPIC_MIP_POINT &&
+                !g_aniso_point_mip_supported) {
+                // The nearest the device has: linear mips between the levels.
+                LOG_W_ONCE("d3d12", "anisotropic filtering with point mips unsupported: linear mips instead");
+                d.Filter = (D3D12_FILTER)(in.filter | 1u);
+            }
             d.AddressU = (D3D12_TEXTURE_ADDRESS_MODE)in.address[0];
             d.AddressV = (D3D12_TEXTURE_ADDRESS_MODE)in.address[1];
             d.AddressW = (D3D12_TEXTURE_ADDRESS_MODE)in.address[2];
