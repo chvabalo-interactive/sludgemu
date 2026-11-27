@@ -16,6 +16,9 @@
 //   hold the byte address of each dword instead of descriptor bits, so translation fails where a
 //   program changes a loaded descriptor or puts one together (except buffer descriptor fields a raw
 //   desktop view ignores).
+// - The descriptor shadow: a buffer laid out like console resource heap memory, one 32-byte record per
+//   desktop heap slot holding the console descriptor's first four dwords (buffer descriptors whole)
+//   and the kind of the desktop view in the slot.
 // - Root descriptors (buffer addresses in user data) become desktop root SRVs/UAVs read as raw
 //   buffers; registers holding their high address dword are tracked statically.
 // - Vertex fetches (loads through the vertex buffer table) become desktop input assembler inputs.
@@ -130,6 +133,20 @@ struct InlineSampler {
 #define SHADER_MAX_INLINE_SAMPLERS  16
 #define TABLE_REACH_UNKNOWN         0xFFFF
 #define SHADER_INLINE_SAMPLER_SPACE 103 // register s<i> holds inline sampler i
+
+// The descriptor shadow (see the model above): a raw buffer at register t0 of this space, a record per
+// desktop resource heap slot. Dwords 0-3: the console descriptor's dwords 0-3; dword 4: the desktop
+// view's kind; dwords 5-7: zero.
+#define SHADER_DESCRIPTOR_SHADOW_SPACE 101
+#define SHADER_SHADOW_RECORD_BYTES     32
+#define SHADER_SHADOW_KIND_OFFSET      16
+
+enum ShadowViewKind : u32 {
+    SHADOW_VIEW_NONE = 0, // a null view or nothing written
+    SHADOW_VIEW_SRV = 1,
+    SHADOW_VIEW_UAV = 2,
+    SHADOW_VIEW_CBV = 3, // a constant buffer, viewed as a raw shader resource view
+};
 
 // The translation's result: HLSL source plus what the pipeline needs to know about it.
 struct TranslatedShader {

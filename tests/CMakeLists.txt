@@ -14,6 +14,7 @@ add_executable(sludgemu_tests
     ${PROJECT_SOURCE_DIR}/src/gpu/console_layout.cpp
     ${PROJECT_SOURCE_DIR}/src/gpu/formats.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/dstorage/bcpack.cpp
+    ${PROJECT_SOURCE_DIR}/src/hle/d3d12/descriptor_shadow.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xapu.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xdsp.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xma.cpp

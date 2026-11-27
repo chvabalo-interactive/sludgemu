@@ -4,6 +4,7 @@
 
 #include <string.h>
 
+#include "hle/d3d12/descriptor_shadow.h"
 #include "shader/rdna.h"
 #include "shader/translate.h"
 #include "test.h"
@@ -514,6 +515,59 @@ static void test_changed_descriptors() {
     }
 }
 
+// --- descriptor shadow records -------------------------------------------------------------------------
+
+// What the runtime writes into the shadow for a slot, read back the way translated programs read it.
+static void test_descriptor_shadow_records() {
+    u8 slot[32];
+    u32 record[8];
+    {
+        // A raw view of 0x1234 bytes at 0x2_8000_0100: no stride, records count bytes.
+        u32 bits[4];
+        shadow_buffer_descriptor(0x280000100ull, 0, 0x1234, bits);
+        u64 marker[2] = {DESCRIPTOR_MARKER_MAGIC | (u64)(2 | SHADOW_VIEW_UAV << 8) << 32, 0x1000};
+        memcpy(slot, marker, 16);
+        memcpy(slot + DESCRIPTOR_MARKER_BITS, bits, 16);
+        shadow_record(slot, record);
+        u64 base = record[0] | (u64)(record[1] & 0xFFFF) << 32;
+        CHECK(base == 0x280000100ull);
+        CHECK(((record[1] >> 16) & 0x3FFF) == 0);
+        CHECK(record[2] == 0x1234 && (record[2] & ~15u) != 0);
+        CHECK(record[4] == SHADOW_VIEW_UAV);
+        CHECK(record[5] == 0 && record[6] == 0 && record[7] == 0);
+    }
+    {
+        // A structured view of 100 elements of 24 bytes, rewritten the way compilers make a raw
+        // descriptor of it: records times the stride, the stride cleared, the base kept.
+        u32 bits[4];
+        shadow_buffer_descriptor(0x7C9600040ull, 24, 100, bits);
+        u32 stride = (bits[1] >> 16) & 0x3FFF;
+        CHECK(stride == 24);
+        CHECK(bits[2] * (stride > 1 ? stride : 1) == 2400);
+        CHECK((bits[1] & 0xC000FFFFu) == 0x7);
+        CHECK(bits[0] == 0xC9600040u);
+    }
+    {
+        // A constant buffer view the title wrote: the descriptor is its own record.
+        u64 native[2] = {0x80B3FF00ull | NATIVE_CBV_STRIDE_BITS << 48, 64 | NATIVE_CBV_FORMAT_BITS << 32};
+        memcpy(slot, native, 16);
+        memset(slot + 16, 0xEE, 16);
+        shadow_record(slot, record);
+        CHECK(record[0] == 0x80B3FF00u && record[1] == 0x00100000u);
+        CHECK(((record[1] >> 16) & 0x3FFF) == 16 && record[2] == 64);
+        CHECK(record[4] == SHADOW_VIEW_CBV);
+    }
+    {
+        // Memory never written as a descriptor: a null view's record.
+        memset(slot, 0x5A, sizeof(slot));
+        shadow_record(slot, record);
+        bool zero = true;
+        for (u32 i = 0; i < 8; i++)
+            zero &= record[i] == 0;
+        CHECK(zero);
+    }
+}
+
 void test_shader_translate() {
     rdna_init();
     test_constant_sampler_in_vcc();
@@ -522,5 +576,6 @@ void test_shader_translate() {
     test_sampler_decoding();
     test_swapped_heap_sampler();
     test_changed_descriptors();
+    test_descriptor_shadow_records();
     g_out.hlsl.release();
 }

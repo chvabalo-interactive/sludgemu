@@ -234,8 +234,8 @@ static HRESULT create_desktop_signature(ConsoleRootSignature* rs, const SamplerS
     // so the image covers the graphics layout, the longer one.
     ShaderInfo info = {};
     u32 user_sgprs = console_user_data_layout(rs->layout, CONSOLE_FIRST_ROOT_SGPR_GRAPHICS, &info);
-    rs->user_dwords = (u8)((user_sgprs + 3) & ~3u); // shaders read the user data as uint4s
-    D3D12_ROOT_PARAMETER1 params[1 + ROOT_MAX_PARAMETERS] = {};
+    rs->user_dwords = (u8)((user_sgprs + 3) & ~3u);             // shaders read the user data as uint4s
+    D3D12_ROOT_PARAMETER1 params[2 + ROOT_MAX_PARAMETERS] = {}; // user data, root descriptors, the shadow
     u32 count = 0;
     D3D12_ROOT_PARAMETER1& user = params[count++];
     user.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
@@ -265,6 +265,26 @@ static HRESULT create_desktop_signature(ConsoleRootSignature* rs, const SamplerS
         LOG_E("d3d12", "root signature: %u user data dwords and root descriptors exceed the desktop limit",
               dwords);
         return E_INVALIDARG;
+    }
+    // The descriptor shadow, which programs reading descriptor bits or branching on view kinds declare.
+    // Rewritten by the CPU while lists are recorded and run, like the descriptors it shadows. Every
+    // variant puts it at the same place (lists may read shadow_parameter meanwhile: it only ever gets
+    // that value).
+    if (dwords + 2 <= 64) {
+        D3D12_ROOT_PARAMETER1& p = params[count];
+        p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        p.Descriptor.ShaderRegister = 0;
+        p.Descriptor.RegisterSpace = SHADER_DESCRIPTOR_SHADOW_SPACE;
+        p.Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
+        p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rs->shadow_parameter = (s8)count++;
+        dwords += 2;
+    } else {
+        rs->shadow_parameter = -1;
+        LOG_E("d3d12",
+              "root signature: no room for the descriptor shadow (%u dwords); pipelines whose "
+              "programs read it fail to build",
+              dwords);
     }
     D3D12_STATIC_SAMPLER_DESC1 samplers[64 + 3 * SHADER_MAX_INLINE_SAMPLERS];
     u32 sampler_count = desc.NumStaticSamplers < 64 ? desc.NumStaticSamplers : 64;

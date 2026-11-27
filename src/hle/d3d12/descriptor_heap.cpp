@@ -153,6 +153,49 @@ void console_descriptor_copy_keepers(const DescriptorSlot& dest, const Descripto
         set_keeper(dest.heap, dest.index + i, src.heap->keepers[src.index + i]);
 }
 
+// --- descriptor shadow ---------------------------------------------------------------------------------
+
+// The shadow of a resource heap with `visible_count` shader-visible slots, mapped for good (upload heap
+// memory is write-combined: written, never read back). Created zeroed: no view in any slot.
+static ID3D12Resource* create_shadow(u32 visible_count, u8** mapped) {
+    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC1 desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = (u64)visible_count * SHADER_SHADOW_RECORD_BYTES;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* shadow = nullptr;
+    HRESULT hr = gpu_device()->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                        D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, nullptr, 0,
+                                                        nullptr, IID_PPV_ARGS(&shadow));
+    if (SUCCEEDED(hr)) {
+        hr = shadow->Map(0, nullptr, (void**)mapped);
+        if (FAILED(hr)) {
+            shadow->Release();
+            shadow = nullptr;
+        }
+    }
+    if (FAILED(hr)) {
+        LOG_E("d3d12", "cannot create the %llu KiB descriptor shadow of a heap of %u slots (0x%08lx)",
+              desc.Width >> 10, visible_count, (unsigned long)hr);
+        return nullptr;
+    }
+    gpu_set_name(shadow, "descriptor shadow (%u slots)", visible_count);
+    return shadow;
+}
+
+// Writes the record of shader-visible slot `desktop_index` (with the descriptor copied there).
+static void write_shadow(ConsoleDescriptorHeap* heap, u32 desktop_index, const u8* console) {
+    if (!heap->shadow_cpu)
+        return;
+    u32 record[SHADER_SHADOW_RECORD_BYTES / 4];
+    shadow_record(console, record);
+    memcpy(heap->shadow_cpu + (u64)desktop_index * SHADER_SHADOW_RECORD_BYTES, record, sizeof(record));
+}
+
 void console_descriptor_publish(const DescriptorSlot& slot, u32 count) {
     if (slot.heap->keepers)
         for (u32 i = 0; i < count; i++)
@@ -160,6 +203,8 @@ void console_descriptor_publish(const DescriptorSlot& slot, u32 count) {
     if (!slot.visible_cpu.ptr)
         return;
     gpu_device()->CopyDescriptorsSimple(count, slot.visible_cpu, slot.cpu, slot.type);
+    for (u32 i = 0; i < count; i++)
+        write_shadow(slot.heap, slot.index + i, slot.console + (u64)i * slot.heap->stride);
     if (slot.heap->native)
         for (u32 i = 0; i < count; i++)
             slot.heap->native[slot.index + i].generation = 0;
@@ -176,14 +221,15 @@ void console_descriptor_publish(const DescriptorSlot& slot, u32 count) {
 // on top. Their desktop views are made here, and remade only when the descriptor or the memory
 // windows change.
 
-static void mirror_native_constant_buffer(ConsoleDescriptorHeap* heap, u32 desktop_index, u64 address,
-                                          u64 records) {
+static void mirror_native_constant_buffer(ConsoleDescriptorHeap* heap, u32 desktop_index, const u8* console,
+                                          u64 address, u64 records) {
     ConsoleDescriptorHeap::NativeView& seen = heap->native[desktop_index];
     u32 generation = gpu_window_generation();
     if (seen.generation == generation && seen.address == address && seen.records == records)
-        return;
+        return; // the slot and its shadow record hold this view (other writes of the slot reset `seen`)
     D3D12_CPU_DESCRIPTOR_HANDLE dst = {heap->visible_cpu_start + (u64)desktop_index * heap->desktop_stride};
     write_constant_buffer_view(address, records * 16, dst);
+    write_shadow(heap, desktop_index, console);
     seen.address = address;
     seen.records = records;
     seen.generation = generation;
@@ -205,10 +251,10 @@ void console_descriptor_mirror(ConsoleDescriptorHeap* heap, u32 first, u32 count
         memcpy(&q0, console, 8);
         memcpy(&q1, console + 8, 8);
         if (heap->native && (q0 >> 48) == NATIVE_CBV_STRIDE_BITS && (q1 >> 32) == NATIVE_CBV_FORMAT_BITS) {
-            mirror_native_constant_buffer(heap, d, q0 & NATIVE_CBV_ADDRESS_MASK, (u32)q1);
+            mirror_native_constant_buffer(heap, d, console, q0 & NATIVE_CBV_ADDRESS_MASK, (u32)q1);
             continue;
         }
-        u32 magic = (u32)q0, type = (u32)(q0 >> 32);
+        u32 magic = (u32)q0, type = (u32)(q0 >> 32) & 0xFF;
         u64 source = q1;
         u64 own = heap->cpu_start + (u64)i * heap->desktop_stride;
         if (magic != DESCRIPTOR_MARKER_MAGIC || type != (u32)heap->desktop_type)
@@ -217,6 +263,7 @@ void console_descriptor_mirror(ConsoleDescriptorHeap* heap, u32 first, u32 count
             continue; // written in place, and published then
         D3D12_CPU_DESCRIPTOR_HANDLE dst = {heap->visible_cpu_start + (u64)d * heap->desktop_stride};
         device->CopyDescriptorsSimple(1, dst, {source}, heap->desktop_type);
+        write_shadow(heap, d, console);
         if (heap->native)
             heap->native[d].generation = 0;
     }
@@ -251,6 +298,7 @@ static void descriptor_heap_destroy(void* object) {
     unregister_heap(heap);
     gpu_retire(heap->cpu);
     gpu_retire(heap->visible);
+    gpu_retire(heap->shadow); // unmapped with its release
     free(heap->native);
     if (heap->keepers) {
         for (u32 i = 0; i < heap->desc.NumDescriptors; i++)
@@ -361,6 +409,18 @@ HRESULT console_create_descriptor_heap(ConsoleDevice* device, const D3D12_DESCRI
             visible->Release();
         return hr;
     }
+    // Translated shaders bind the descriptor shadow of the resource heap they index: without one they
+    // would read through an unbound root descriptor.
+    ID3D12Resource* shadow = nullptr;
+    u8* shadow_cpu = nullptr;
+    if (visible && d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        shadow = create_shadow(visible_count, &shadow_cpu);
+        if (!shadow) {
+            cpu->Release();
+            visible->Release();
+            return E_OUTOFMEMORY;
+        }
+    }
 
     // Like the console runtime, take the memory from XMemAlloc, where the title's allocation hooks
     // may supply memory set aside for this heap. Handles must fit in 32 bits: console hardware
@@ -374,6 +434,8 @@ HRESULT console_create_descriptor_heap(ConsoleDevice* device, const D3D12_DESCRI
         cpu->Release();
         if (visible)
             visible->Release();
+        if (shadow)
+            shadow->Release();
         return E_OUTOFMEMORY;
     }
 
@@ -390,6 +452,9 @@ HRESULT console_create_descriptor_heap(ConsoleDevice* device, const D3D12_DESCRI
     heap->desktop_stride = g_desktop_stride[d.Type];
     heap->cpu = cpu;
     heap->visible = visible;
+    heap->shadow = shadow;
+    heap->shadow_cpu = shadow_cpu;
+    heap->shadow_gpu = shadow ? shadow->GetGPUVirtualAddress() : 0;
     heap->cpu_start = cpu->GetCPUDescriptorHandleForHeapStart().ptr;
     if (visible) {
         heap->visible_cpu_start = visible->GetCPUDescriptorHandleForHeapStart().ptr;

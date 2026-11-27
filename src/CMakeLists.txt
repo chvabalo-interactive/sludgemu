@@ -88,6 +88,8 @@ add_executable(sludgemu WIN32
     hle/d3d12/fence.cpp
     hle/d3d12/resource.cpp
     hle/d3d12/descriptor_heap.cpp
+    hle/d3d12/descriptor_shadow.h
+    hle/d3d12/descriptor_shadow.cpp
     hle/d3d12/query_heap.cpp
     hle/d3d12/pipeline_state.cpp
     hle/d3d12/command_signature.cpp

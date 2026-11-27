@@ -298,6 +298,12 @@ void list_flush_user_data(ConsoleCommandList* self, bool graphics) {
     }
     graphics ? l->SetGraphicsRoot32BitConstants(0, rs->user_dwords, image, 0)
              : l->SetComputeRoot32BitConstants(0, rs->user_dwords, image, 0);
+    // The shadow of the bound resource heap, which translated programs index like the heap.
+    ConsoleDescriptorHeap* resources = self->state.heaps[0];
+    if (rs->shadow_parameter >= 0 && resources && resources->shadow) {
+        graphics ? l->SetGraphicsRootShaderResourceView(rs->shadow_parameter, resources->shadow_gpu)
+                 : l->SetComputeRootShaderResourceView(rs->shadow_parameter, resources->shadow_gpu);
+    }
 }
 
 // Sets everything the list had set on a fresh desktop list.
@@ -553,6 +559,8 @@ static void WINAPI list_set_descriptor_heaps(ConsoleCommandList* self, UINT coun
         desktop[n++] = heap->visible;
     }
     self->desktop->SetDescriptorHeaps(n, desktop);
+    // Tables are placed in the bound heaps and the shadow is the resource heap's: both go again.
+    self->state.user_data_dirty[0] = self->state.user_data_dirty[1] = true;
 }
 
 // A new root signature drops the arguments set for the old one.

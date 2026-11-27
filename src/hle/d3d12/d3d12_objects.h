@@ -8,6 +8,7 @@
 #include "gpu/gpu_window.h"
 #include "gpu/tile_pool.h"
 #include "hle/d3d12/console_object.h"
+#include "hle/d3d12/descriptor_shadow.h"
 
 // Console D3D12 object types and their creation functions (one source file per type).
 
@@ -395,6 +396,12 @@ struct ConsoleDescriptorHeap {
     // Per slot, the resource without a title reference a view in it keeps (console_descriptor_keep);
     // allocated with the first one.
     ConsoleResource* volatile* keepers;
+    // Shader-visible resource heaps: the descriptor shadow translated shaders read descriptor bits
+    // and view kinds from (see translate.h), a record per shader-visible slot, written with the slot.
+    // In system memory (an upload heap, persistently mapped): reads are few and cached.
+    ID3D12Resource* shadow;
+    u8* shadow_cpu;
+    u64 shadow_gpu;
 };
 
 // Where a console descriptor handle points.
@@ -410,18 +417,6 @@ struct DescriptorSlot {
 };
 
 void console_descriptor_heap_init();
-
-// Constant buffer views in the console's own descriptor format: the buffer address with a 16-byte
-// stride in the top bits of the first quadword, the size in 16-byte records with a fixed format word
-// on top of the second. Titles write these themselves (the console runtime inlines their creation),
-// and we write them too, so copies of descriptor memory carry the view itself.
-#define NATIVE_CBV_STRIDE_BITS  0x0010ull     // top 16 bits of the first quadword
-#define NATIVE_CBV_FORMAT_BITS  0x0002403Cull // top 32 bits of the second quadword
-#define NATIVE_CBV_ADDRESS_MASK 0x0000FFFFFFFFFFFFull
-
-// Console descriptor slots written by us start with this marker, then the slot's descriptor type
-// and its desktop CPU-only descriptor.
-#define DESCRIPTOR_MARKER_MAGIC 0x47444C53u // "SLDG"
 
 // Brings console slots [first, first + count), which the title may have written or copied itself,
 // to shader-visible desktop slots from `desktop_first`: the same index or a relocation.
@@ -498,6 +493,7 @@ struct ConsoleRootSignature {
     u8 user_dwords;                            // user data dwords in the desktop root constants
     u8 user_sgpr[ROOT_MAX_PARAMETERS];         // each parameter's first user SGPR
     s8 desktop_parameter[ROOT_MAX_PARAMETERS]; // root descriptors: their desktop root parameter
+    s8 shadow_parameter;                       // the descriptor shadow's root SRV, or -1 (no room)
 
     // Desktop signatures that also carry pipelines' inline samplers: one per distinct set of sampler
     // sets, found by hash and told apart by the sets themselves (kept flattened, see
