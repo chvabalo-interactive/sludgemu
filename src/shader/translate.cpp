@@ -2,6 +2,7 @@
 
 #include "shader/translate.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -424,10 +425,26 @@ static void clear_spill(const Translator& t, TagState& s, const RdnaOperand& o, 
 
 static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx);
 
-// Whether a float operand is 8.0 at translation time (8.0 is no inline constant: a literal or an SGPR).
-static bool eight_f32(const TagState& s, const RdnaOperand& o) {
-    u32 value;
-    return !o.abs && !o.neg && o.kind != OPND_INLINE && constant_of(s, o, 0, &value) && value == 0x41000000u;
+// The value of a float operand known at translation time (literals, inline constants, SGPRs and
+// VGPRs holding constants), without modifiers.
+static bool float_constant(const TagState& s, const RdnaOperand& o, f32* value) {
+    u32 bits;
+    if (o.abs || o.neg || !eval_const_u32(s, o, TYPE_32, 0, &bits))
+        return false;
+    memcpy(value, &bits, sizeof(bits));
+    return true;
+}
+
+// Cube array faces are index * 8 + face. A variable index is folded in by a multiply-add with 8.0; a
+// constant one by adding index * 8 (0 included: the compiler keeps the add).
+static bool cube_index_scale(const TagState& s, const RdnaOperand& o) {
+    f32 v;
+    return float_constant(s, o, &v) && v == 8.0f;
+}
+
+static bool cube_index_offset(const TagState& s, const RdnaOperand& o) {
+    f32 v;
+    return float_constant(s, o, &v) && v >= 0.0f && v < 16777216.0f && v == 8.0f * floorf(v / 8.0f);
 }
 
 void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx) {
@@ -506,7 +523,17 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
         // index * 8 + face: the face of a cube in a cube array, as cube sampling takes it.
         bool accumulate = in.op == OP_V_FMAC_F32 || in.op == OP_V_MAC_F32;
         Tag addend = accumulate ? tag_of(s, in.dst[0]) : tag_of(s, in.src[2]);
-        bool cube = tag_kind(addend) == TAG_CUBE_FACE && (eight_f32(s, in.src[0]) || eight_f32(s, in.src[1]));
+        bool cube = tag_kind(addend) == TAG_CUBE_FACE &&
+                    (cube_index_scale(s, in.src[0]) || cube_index_scale(s, in.src[1]));
+        clear_spill(t, s, in.dst[0], 0);
+        set_tag(s, in.dst[0], 0, cube ? make_tag(TAG_CUBE_FACE, 1) : TAG_NONE);
+        set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
+        return;
+    }
+    case OP_V_ADD_F32: {
+        // Constant index * 8 + face (see cube_index_offset).
+        bool cube = (tag_kind(tag_of(s, in.src[0])) == TAG_CUBE_FACE && cube_index_offset(s, in.src[1])) ||
+                    (tag_kind(tag_of(s, in.src[1])) == TAG_CUBE_FACE && cube_index_offset(s, in.src[0]));
         clear_spill(t, s, in.dst[0], 0);
         set_tag(s, in.dst[0], 0, cube ? make_tag(TAG_CUBE_FACE, 1) : TAG_NONE);
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
