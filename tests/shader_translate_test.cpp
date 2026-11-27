@@ -2,6 +2,7 @@
 // static analysis makes of them (samplers built from constants, descriptors moved through register
 // swaps) and that what it can't place fails instead of translating wrong.
 
+#include <stdio.h>
 #include <string.h>
 
 #include "hle/d3d12/descriptor_shadow.h"
@@ -63,6 +64,18 @@ struct Asm {
         put(0xE0000000u | op << 18 | 1u << 12);
         put(ZERO << 24 | (srsrc / 4) << 16 | vdata << 8 | vaddr);
     }
+    // An indexed buffer access (the index in `vaddr`), returning the old value for atomics.
+    void mubuf_idxen(u32 op, u32 vdata, u32 vaddr, u32 srsrc) {
+        put(0xE0000000u | op << 18 | 1u << 14 | 1u << 13);
+        put(ZERO << 24 | (srsrc / 4) << 16 | vdata << 8 | vaddr);
+    }
+    // A global load from the 64-bit address in v[vaddr:vaddr+1].
+    void global_load(u32 op, u32 vdst, u32 vaddr, u32 offset) {
+        put(0xDC000000u | op << 18 | 2u << 14 | (offset & 0xFFF));
+        put(vdst << 24 | NUL << 16 | vaddr);
+    }
+    void vop1(u32 op, u32 vdst, u32 s0) { put(0x7E000000u | vdst << 17 | op << 9 | s0); }
+    void vop2(u32 op, u32 vdst, u32 s0, u32 vsrc1) { put(op << 25 | vdst << 17 | vsrc1 << 9 | s0); }
     void end() { sopp(1, 0); }
 };
 
@@ -70,6 +83,7 @@ struct Asm {
 enum : u32 {
     SOP2_ADD_U32 = 0,
     SOP2_AND_B32 = 14,
+    SOP2_LSHL_B32 = 30,
     SOP2_OR_B32 = 16,
     SOP2_XOR_B32 = 18,
     SOP2_XOR_B64 = 19,
@@ -90,6 +104,13 @@ enum : u32 {
     SOPC_CMP_EQ_U32 = 6,
     SOPP_CBRANCH_SCC0 = 4,
     MUBUF_LOAD_DWORD = 12,
+    MUBUF_STORE_DWORD = 28,
+    MUBUF_ATOMIC_ADD = 50,
+    MIMG_STORE = 8,
+    GLOBAL_LOAD_DWORD = 12,
+    VOP1_MOV_B32 = 1,
+    VOP2_LSHLREV_B32 = 26,
+    VOP2_ADD_NC_U32 = 37,
     VOP3_READLANE = 0x360,
     VOP3_WRITELANE = 0x361,
 };
@@ -149,7 +170,10 @@ static bool translate(const Asm& a, const ShaderInfo& info) {
 }
 
 static bool error_has(const char* text) {
-    return strstr(g_out.error, text) != nullptr;
+    bool found = strstr(g_out.error, text) != nullptr;
+    if (!found)
+        printf("  the error was: %s\n", g_out.error);
+    return found;
 }
 
 static bool hlsl_has(const char* text) {
@@ -413,13 +437,23 @@ static void test_swapped_heap_sampler() {
 // --- descriptors changed after loading ------------------------------------------------------------------
 
 // Translated code keeps a loaded descriptor's heap address only, so what changes a descriptor (or puts
-// one together) must fail rather than read the unchanged one.
+// one together) must fail rather than read the unchanged one. Reading a dword the descriptor shadow
+// doesn't hold (samplers', images') as a value fails where it is read.
 static void test_changed_descriptors() {
     ShaderInfo info = compute_info();
     {
         Asm a = {};
         load_descriptors(a, true);
         a.sop2(SOP2_AND_B32, 18, 18, LIT, 0xFFFFF000u); // a LOD bias override
+        sample(a, 16);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("sampler descriptor dword read as a value"));
+    }
+    {
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sop2(SOP2_LSHL_B32, 18, 0, ZERO + 1); // a value from elsewhere
         sample(a, 16);
         a.end();
         CHECK(!translate(a, info));
@@ -440,7 +474,7 @@ static void test_changed_descriptors() {
         load_descriptors(a, true);
         a.sopc(SOPC_CMP_EQ_U32, 0, ZERO);
         a.sopp(SOPP_CBRANCH_SCC0, 1);
-        a.sop2(SOP2_OR_B32, 18, 18, 18);
+        a.sop2(SOP2_LSHL_B32, 18, 0, ZERO + 1);
         sample(a, 16);
         a.end();
         CHECK(!translate(a, info));
@@ -450,6 +484,15 @@ static void test_changed_descriptors() {
         Asm a = {};
         load_descriptors(a, true);
         a.sop2(SOP2_OR_B32, 13, 13, LIT, 0x1000u);
+        sample(a, 16);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("image descriptor dword read as a value"));
+    }
+    {
+        Asm a = {};
+        load_descriptors(a, true);
+        a.sop2(SOP2_LSHL_B32, 13, 0, ZERO + 1);
         sample(a, 16);
         a.end();
         CHECK(!translate(a, info));
@@ -485,7 +528,8 @@ static void test_changed_descriptors() {
         sample(a, 16);
         a.end();
         CHECK(translate(a, info) == (same != 0));
-        CHECK(same ? hlsl_has("SamplerDescriptorHeap[s16 >> 4]") : error_has("sampler of unknown origin"));
+        CHECK(same ? hlsl_has("SamplerDescriptorHeap[s16 >> 4]")
+                   : error_has("sampler loaded on some paths only"));
     }
     // Buffers: a raw view ignores a new record count, not a moved base address.
     for (u32 moved = 0; moved < 2; moved++) {
@@ -512,6 +556,148 @@ static void test_changed_descriptors() {
         a.end();
         CHECK(!translate(a, info));
         CHECK(error_has("through a descriptor's address"));
+    }
+}
+
+// --- view kinds by use ---------------------------------------------------------------------------------
+
+// Loads the buffer descriptor at slot `slot` of the resource table into s[8:11].
+static void load_buffer_descriptor(Asm& a, u32 slot) {
+    a.sop1(SOP1_MOV_B32, 2, 0);
+    a.sop1(SOP1_MOV_B32, 3, ZERO);
+    a.smem(SMEM_LOAD_DWORDX4, 8, 2, slot * 32);
+}
+
+static const char k_shadow_kind_branch[] = "if (g_descriptor_info.Load((s8 & ~31u) + 16u) == 2u) {";
+
+// Root signature ranges don't decide what a slot holds: what the program does through it does, and a
+// slot it only reads takes the kind the descriptor shadow records.
+static void test_view_kinds() {
+    ShaderInfo info = compute_info();
+    info.parameters[0].ranges[0] = {RANGE_CBV, 0, ~0u}; // labels that don't fit the use
+    {
+        // An atomic through a slot labeled as a constant buffer: an unordered access view, indexed with
+        // the stride the descriptor holds.
+        Asm a = {};
+        load_buffer_descriptor(a, 10);
+        a.mubuf_idxen(MUBUF_ATOMIC_ADD, 6, 5, 8);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("RWByteAddressBuffer b_ = ResourceDescriptorHeap[(s8 >> 5)];"));
+        CHECK(hlsl_has("uint a_ = v5 * ((g_descriptor_info.Load(s9) >> 16) & 0x3fffu)"));
+        CHECK(hlsl_has("InterlockedAdd(a_, v6, o_)"));
+        CHECK(hlsl_has("ByteAddressBuffer g_descriptor_info : register(t0, space101);"));
+        CHECK(!hlsl_has(k_shadow_kind_branch));
+    }
+    {
+        // Read and written: read through the same unordered access view.
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.mubuf_offen(MUBUF_LOAD_DWORD, 4, 0, 8);
+        a.mubuf_offen(MUBUF_STORE_DWORD, 4, 0, 8);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("RWByteAddressBuffer b_"));
+        CHECK(!hlsl_has("    ByteAddressBuffer b_"));
+        CHECK(!hlsl_has(k_shadow_kind_branch));
+    }
+    {
+        // Only read: either view, by the slot's kind in the shadow.
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.mubuf_offen(MUBUF_LOAD_DWORD, 4, 0, 8);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has(k_shadow_kind_branch));
+        CHECK(hlsl_has("RWByteAddressBuffer b_"));
+        CHECK(hlsl_has("    ByteAddressBuffer b_"));
+    }
+    {
+        // Another slot written doesn't decide this one.
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.sop1(SOP1_MOV_B32, 4, 0);
+        a.sop1(SOP1_MOV_B32, 5, ZERO);
+        a.smem(SMEM_LOAD_DWORDX4, 12, 4, 32);
+        a.mubuf_offen(MUBUF_STORE_DWORD, 4, 0, 12);
+        a.mubuf_offen(MUBUF_LOAD_DWORD, 4, 0, 8);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has(k_shadow_kind_branch));
+    }
+    {
+        // Sampled through and written: no desktop view does both.
+        Asm a = {};
+        load_descriptors(a, true);
+        sample(a, 16);
+        a.mimg(MIMG_STORE, 0, 0, 8, 0, 0xF);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("both writes and samples"));
+    }
+}
+
+// --- descriptor bits as values -------------------------------------------------------------------------
+
+// Translated code holds the heap addresses of loaded descriptor dwords; reading one as a value reads the
+// descriptor shadow there, and what is computed from it is a plain value.
+static void test_descriptor_values() {
+    ShaderInfo info = compute_info();
+    {
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.sop2(SOP2_AND_B32, 20, 10, LIT, 0x1FFFFu); // the record count
+        a.sop2(SOP2_ADD_U32, 21, 20, ZERO + 1);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("(g_descriptor_info.Load(s10) & 0x0001ffffu)"));
+        CHECK(!hlsl_has("Load(s20)")); // s20 holds the value itself
+    }
+    {
+        // Image descriptors' bits aren't in the shadow.
+        Asm a = {};
+        load_descriptors(a, false);
+        a.sop2(SOP2_AND_B32, 20, 10, LIT, 0x3FFFu);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("image descriptor dword read as a value"));
+    }
+    {
+        // A descriptor picked per lane: the address is the table's plus a scaled index, with a high
+        // dword of zero (heaps are below 4 GiB), read from the shadow lane by lane.
+        Asm a = {};
+        a.vop2(VOP2_LSHLREV_B32, 2, ZERO + 5, 0);
+        a.vop1(VOP1_MOV_B32, 3, ZERO);
+        a.vop2(VOP2_ADD_NC_U32, 2, 0, 2);
+        a.global_load(GLOBAL_LOAD_DWORD, 4, 2, 8);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("if (EXEC) v4 = g_descriptor_info.Load(v2 + 0x8u);"));
+    }
+    {
+        // The second half of a slot is an image descriptor's dwords 4-7.
+        Asm a = {};
+        a.vop2(VOP2_LSHLREV_B32, 2, ZERO + 5, 0);
+        a.vop1(VOP1_MOV_B32, 3, ZERO);
+        a.vop2(VOP2_ADD_NC_U32, 2, 0, 2);
+        a.global_load(GLOBAL_LOAD_DWORD, 4, 2, 20);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("image descriptor dwords 4-7"));
+    }
+    {
+        // A dword loaded on one path and a value on the other, read after they join: the path holding
+        // the address reads the dword before it jumps.
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.sopc(SOPC_CMP_EQ_U32, 0, ZERO);
+        a.sopp(SOPP_CBRANCH_SCC0, 1);
+        a.sop1(SOP1_MOV_B32, 10, ZERO + 7);
+        a.sop2(SOP2_AND_B32, 20, 10, LIT, 0x1FFFFu);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("s10 = g_descriptor_info.Load(s10);"));
+        CHECK(hlsl_has("(s10 & 0x0001ffffu)"));
     }
 }
 
@@ -576,6 +762,8 @@ void test_shader_translate() {
     test_sampler_decoding();
     test_swapped_heap_sampler();
     test_changed_descriptors();
+    test_view_kinds();
+    test_descriptor_values();
     test_descriptor_shadow_records();
     g_out.hlsl.release();
 }

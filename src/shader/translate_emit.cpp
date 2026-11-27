@@ -107,13 +107,41 @@ static const char* operand_u32(Translator& t, const RdnaOperand& o, OperandType 
     }
 }
 
+const char* register_data(Translator& t, Tag tag, const char* raw) {
+    if (!heap_loaded(tag) || t.copying)
+        return raw;
+    u32 payload = tag_payload(tag);
+    if (payload & HEAP_MODIFIED)
+        translator_fail(t, "register read as a value at 0x%x holds a descriptor dword on some paths only",
+                        t.inst_offset);
+    else if ((payload & 1) == HEAP_SAMPLERS)
+        translator_fail(t, "sampler descriptor dword read as a value at 0x%x", t.inst_offset);
+    else if (payload & HEAP_IMAGE)
+        translator_fail(t, "image descriptor dword read as a value at 0x%x (the shadow has buffers' only)",
+                        t.inst_offset);
+    // The shadow lays out each desktop slot's descriptor bits like console heap memory: the dword at
+    // heap byte address A is word A of it.
+    t.needs_descriptor_info = true;
+    return fmt(t, "g_descriptor_info.Load(%s)", raw);
+}
+
+// The tag of a register operand (dword `part`), TAG_NONE for anything else.
+static Tag operand_tag(const Translator& t, const RdnaOperand& o, u32 part) {
+    if (o.kind == OPND_SGPR ||
+        (o.kind == OPND_SPECIAL && o.reg + part >= SRC_VCC_LO && o.reg + part <= SRC_VCC_HI))
+        return t.tags.sgpr[(o.reg + part) & 127];
+    if (o.kind == OPND_VGPR)
+        return t.tags.vgpr[(o.reg + part) & 255];
+    return TAG_NONE;
+}
+
 const char* src_u32(Translator& t, const RdnaInst& in, u32 i, OperandType type, u32 part) {
     if (t.dpp_active && i == 0 && part == 0)
         return "dpp0_";
     const RdnaOperand& o = in.src[i];
     if (o.kind == OPND_SPECIAL && (o.reg == SRC_VCC_LO || o.reg == SRC_EXEC_LO))
         t.sgpr_used[o.reg] = 1;
-    const char* value = operand_u32(t, o, type, part);
+    const char* value = register_data(t, operand_tag(t, o, part), operand_u32(t, o, type, part));
     if (in.has_sdwa && i < 2 && in.sdwa.src_sel[i] != SDWA_DWORD) {
         u32 sel = in.sdwa.src_sel[i];
         u32 shift = sel <= SDWA_BYTE_3 ? sel * 8 : (sel - SDWA_WORD_0) * 16;
@@ -420,6 +448,8 @@ static void emit_block(Translator& t, u32 b) {
     t.tags = t.block_entry[b];
     for (u32 i = blk.first; i < blk.end && !t.failed; i++) {
         const RdnaInst& in = t.program.insts[i];
+        t.inst_offset = in.offset;
+        t.copying = copies_tags(t, in, i);
         emit_instruction(t, in);
         tags_transfer(t, t.tags, in, i);
     }
@@ -451,6 +481,37 @@ static const char* branch_condition(Translator& t, const RdnaInst& in) {
 
 #define PC_EXIT 0xFFFFFFFFu
 
+// Scalar registers that hold a loaded descriptor dword's address at the end of a block but a value where
+// block `next` starts (another way in holds a value there, see tags_merge): read from the shadow before
+// the jump. With `emitting` false, only whether there are any.
+static bool emit_join_conversions(Translator& t, s32 next, bool emitting) {
+    if (next < 0)
+        return false;
+    const TagState& entry = t.block_entry[next];
+    bool any = false;
+    const u64* live = &t.live_sgprs[2 * next];
+    for (u32 r = 0; r < 128; r++) {
+        if (!join_converts(t.tags.sgpr[r]) || heap_loaded(entry.sgpr[r]) || !((live[r / 64] >> (r % 64)) & 1))
+            continue;
+        any = true;
+        if (emitting) {
+            t.needs_descriptor_info = true;
+            emit(t, "%s = g_descriptor_info.Load(%s);", sgpr(t, r), sgpr(t, r));
+        }
+    }
+    for (u32 slot = 0; slot < t.spill_vgpr_count; slot++)
+        for (u32 lane = 0; lane < 64; lane++) {
+            if (!join_converts(t.tags.spill_tag[slot][lane]) || heap_loaded(entry.spill_tag[slot][lane]))
+                continue;
+            any = true;
+            if (emitting) {
+                t.needs_descriptor_info = true;
+                emit(t, "spill%u_%u = g_descriptor_info.Load(spill%u_%u);", slot, lane, slot, lane);
+            }
+        }
+    return any;
+}
+
 // Several blocks: a loop over a switch on the block number. Branch conditions are uniform, so the
 // whole wave always takes the same case.
 static void emit_blocks(Translator& t) {
@@ -470,10 +531,29 @@ static void emit_blocks(Translator& t) {
         const Block& blk = p.blocks[b];
         const RdnaInst& last = p.insts[blk.end - 1];
         u32 next0 = blk.next[0] < 0 ? PC_EXIT : (u32)blk.next[0];
-        if (blk.next[1] >= 0)
+        bool convert0 = emit_join_conversions(t, blk.next[0], false);
+        bool convert1 = emit_join_conversions(t, blk.next[1], false);
+        if (blk.next[1] >= 0 && (convert0 || convert1)) {
+            emit(t, "{ bool taken_ = %s;", branch_condition(t, last));
+            t.depth++;
+            emit(t, "if (taken_) {");
+            t.depth++;
+            emit_join_conversions(t, blk.next[0], true);
+            t.depth--;
+            emit(t, "} else {");
+            t.depth++;
+            emit_join_conversions(t, blk.next[1], true);
+            t.depth--;
+            emit(t, "}");
+            emit(t, "pc = taken_ ? %uu : %uu;", next0, (u32)blk.next[1]);
+            t.depth--;
+            emit(t, "}");
+        } else if (blk.next[1] >= 0) {
             emit(t, "pc = %s ? %uu : %uu;", branch_condition(t, last), next0, (u32)blk.next[1]);
-        else
+        } else {
+            emit_join_conversions(t, blk.next[0], true);
             emit(t, "pc = %uu;", next0);
+        }
         emit(t, "break;");
         t.depth--;
         emit(t, "}");
@@ -693,7 +773,8 @@ static void write_declarations(Translator& t, Text& h) {
         h.put("0u};\n");
     }
     if (t.needs_descriptor_info)
-        h.put("ByteAddressBuffer g_descriptor_info : register(t0, space101);\n");
+        h.put("ByteAddressBuffer g_descriptor_info : register(t0, space%d);\n",
+              SHADER_DESCRIPTOR_SHADOW_SPACE);
     for (u32 i = 0; i < t.out->sampler_count; i++)
         h.put("%s g_sampler%u : register(s%u, space%d);\n",
               t.sampler_compare & (1u << i) ? "SamplerComparisonState" : "SamplerState", i, i,

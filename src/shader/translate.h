@@ -15,10 +15,14 @@
 //   descriptor, divided by the slot size, is its desktop heap index. Registers loaded from the heap
 //   hold the byte address of each dword instead of descriptor bits, so translation fails where a
 //   program changes a loaded descriptor or puts one together (except buffer descriptor fields a raw
-//   desktop view ignores).
+//   desktop view ignores). Where a program reads a descriptor's dwords as values, translated code
+//   reads them from the descriptor shadow (below) at that address.
 // - The descriptor shadow: a buffer laid out like console resource heap memory, one 32-byte record per
 //   desktop heap slot holding the console descriptor's first four dwords (buffer descriptors whole)
-//   and the kind of the desktop view in the slot.
+//   and the kind of the desktop view in the slot. Root signature ranges don't say reliably what a slot
+//   holds (titles label them loosely, and console hardware never looks), so a program's own accesses
+//   decide: a slot written through is an unordered access view, one sampled through a shader resource
+//   view, and one only read takes the kind the shadow records.
 // - Root descriptors (buffer addresses in user data) become desktop root SRVs/UAVs read as raw
 //   buffers; registers holding their high address dword are tracked statically.
 // - Vertex fetches (loads through the vertex buffer table) become desktop input assembler inputs.

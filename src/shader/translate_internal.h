@@ -36,19 +36,24 @@ enum TagKind : u16 {
 
 // TAG_HEAP payload bits:
 //   bit 0      which heap (HEAP_RESOURCES or HEAP_SAMPLERS)
-//   bits 1-6   the root parameter of the table the address is in (0x3F: a directly indexed heap)
+//   bits 1-6   the root parameter of the table the address is in (0x3F: a directly indexed heap, or
+//              a table not known)
 //   bit 7      HEAP_LOADED: a descriptor dword loaded from the heap (translated code holds its byte
 //              address), as opposed to a table address. Arithmetic on table addresses indexes the table;
-//              on loaded dwords it changes the descriptor, which translated code can't follow.
-//   bit 8      HEAP_MODIFIED: a loaded dword some arithmetic changed (set only with HEAP_LOADED)
-//   bits 9-11  free
-// The bits travel with the tag through moves, spills and swaps; joins of tags that differ only in
-// HEAP_MODIFIED keep it (see tags_merge).
+//              reading a loaded dword as a value reads the descriptor shadow at that address instead
+//              (see register_data), and the result is a plain value.
+//   bit 8      HEAP_MODIFIED: the register holds a loaded dword's address on some paths only (set only
+//              with HEAP_LOADED, by joins): neither a descriptor nor a value translated code can use
+//   bit 9      HEAP_IMAGE: (on some path) a dword of an image descriptor, whose bits the shadow
+//              doesn't hold: loaded 8 or more at a time, or from the second half of a 32-byte slot
+//   bits 10-11 free
+// The bits travel with the tag through moves, spills and swaps (see tags_merge for joins).
 enum : u16 {
     HEAP_RESOURCES = 0,
     HEAP_SAMPLERS = 1,
     HEAP_LOADED = 0x80,
     HEAP_MODIFIED = 0x100,
+    HEAP_IMAGE = 0x200,
 };
 
 inline Tag make_tag(TagKind kind, u32 payload) {
@@ -130,6 +135,20 @@ struct PcPool {
     u32 dwords;
 };
 
+// What a program does with the descriptor at a known place in a table (see find_slot_uses).
+enum : u8 {
+    SLOT_WRITTEN = 1, // stores or atomics through it: it must be an unordered access view
+    SLOT_SAMPLED = 2, // sampled through it: it must be a shader resource view
+};
+
+struct SlotUse {
+    u8 parameter;
+    u8 flags;
+    u16 index;
+};
+
+#define SHADER_MAX_SLOT_USES 64
+
 struct Translator {
     const ShaderInfo* info;
     TranslatedShader* out;
@@ -138,7 +157,10 @@ struct Translator {
     Program program;
     TagState* block_entry; // tags at each block's start
     u8* xor_swap_role;     // per-instruction: 1 = start of 3-xor swap, 2 = swap continuation
+    u64* live_sgprs;       // per block, two words: scalar registers live at its start
     TagState tags;         // tags before the instruction being emitted
+    u32 inst_offset;       // the instruction being emitted, for messages
+    bool copying;          // it copies registers as they are (copies_tags): descriptor addresses too
     Text body;             // the program's statements; declarations are written around them
     u32 depth;             // indentation of emitted statements
     bool failed;
@@ -169,6 +191,10 @@ struct Translator {
     u8 spill_vgpr_count;
     u8 spill_slot[256];
     u64 spill_lanes[SHADER_MAX_SPILL_VGPRS];
+    // Descriptors at known places that the program writes or samples through (find_slot_uses); with
+    // more than fit, the rest count as unknown.
+    SlotUse slot_uses[SHADER_MAX_SLOT_USES];
+    u32 slot_use_count;
 
     // Scratch strings for operand expressions (a ring: an expression stays valid for a while).
     char ring[32][320];
@@ -185,6 +211,19 @@ enum OperandType : u8 {
 void translator_fail(Translator& t, const char* format, ...);
 void detect_wave_size(Translator& t);
 void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx = ~0u);
+// Whether an instruction copies register values as they are, so that its results keep their sources'
+// tags (moves, spills, recognized swaps). Everything else computes values: its sources are read as
+// values (register_data). tags_transfer and emission both decide by this.
+bool copies_tags(const Translator& t, const RdnaInst& in, u32 inst_idx);
+// Whether a scalar register holding a loaded descriptor dword on one path into a block only becomes a
+// value there: the path reads the dword from the descriptor shadow as it jumps (see tags_merge).
+bool join_converts(Tag tag);
+// A register read as a value by the instruction being emitted: `raw` (its HLSL variable), or, for a
+// loaded descriptor dword (which translated code holds the heap address of), the dword from the
+// descriptor shadow. Fails translation where neither is the register's value.
+const char* register_data(Translator& t, Tag tag, const char* raw);
+// Records which descriptors at known places the program writes or samples through. translate_memory.cpp
+void find_slot_uses(Translator& t);
 // A v_readlane/v_writelane lane operand known at translation time (a literal or inline integer), in the
 // wave's lane range.
 bool constant_lane(const Translator& t, const RdnaOperand& o, u32* lane);

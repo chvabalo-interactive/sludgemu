@@ -10,6 +10,11 @@ static const char* src(Translator& t, const RdnaInst& in, u32 i, u32 part = 0) {
     return src_u32(t, in, i, TYPE_32, part);
 }
 
+// The destination register's old value, which accumulating and half-writing instructions read.
+static const char* dst_value(Translator& t, const RdnaInst& in) {
+    return register_data(t, t.tags.vgpr[in.dst[0].reg & 255], vgpr(t, in.dst[0].reg));
+}
+
 static const char* src64(Translator& t, const RdnaInst& in, u32 i) {
     return fmt(t, "((uint64_t)%s | ((uint64_t)%s << 32))", src(t, in, i, 0), src(t, in, i, 1));
 }
@@ -259,10 +264,11 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
         break;
     case OP_S_ADDK_I32:
         emit(t, "{ uint a_ = %s, b_ = 0x%08xu, r_ = a_ + b_; scc = ((~(a_ ^ b_)) & (a_ ^ r_)) >> 31 != 0u;",
-             sgpr(t, d.reg), (u32)in.simm16);
+             register_data(t, t.tags.sgpr[d.reg & 127], sgpr(t, d.reg)), (u32)in.simm16);
         break;
     case OP_S_MULK_I32:
-        emit(t, "{ uint r_ = %s * 0x%08xu;", sgpr(t, d.reg), (u32)in.simm16);
+        emit(t, "{ uint r_ = %s * 0x%08xu;", register_data(t, t.tags.sgpr[d.reg & 127], sgpr(t, d.reg)),
+             (u32)in.simm16);
         break;
     case OP_S_MIN_I32:
     case OP_S_MAX_I32:
@@ -595,7 +601,7 @@ static void vfloat(Translator& t, const RdnaInst& in, const char* value) {
 // A 16-bit float result: low half, or the high half with op_sel bit 3; the other half is kept.
 static void vhalf(Translator& t, const RdnaInst& in, const char* value) {
     const char* v = in.clamp ? fmt(t, "saturate(%s)", value) : value;
-    const char* dst = vgpr(t, in.dst[0].reg);
+    const char* dst = dst_value(t, in);
     if (in.op_sel & 8)
         vwrite(t, in, fmt(t, "((%s & 0xffffu) | (f32tof16(%s) << 16))", dst, v));
     else
@@ -604,7 +610,7 @@ static void vhalf(Translator& t, const RdnaInst& in, const char* value) {
 
 // A 16-bit integer result: low half, or the high half with op_sel bit 3; the other half is kept.
 static void vhalf_u16(Translator& t, const RdnaInst& in, const char* value) {
-    const char* dst = vgpr(t, in.dst[0].reg);
+    const char* dst = dst_value(t, in);
     if (in.op_sel & 8)
         vwrite(t, in, fmt(t, "((%s & 0xffffu) | ((%s & 0xffffu) << 16))", dst, value));
     else
@@ -832,12 +838,11 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
         return true;
     case OP_V_FMAC_F32:
     case OP_V_MAC_F32:
-        vfloat(t, in, fmt(t, "mad(%s, %s, asfloat(%s))", f(t, in, 0), f(t, in, 1), vgpr(t, in.dst[0].reg)));
+        vfloat(t, in, fmt(t, "mad(%s, %s, asfloat(%s))", f(t, in, 0), f(t, in, 1), dst_value(t, in)));
         return true;
     case OP_V_FMAC_LEGACY_F32:
-        vfloat(
-            t, in,
-            fmt(t, "(mul_legacy(%s, %s) + asfloat(%s))", f(t, in, 0), f(t, in, 1), vgpr(t, in.dst[0].reg)));
+        vfloat(t, in,
+               fmt(t, "(mul_legacy(%s, %s) + asfloat(%s))", f(t, in, 0), f(t, in, 1), dst_value(t, in)));
         return true;
     case OP_V_FMA_F32:
     case OP_V_MAD_F32:
@@ -1275,7 +1280,7 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
         vhalf(t, in, fmt(t, "mad(%s, %s, %s)", h(t, in, 0), h(t, in, 1), h(t, in, 2)));
         return true;
     case OP_V_FMAC_F16: {
-        const char* acc = fmt(t, "f16tof32(%s)", vgpr(t, in.dst[0].reg));
+        const char* acc = fmt(t, "f16tof32(%s)", dst_value(t, in));
         vhalf(t, in, fmt(t, "mad(%s, %s, %s)", h(t, in, 0), h(t, in, 1), acc));
         return true;
     }
@@ -1420,7 +1425,7 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
     case OP_V_PK_FMAC_F16: {
         const char* a = pk_f16_pair(t, in, 0);
         const char* b = pk_f16_pair(t, in, 1);
-        const char* d = vgpr(t, in.dst[0].reg);
+        const char* d = dst_value(t, in);
         emit(t, "{ uint a_ = %s, b_ = %s, d_ = %s;", a, b, d);
         t.depth++;
         emit(t, "uint lo_ = f32tof16(mad(f16tof32(a_), f16tof32(b_), f16tof32(d_)));");
@@ -1485,7 +1490,7 @@ static bool emit_vop3p(Translator& t, const RdnaInst& in) {
             fmt(t, "mad(%s, %s, %s)", mix_source(t, in, 0), mix_source(t, in, 1), mix_source(t, in, 2));
         if (in.clamp)
             v = fmt(t, "saturate(%s)", v);
-        const char* dst = vgpr(t, in.dst[0].reg);
+        const char* dst = dst_value(t, in);
         if (in.op == OP_V_FMA_MIXLO_F16)
             vwrite(t, in, fmt(t, "((%s & 0xffff0000u) | f32tof16(%s))", dst, v));
         else
@@ -1603,7 +1608,7 @@ static bool emit_vop3p(Translator& t, const RdnaInst& in) {
 }
 
 static bool begin_dpp(Translator& t, const RdnaInst& in) {
-    const char* v = vgpr(t, in.src[0].reg);
+    const char* v = register_data(t, t.tags.vgpr[in.src[0].reg & 255], vgpr(t, in.src[0].reg));
     u32 c = in.dpp.ctrl;
     const char* addr = nullptr;
     bool always_in_bounds = true;

@@ -223,9 +223,9 @@ static bool mask_source(const TagState& s, const RdnaOperand& o) {
     return is_exec(o) || tag_kind(tag_of(s, o)) == TAG_MASK;
 }
 
-// Address-like results keep their source's tag (heap offsets, root buffer high dwords). Arithmetic on
-// a loaded descriptor dword changes the descriptor: the tag stays, marked modified, and each consumer
-// decides whether it can take that.
+// Address-like results keep their source's tag (heap offsets, root buffer high dwords). A loaded
+// descriptor dword is read as its value (register_data), so arithmetic on one gives a plain value: a
+// descriptor rebuilt from such values is no longer the slot's (see descriptor_origin).
 static Tag carried(Tag a, Tag b) {
     Tag r = TAG_NONE;
     if (a != TAG_NONE && b == TAG_NONE)
@@ -234,7 +234,7 @@ static Tag carried(Tag a, Tag b) {
         r = b;
     else if (a == b)
         r = a;
-    return heap_loaded(r) ? (Tag)(r | HEAP_MODIFIED) : r;
+    return heap_loaded(r) ? TAG_NONE : r;
 }
 
 static const u32 k_const_f32[9] = {0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
@@ -447,14 +447,35 @@ static void clear_spill(const Translator& t, TagState& s, const RdnaOperand& o, 
 
 static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx);
 
-// A register's tag where two paths join: what both agree on, a heap tag modified on either path, or
-// nothing.
-static Tag merged_tag(Tag a, Tag b) {
+bool join_converts(Tag tag) {
+    return heap_loaded(tag) && (tag_payload(tag) & (1 | HEAP_MODIFIED | HEAP_IMAGE)) == HEAP_RESOURCES;
+}
+
+// A register's tag where two paths join (or where an instruction leaves either of two values): what both
+// agree on, or nothing. Loaded descriptor dwords are held as heap addresses, which must not pass for
+// values: a loaded dword on both paths stays one (of a table not known when they differ). On one path
+// only, a scalar register at a join of blocks becomes a value (`converting`: the path holding the
+// address reads the dword from the shadow at the jump, see emit_join_conversions); otherwise it is
+// marked HEAP_MODIFIED, which nothing can use.
+//
+// A dword that can't be converted (one the shadow doesn't hold, an image's or a sampler's, or one
+// already an address on some paths only) joins as a value all the same, holding its heap address on
+// that path, as before the shadow: compilers leave such dwords in registers on paths where they are
+// dead, and liveness over the block graph can't tell (exec-masked skips of a loop's body join with
+// stale registers).
+static Tag merged_tag(Tag a, Tag b, bool converting = false) {
     if (a == b)
         return a;
-    if (tag_kind(a) == TAG_HEAP && tag_kind(b) == TAG_HEAP && ((a ^ b) & ~HEAP_MODIFIED) == 0)
-        return (Tag)(a | HEAP_MODIFIED);
-    return TAG_NONE;
+    bool la = heap_loaded(a), lb = heap_loaded(b);
+    if (!la && !lb)
+        return TAG_NONE;
+    if (converting && la != lb)
+        return TAG_NONE;
+    u32 pa = la ? tag_payload(a) : 0, pb = lb ? tag_payload(b) : 0;
+    u32 payload = ((pa | pb) & 1) | (0x3F << 1) | HEAP_LOADED | ((pa | pb) & (HEAP_MODIFIED | HEAP_IMAGE));
+    if (!la || !lb || ((pa ^ pb) & 1))
+        payload |= HEAP_MODIFIED;
+    return make_tag(TAG_HEAP, payload);
 }
 
 // A conditional move (s_cmov) of a value with `tag`, `descriptor` and maybe a constant into one dword of
@@ -468,6 +489,33 @@ static void conditional_move(TagState& s, const RdnaOperand& dst, u32 part, Tag 
     set_descriptor(s, dst, part, old_descriptor == descriptor ? descriptor : NO_DESCRIPTOR);
     if (known && old_known && value == old_value)
         set_constant(s, dst, part, value);
+}
+
+// A vector move without modifiers: the value as it is.
+static bool plain_vector_move(const RdnaInst& in) {
+    return !in.has_sdwa && !in.has_dpp && !in.src[0].abs && !in.src[0].neg && !in.omod && !in.clamp;
+}
+
+bool copies_tags(const Translator& t, const RdnaInst& in, u32 inst_idx) {
+    if (inst_idx != ~0u && t.xor_swap_role && t.xor_swap_role[inst_idx])
+        return true;
+    u32 lane;
+    switch (in.op) {
+    case OP_S_MOV_B32:
+    case OP_S_CMOV_B32:
+    case OP_S_MOV_B64:
+    case OP_S_CMOV_B64:
+    case OP_V_READLANE_B32:
+        return true;
+    case OP_V_MOV_B32:
+    case OP_V_READFIRSTLANE_B32:
+        return plain_vector_move(in);
+    case OP_V_WRITELANE_B32: // into a spill slot, which keeps the tag; elsewhere one lane of a value
+        return in.dst[0].kind == OPND_VGPR && t.spill_slot[in.dst[0].reg & 255] != 0xFF &&
+               constant_lane(t, in.src[1], &lane);
+    default:
+        return false;
+    }
 }
 
 void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx) {
@@ -535,7 +583,7 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     }
     case OP_V_MOV_B32:
     case OP_V_READFIRSTLANE_B32: {
-        bool raw = !in.has_sdwa && !in.has_dpp && !in.src[0].abs && !in.src[0].neg && !in.omod && !in.clamp;
+        bool raw = plain_vector_move(in);
         u32 cv = 0;
         clear_spill(t, s, in.dst[0], 0);
         set_tag(s, in.dst[0], 0, raw ? tag_of(s, in.src[0]) : TAG_NONE);
@@ -546,17 +594,24 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
             set_any_constant(s, in.dst[0], 0, cv);
         return;
     }
-    case OP_V_SWAP_B32:
-        // Both registers change; under a partial EXEC neither holds one value, so forget both.
+    case OP_V_SWAP_B32: {
+        // Both registers change; under a partial EXEC neither holds one value, so forget both. Swapped
+        // as they are, a loaded dword's address may end up in either (see merged_tag).
+        Tag a = tag_of(s, in.dst[0]), b = tag_of(s, in.src[0]);
+        Tag either = heap_loaded(a) || heap_loaded(b) ? merged_tag(a, b) : TAG_NONE;
         clear_spill(t, s, in.dst[0], 0);
         clear_spill(t, s, in.src[0], 0);
-        set_tag(s, in.dst[0], 0, TAG_NONE);
-        set_tag(s, in.src[0], 0, TAG_NONE);
+        set_tag(s, in.dst[0], 0, either);
+        set_tag(s, in.src[0], 0, either);
         return;
+    }
     case OP_S_MOVK_I32:
         set_tag(s, in.dst[0], 0, TAG_NONE);
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
         set_constant(s, in.dst[0], 0, (u32)(s32)in.simm16);
+        return;
+    case OP_S_CMOVK_I32:
+        conditional_move(s, in.dst[0], 0, TAG_NONE, NO_DESCRIPTOR, true, (u32)(s32)in.simm16);
         return;
     case OP_S_ADDK_I32: {
         // Adds to the register in place: a constant stays one, anything else is forgotten.
@@ -738,15 +793,31 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
         u32 first = NO_DESCRIPTOR, slot = 32;
         // Loads through a loaded descriptor read the memory it points to: plain values (emission fails
         // on them).
+        bool null_soffset = in.src[1].kind == OPND_SPECIAL && in.src[1].reg == SRC_NULL;
         if (tag_kind(base) == TAG_HEAP && !heap_loaded(base)) {
             // Descriptors from the heap: each register holds its own byte address.
             result = (Tag)(base | HEAP_LOADED);
             // At a known place when loaded from the table's start with a constant offset.
             slot = (tag_payload(base) & 1) == HEAP_SAMPLERS ? 16 : 32;
             u32 at = descriptor_of(s, in.src[0]);
-            bool constant = in.src[1].kind == OPND_SPECIAL && in.src[1].reg == SRC_NULL;
-            if (at != NO_DESCRIPTOR && constant && in.mem.offset >= 0)
+            if (at != NO_DESCRIPTOR && null_soffset && in.mem.offset >= 0)
                 first = at * slot + (u32)in.mem.offset;
+            // Image descriptors, whose bits the shadow doesn't hold: what is loaded 8 dwords or more at a
+            // time, and what is in the second half of a 32-byte slot. Programs address descriptors by
+            // whole slots, so the base and a register offset are taken to be multiples of the slot size.
+            if (slot == 32) {
+                u32 soffset = 0;
+                constant_of(s, in.src[1], 0, &soffset);
+                bool image = in.dst[0].count >= 8;
+                for (u32 i = 0; i < in.dst[0].count; i++) {
+                    u32 at_byte = (u32)in.mem.offset + soffset + 4 * i;
+                    Tag tag = !image && at_byte % 32 < 16 ? result : (Tag)(result | HEAP_IMAGE);
+                    set_tag(s, in.dst[0], i, tag);
+                    set_descriptor(s, in.dst[0], i,
+                                   first == NO_DESCRIPTOR ? NO_DESCRIPTOR : (first + 4 * i) / slot);
+                }
+                return;
+            }
         } else if (tag_kind(base) == TAG_VB_TABLE && in.src[1].kind == OPND_SPECIAL &&
                    in.src[1].reg == SRC_NULL && in.mem.offset % 16 == 0)
             result = make_tag(TAG_VB_DESC, (u32)in.mem.offset / 16);
@@ -780,8 +851,8 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     }
 }
 
-static bool merge_tag(Tag& into, Tag from) {
-    Tag m = merged_tag(into, from);
+static bool merge_tag(Tag& into, Tag from, bool converting) {
+    Tag m = merged_tag(into, from, converting);
     if (m == into)
         return false;
     into = m;
@@ -801,9 +872,11 @@ static bool tags_merge(const Translator& t, TagState& into, const TagState& from
         changed = true;
     }
     for (u32 i = 0; i < 128; i++)
-        changed |= merge_tag(into.sgpr[i], from.sgpr[i]);
+        changed |= merge_tag(into.sgpr[i], from.sgpr[i], true);
+    // Vector registers aren't converted: lanes outside EXEC may hold anything, the shadow has no room
+    // for reads at stray addresses.
     for (u32 i = 0; i < 256; i++)
-        changed |= merge_tag(into.vgpr[i], from.vgpr[i]);
+        changed |= merge_tag(into.vgpr[i], from.vgpr[i], false);
     for (u32 i = 0; i < 128; i++)
         if (into.descriptor[i] != from.descriptor[i] && into.descriptor[i] != NO_DESCRIPTOR) {
             into.descriptor[i] = NO_DESCRIPTOR;
@@ -828,7 +901,7 @@ static bool tags_merge(const Translator& t, TagState& into, const TagState& from
         }
     for (u32 slot = 0; slot < t.spill_vgpr_count; slot++)
         for (u32 lane = 0; lane < 64; lane++) {
-            changed |= merge_tag(into.spill_tag[slot][lane], from.spill_tag[slot][lane]);
+            changed |= merge_tag(into.spill_tag[slot][lane], from.spill_tag[slot][lane], true);
             if (into.spill_desc[slot][lane] != from.spill_desc[slot][lane] &&
                 into.spill_desc[slot][lane] != NO_DESCRIPTOR) {
                 into.spill_desc[slot][lane] = NO_DESCRIPTOR;
@@ -1022,6 +1095,79 @@ static void find_spill_vgprs(Translator& t) {
     }
 }
 
+// Scalar registers an instruction reads and writes, as 128-bit sets. Reads err on the side of more:
+// registers read implicitly (VCC, M0) count as read by everything, and conditional or accumulating
+// scalar writes as reads too.
+static void add_registers(u64 set[2], u32 first, u32 count) {
+    for (u32 r = first; r < first + count && r < 128; r++)
+        set[r / 64] |= 1ull << (r % 64);
+}
+
+static void scalar_registers(const RdnaInst& in, u64 reads[2], u64 writes[2]) {
+    reads[0] = reads[1] = writes[0] = writes[1] = 0;
+    for (u32 k = 0; k < in.num_src; k++) {
+        const RdnaOperand& o = in.src[k];
+        if (o.kind == OPND_SGPR)
+            add_registers(reads, o.reg, o.count ? o.count : 1u);
+        else if (o.kind == OPND_SPECIAL && o.reg < 128 && o.reg != SRC_NULL)
+            add_registers(reads, o.reg, o.count > 2 ? o.count : 2u);
+    }
+    bool reads_dst = in.op == OP_S_CMOV_B32 || in.op == OP_S_CMOV_B64 || in.op == OP_S_CMOVK_I32 ||
+                     (in.enc == ENC_SOPK && in.op != OP_S_MOVK_I32);
+    for (u32 d = 0; d < 2; d++) {
+        const RdnaOperand& o = in.dst[d];
+        if (o.kind != OPND_SGPR && !(o.kind == OPND_SPECIAL && o.reg < 128 && o.reg != SRC_NULL))
+            continue;
+        add_registers(writes, o.reg, o.count ? o.count : 1u);
+        if (reads_dst)
+            add_registers(reads, o.reg, o.count ? o.count : 1u);
+    }
+    add_registers(reads, SRC_VCC_LO, 2);
+    add_registers(reads, SRC_M0, 1);
+}
+
+// Scalar registers live where each block starts (read before written on some path from there), which
+// tells joins what is worth converting (see emit_join_conversions). Everything, where the program
+// picks registers at run time.
+static bool find_live_sgprs(Translator& t) {
+    const Program& p = t.program;
+    t.live_sgprs = (u64*)calloc((usize)p.block_count * 2, sizeof(u64));
+    if (!t.live_sgprs)
+        return false;
+    for (u32 i = 0; i < p.count; i++) {
+        if (picks_registers_at_run_time(p.insts[i].op)) {
+            memset(t.live_sgprs, 0xFF, (usize)p.block_count * 2 * sizeof(u64));
+            return true;
+        }
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (u32 b = p.block_count; b-- > 0;) {
+            u64 live[2] = {0, 0};
+            for (u32 k = 0; k < 2; k++) {
+                s32 n = p.blocks[b].next[k];
+                if (n >= 0) {
+                    live[0] |= t.live_sgprs[2 * n];
+                    live[1] |= t.live_sgprs[2 * n + 1];
+                }
+            }
+            for (u32 i = p.blocks[b].end; i-- > p.blocks[b].first;) {
+                u64 reads[2], writes[2];
+                scalar_registers(p.insts[i], reads, writes);
+                for (u32 w = 0; w < 2; w++)
+                    live[w] = (live[w] & ~writes[w]) | reads[w];
+            }
+            for (u32 w = 0; w < 2; w++) {
+                if (live[w] != t.live_sgprs[2 * b + w]) {
+                    t.live_sgprs[2 * b + w] = live[w];
+                    changed = true;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static bool analyze_tags(Translator& t) {
     Program& p = t.program;
     find_spill_vgprs(t);
@@ -1062,7 +1208,7 @@ static bool analyze_tags(Translator& t) {
         }
     }
     free(reached);
-    return true;
+    return find_live_sgprs(t);
 }
 
 // --- driver ------------------------------------------------------------------------------------------
@@ -1083,6 +1229,7 @@ static void release(Translator& t) {
     free(t.program.block_of);
     free(t.block_entry);
     free(t.xor_swap_role);
+    free(t.live_sgprs);
     t.body.release();
 }
 
@@ -1102,6 +1249,8 @@ bool shader_translate(const void* code, u32 size, const ShaderInfo& info, Transl
         detect_wave_size(t);
         ok = analyze_tags(t);
     }
+    if (ok)
+        find_slot_uses(t);
     if (ok) {
         emit_program(t);
         ok = !t.failed && !t.body.failed && !out->hlsl.failed;
