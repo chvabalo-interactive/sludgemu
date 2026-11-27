@@ -31,6 +31,32 @@ static bool ends_program(RdnaOp op) {
     return op == OP_S_ENDPGM || op == OP_S_ENDPGM_SAVED || op == OP_S_ENDPGM_ORDERED_PS_DONE;
 }
 
+// SOPK instructions whose register the decoder gives as the destination although they only read it.
+static bool destination_only_read(RdnaOp op) {
+    switch (op) {
+    case OP_S_CMPK_EQ_I32:
+    case OP_S_CMPK_LG_I32:
+    case OP_S_CMPK_GT_I32:
+    case OP_S_CMPK_GE_I32:
+    case OP_S_CMPK_LT_I32:
+    case OP_S_CMPK_LE_I32:
+    case OP_S_CMPK_EQ_U32:
+    case OP_S_CMPK_LG_U32:
+    case OP_S_CMPK_GT_U32:
+    case OP_S_CMPK_GE_U32:
+    case OP_S_CMPK_LT_U32:
+    case OP_S_CMPK_LE_U32:
+    case OP_S_SETREG_B32:
+    case OP_S_WAITCNT_VSCNT:
+    case OP_S_WAITCNT_VMCNT:
+    case OP_S_WAITCNT_EXPCNT:
+    case OP_S_WAITCNT_LGKMCNT:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // A jump to a place known at translation time: the SOPP branches, and s_setpc_b64 long branches, whose
 // targets decode_program resolves (see long_branch_target).
 static bool is_jump(const RdnaInst& in) {
@@ -645,6 +671,8 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
         if (role == 2)
             return;
     }
+    if (destination_only_read(in.op))
+        return;
     switch (in.op) {
     case OP_S_MOV_B32:
     case OP_S_CMOV_B32: {
@@ -693,24 +721,6 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     case OP_S_CMOVK_I32:
         conditional_move(s, in.dst[0], 0, TAG_NONE, NO_DESCRIPTOR, true, (u32)(s32)in.simm16);
         return;
-    case OP_S_CMPK_EQ_I32:
-    case OP_S_CMPK_LG_I32:
-    case OP_S_CMPK_GT_I32:
-    case OP_S_CMPK_GE_I32:
-    case OP_S_CMPK_LT_I32:
-    case OP_S_CMPK_LE_I32:
-    case OP_S_CMPK_EQ_U32:
-    case OP_S_CMPK_LG_U32:
-    case OP_S_CMPK_GT_U32:
-    case OP_S_CMPK_GE_U32:
-    case OP_S_CMPK_LT_U32:
-    case OP_S_CMPK_LE_U32:
-    case OP_S_SETREG_B32:
-    case OP_S_WAITCNT_VSCNT:
-    case OP_S_WAITCNT_VMCNT:
-    case OP_S_WAITCNT_EXPCNT:
-    case OP_S_WAITCNT_LGKMCNT:
-        return; // their register (decoded as the destination) is only read
     case OP_S_ADDK_I32: {
         // Adds to the register in place: a constant stays one, anything else is forgotten.
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
@@ -1362,6 +1372,8 @@ static const char* tag_text(Tag tag) {
 }
 
 static bool writes_register(const RdnaInst& in, bool vector, u32 reg) {
+    if (destination_only_read(in.op))
+        return false;
     for (u32 d = 0; d < 2; d++) {
         const RdnaOperand& o = in.dst[d];
         if (vector && o.kind == OPND_VGPR) {
@@ -1388,13 +1400,18 @@ void describe_tag_loss(const Translator& t, bool vector, u32 reg, char* out, usi
             return;
         }
     }
-    if (b == 0) {
+    // What each way into the block brings. The first block is also entered at the program's start, and
+    // only there unless a loop comes back to it.
+    bool loops_back = false;
+    for (u32 k = 0; k < p.block_count && b == 0; k++)
+        loops_back |= t.block_reached[k] && (p.blocks[k].next[0] == 0 || p.blocks[k].next[1] == 0);
+    if (b == 0 && !loops_back) {
         snprintf(out, size, " (not written since the program's start)");
         return;
     }
-    // What each way into the block brings.
-    usize n = (usize)snprintf(out, size, " (joining at 0x%x:", p.insts[p.blocks[b].first].offset);
-    u32 listed = 0;
+    usize n = (usize)snprintf(out, size, " (joining at 0x%x:%s", p.insts[p.blocks[b].first].offset,
+                              b == 0 ? " the program's start" : "");
+    u32 listed = b == 0 ? 1 : 0;
     for (u32 k = 0; k < p.block_count && n < size; k++) {
         const Block& from = p.blocks[k];
         if (!t.block_reached[k] || (from.next[0] != (s32)b && from.next[1] != (s32)b))

@@ -1146,6 +1146,26 @@ static void test_descriptors_on_paths() {
             "with an image descriptor changed after loading (joining at 0x1c: a descriptor at 0x14, "
             "a value at 0x18)"));
     }
+    {
+        // A compare that names its register as the destination doesn't write it.
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, 8, ZERO);      // 0x00
+        a.sopk(SOPK_CMPK_LG_U32, 8, 0);     // 0x04
+        a.mimg(MIMG_LOAD, 4, 0, 8, 0, 0x1); // 0x08
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("not from a descriptor table (written at 0x0 by s_mov_b32)"));
+    }
+    {
+        // The first block is entered at the start and again by a loop.
+        Asm a = {};
+        a.mimg(MIMG_LOAD, 4, 0, 8, 0, 0x1); // 0x00
+        a.sop1(SOP1_MOV_B32, 8, ZERO);      // 0x08
+        a.sopp(SOPP_CBRANCH_SCC0, 0xFFFC);  // 0x0C -> 0x00
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("(joining at 0x0: the program's start, a value at 0xc)"));
+    }
 }
 
 // --- descriptor shadow records -------------------------------------------------------------------------
