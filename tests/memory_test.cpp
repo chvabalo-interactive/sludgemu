@@ -794,6 +794,7 @@ void test_bcpack();
 void test_shader_translate();
 void test_shader_lanes();
 void test_shader_cache();
+void test_shader_schedule();
 
 int main() {
     log_init(nullptr, LOG_LEVEL_WARN);
@@ -824,6 +825,7 @@ int main() {
     test_shader_translate();
     test_shader_lanes();
     test_shader_cache();
+    test_shader_schedule();
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "passed", g_failures);
     return g_failures;
 }

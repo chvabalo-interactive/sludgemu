@@ -9,24 +9,21 @@
 #include <dxcapi.h>
 
 #include "common/log.h"
+#include "core/memory.h"
 #include "generated/shader_translator_hash.h"
+#include "gpu/shader_schedule.h"
 #include "shader/rdna.h"
 
 // --- jobs --------------------------------------------------------------------------------------------
 
-// A job is a program to build or a function to run.
-struct Job {
-    ShaderProgram* program;
-    void (*run)(void* context);
-    void* context;
-};
-
-// Two lanes: work something waits for, served first, and work nothing waits for yet: programs titles
-// merely created (often thousands at once, at startup) and jobs queued behind them.
+// Work something waits for is served first, in the order asked. Work nothing waits for yet (programs
+// titles merely created, often thousands at once at startup, and jobs queued behind them) runs cheapest
+// first on part of the workers, and its compiles start only while their memory fits the budget
+// (gpu/shader_schedule.h).
 #define JOB_CAPACITY 65536
 
-struct JobLane {
-    Job* jobs;
+struct UrgentLane {
+    ShaderJob* jobs;
     u32 head, count;
 };
 
@@ -36,76 +33,232 @@ struct Worker {
     HANDLE thread;
     DWORD thread_id;
     u32 index;
-    bool urgent_only;      // takes urgent work alone, so that waits never sit behind background work
-    volatile long boosted; // raised to normal priority: something waits for its job (gpu_job_hurry)
+    // The job running and its speed (under `lock`): urgent jobs run at full speed, background ones
+    // yield to the title until something waits for them (gpu_job_hurry), for that job alone.
+    SRWLOCK lock;
+    u32 ticket; // counts the jobs started; with the index it names the running job (job_token)
+    bool busy;
+    bool full_speed;
 };
 
-#define MAX_GENERAL_WORKERS 8
-#define MAX_WORKERS         (MAX_GENERAL_WORKERS + 1) // and the urgent-only one
-
-static JobLane g_lanes[2]; // urgent, background
+static UrgentLane g_urgent;
+static ShaderJobHeap g_background; // cheapest (least code) first
+static ShaderJobHeap g_compiles;   // translated programs waiting for memory to compile in, least HLSL first
 static SRWLOCK g_job_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE g_job_ready = CONDITION_VARIABLE_INIT;    // general workers
-static CONDITION_VARIABLE g_urgent_ready = CONDITION_VARIABLE_INIT; // the urgent-only worker
-static Worker g_workers[MAX_WORKERS];
+static CONDITION_VARIABLE g_job_ready = CONDITION_VARIABLE_INIT;
+static Worker g_workers[SHADER_MAX_WORKERS];
+static ShaderSchedule g_schedule;
 static u32 g_worker_count;
-static u32 g_active; // workers running a job (under g_job_lock)
+static u32 g_active;             // workers running a job (under g_job_lock)
+static u32 g_background_running; // of them on background jobs (under g_job_lock)
+static u64 g_compile_in_flight;  // the estimated memory of the compiles running (under g_job_lock)
 static bool g_ready;
 
-// Programs done, for the report when the queue drains.
+// Jobs to queue once a program is built (shader_program_then).
+struct ProgramThen {
+    ProgramThen* next;
+    void (*run)(void* context);
+    void* context;
+};
+
+// What the workers did, for the report when the queue drains.
 static struct {
     volatile long cached, built, failed;
     long reported;       // cached + built + failed at the last report (under g_job_lock)
     LARGE_INTEGER start; // when the queue last went from idle to busy (under g_job_lock)
+    long compile_waits;  // compiles that waited for memory (under g_job_lock)
+    u64 compile_peak;    // the most compile memory estimated at once (under g_job_lock)
 } g_stats;
 
-static bool queue(const Job& job, bool urgent) {
-    if (!g_ready)
-        return false;
-    AcquireSRWLockExclusive(&g_job_lock);
-    JobLane& lane = g_lanes[urgent ? 0 : 1];
-    if (lane.count == JOB_CAPACITY) {
-        ReleaseSRWLockExclusive(&g_job_lock);
-        LOG_E("gpu", "GPU job queue full; job dropped");
-        return false;
-    }
-    if (!g_active && !g_lanes[0].count && !g_lanes[1].count)
-        QueryPerformanceCounter(&g_stats.start);
-    lane.jobs[(lane.head + lane.count) % JOB_CAPACITY] = job;
-    lane.count++;
-    ReleaseSRWLockExclusive(&g_job_lock);
-    WakeConditionVariable(&g_job_ready);
-    if (urgent)
-        WakeConditionVariable(&g_urgent_ready);
-    return true;
+// --- worker speed ---
+
+// Background work yields to the title in every way that can be undone from another thread, since the
+// thread that waits for a background job is the one that raises it: the lowest priority (not idle: a
+// compile preempted while it holds a heap lock the title needs would hold it until the scheduler's
+// anti-starvation boost, seconds later), efficiency mode (efficiency cores on hybrid processors, low
+// clocks elsewhere, which leaves laptops the power for the title's threads) and low memory priority
+// (its pages go first when memory runs short). Background mode (THREAD_MODE_BACKGROUND_BEGIN) would add
+// very low I/O priority, which would slow down the disk cache under the title's streaming, and only
+// the thread itself can leave it, so a waiting thread could not raise a worker.
+static bool set_speed(Worker& w, bool full) {
+    THREAD_POWER_THROTTLING_STATE throttling = {THREAD_POWER_THROTTLING_CURRENT_VERSION,
+                                                THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+                                                full ? 0u : (ULONG)THREAD_POWER_THROTTLING_EXECUTION_SPEED};
+    MEMORY_PRIORITY_INFORMATION memory = {full ? (ULONG)MEMORY_PRIORITY_NORMAL : (ULONG)MEMORY_PRIORITY_LOW};
+    bool ok = SetThreadPriority(w.thread, full ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_LOWEST) != 0;
+    ok &= SetThreadInformation(w.thread, ThreadPowerThrottling, &throttling, sizeof(throttling)) != 0;
+    ok &= SetThreadInformation(w.thread, ThreadMemoryPriority, &memory, sizeof(memory)) != 0;
+    w.full_speed = full;
+    return ok;
 }
 
-bool gpu_job_queue(void (*run)(void* context), void* context) {
-    return queue({nullptr, run, context}, true);
+// Names the job a worker runs: what waits for it raises the worker for that job, not for whatever
+// the worker runs by the time the request comes.
+#define TICKET_BITS 28
+
+static u32 job_token(const Worker& w) {
+    return (w.ticket & ((1u << TICKET_BITS) - 1)) << 4 | (w.index + 1);
 }
 
-bool gpu_job_queue_background(void (*run)(void* context), void* context) {
-    return queue({nullptr, run, context}, false);
+static void begin_job(Worker& w, bool urgent) {
+    AcquireSRWLockExclusive(&w.lock);
+    w.ticket++;
+    w.busy = true;
+    // Background jobs drop the speed the previous job was raised to (dropping when a job ends would
+    // only raise it again before an urgent job).
+    if (w.full_speed != urgent && !set_speed(w, urgent))
+        LOG_W_ONCE("gpu", "cannot change the speed of shader workers (error %lu)", GetLastError());
+    ReleaseSRWLockExclusive(&w.lock);
 }
 
-static void hurry(ShaderProgram* p) {
-    if (p->state == PROGRAM_PENDING && InterlockedExchange(&p->urgent, 1) == 0 &&
-        !queue({p, nullptr, nullptr}, true))
-        InterlockedExchange(&p->urgent, 0); // asked again by the next wait
+static void end_job(Worker& w) {
+    AcquireSRWLockExclusive(&w.lock);
+    w.busy = false;
+    ReleaseSRWLockExclusive(&w.lock);
 }
 
 u32 gpu_job_worker() {
     DWORD id = GetCurrentThreadId();
     for (u32 i = 0; i < g_worker_count; i++)
         if (g_workers[i].thread_id == id)
-            return i + 1;
+            return job_token(g_workers[i]);
     return 0;
 }
 
-// The waiting thread would otherwise wait for what busy cores leave over.
-void gpu_job_hurry(u32 worker) {
-    if (worker > 0 && worker <= g_worker_count && InterlockedExchange(&g_workers[worker - 1].boosted, 1) == 0)
-        SetThreadPriority(g_workers[worker - 1].thread, THREAD_PRIORITY_NORMAL);
+// The waiting thread would otherwise wait for what the title leaves over.
+void gpu_job_hurry(u32 token) {
+    u32 index = (token & 15) - 1;
+    if (index >= g_worker_count)
+        return;
+    Worker& w = g_workers[index];
+    AcquireSRWLockExclusive(&w.lock);
+    if (w.busy && job_token(w) == token && !w.full_speed && !set_speed(w, true))
+        LOG_W_ONCE("gpu", "cannot change the speed of shader workers (error %lu)", GetLastError());
+    ReleaseSRWLockExclusive(&w.lock);
+}
+
+// --- queues ---
+
+static bool queues_empty() {
+    return !g_urgent.count && !g_background.count && !g_compiles.count;
+}
+
+// Under g_job_lock. False if the queue is full.
+static bool push_job(const ShaderJob& job, bool urgent, u64 cost) {
+    if (!g_active && queues_empty())
+        QueryPerformanceCounter(&g_stats.start);
+    if (!urgent)
+        return shader_job_heap_push(&g_background, job, cost);
+    if (g_urgent.count == JOB_CAPACITY)
+        return false;
+    g_urgent.jobs[(g_urgent.head + g_urgent.count) % JOB_CAPACITY] = job;
+    g_urgent.count++;
+    return true;
+}
+
+// Background jobs cost `cost` (programs: their code size; functions: 0, they are quick).
+static bool queue(const ShaderJob& job, bool urgent, u64 cost) {
+    if (!g_ready)
+        return false;
+    AcquireSRWLockExclusive(&g_job_lock);
+    bool queued = push_job(job, urgent, cost);
+    ReleaseSRWLockExclusive(&g_job_lock);
+    if (!queued) {
+        LOG_E("gpu", "GPU job queue full; job dropped");
+        return false;
+    }
+    WakeConditionVariable(&g_job_ready);
+    return true;
+}
+
+bool gpu_job_queue(void (*run)(void* context), void* context) {
+    return queue({nullptr, run, context}, true, 0);
+}
+
+bool gpu_job_queue_background(void (*run)(void* context), void* context) {
+    return queue({nullptr, run, context}, false, 0);
+}
+
+// Something waits for `p`: from here on its compile starts whatever the memory, and if no worker has
+// it, it is queued in the urgent lane. Under g_job_lock, like the worker's decision to put a translated
+// program aside (build_program): one of the two sees the other's change.
+static void hurry(ShaderProgram* p) {
+    AcquireSRWLockExclusive(&g_job_lock);
+    p->urgent = true;
+    u32 state = p->state;
+    bool queued = false;
+    if (!p->urgent_queued && (state == PROGRAM_PENDING || state == PROGRAM_TRANSLATED))
+        queued = p->urgent_queued = push_job({p, nullptr, nullptr}, true, 0); // else asked again by the wait
+    ReleaseSRWLockExclusive(&g_job_lock);
+    if (queued)
+        WakeConditionVariable(&g_job_ready);
+}
+
+// Compiles nothing waits for take only commit the system can spare: beyond the reserve the title's own
+// memory stops at (core/memory.h), room for the title to grow, as a compile of one of the largest
+// programs takes a gigabyte and the title stops when the system runs short. All if Windows doesn't tell.
+#define COMPILE_COMMIT_HEADROOM GiB(2)
+
+static u64 commit_room() {
+    MEMORYSTATUSEX m = {sizeof(m)};
+    if (!GlobalMemoryStatusEx(&m))
+        return ~0ull;
+    u64 keep = MEM_COMMIT_RESERVE + COMPILE_COMMIT_HEADROOM;
+    return m.ullAvailPageFile > keep ? m.ullAvailPageFile - keep : 0;
+}
+
+static ShaderQueueState queue_state() {
+    ShaderQueueState s;
+    ShaderJob cheapest;
+    s.urgent_queued = g_urgent.count;
+    s.background_queued = g_background.count;
+    s.background_running = g_background_running;
+    s.background_slots = g_schedule.background_slots;
+    s.compile_waiting = shader_job_heap_peek(&g_compiles, &cheapest);
+    s.compile_cost = s.compile_waiting ? cheapest.program->compile_cost : 0;
+    s.compile_in_flight = g_compile_in_flight;
+    s.compile_budget = g_schedule.compile_budget;
+    s.commit_room = s.compile_waiting ? commit_room() : 0;
+    return s;
+}
+
+// Programs that waited for memory and were then compiled for a draw stay in g_compiles; they are
+// dropped as they come up. Under g_job_lock.
+static void drop_taken_compiles() {
+    ShaderJob job;
+    while (shader_job_heap_peek(&g_compiles, &job) && job.program->state != PROGRAM_TRANSLATED)
+        shader_job_heap_pop(&g_compiles, &job);
+}
+
+// Reserves the estimated memory of a compile. Under g_job_lock.
+static void reserve_compile(u64 cost) {
+    g_compile_in_flight += cost;
+    if (g_compile_in_flight > g_stats.compile_peak)
+        g_stats.compile_peak = g_compile_in_flight;
+}
+
+// A worker's next job, PICK_NOTHING to sleep. Under g_job_lock.
+static ShaderPick take_job(ShaderJob* job) {
+    drop_taken_compiles();
+    ShaderPick pick = shader_pick(queue_state());
+    switch (pick) {
+    case PICK_URGENT:
+        *job = g_urgent.jobs[g_urgent.head];
+        g_urgent.head = (g_urgent.head + 1) % JOB_CAPACITY;
+        g_urgent.count--;
+        break;
+    case PICK_BACKGROUND:
+        shader_job_heap_pop(&g_background, job);
+        break;
+    case PICK_COMPILE:
+        shader_job_heap_pop(&g_compiles, job);
+        InterlockedExchange((volatile LONG*)&job->program->state, PROGRAM_BUILDING);
+        reserve_compile(job->program->compile_cost);
+        break;
+    case PICK_NOTHING:
+        break;
+    }
+    return pick;
 }
 
 static bool is_final(u32 state) {
@@ -118,18 +271,20 @@ bool shader_program_wait(ShaderProgram* p) {
         return state == PROGRAM_READY;
     hurry(p);
     u32 waited_s = 0;
-    bool boosted = false;
+    long boosted = 0;
     for (;;) {
         state = p->state;
         if (is_final(state))
             return state == PROGRAM_READY;
-        if (state == PROGRAM_BUILDING && !boosted && p->worker) {
-            gpu_job_hurry((u32)p->worker);
-            boosted = true;
+        // A program can pass through several workers (translated on one, compiled on another).
+        long builder = p->worker;
+        if (state == PROGRAM_BUILDING && builder && builder != boosted) {
+            gpu_job_hurry((u32)builder);
+            boosted = builder;
         }
-        // Builders wake every waiter when they start (to be hurried along) and when the state becomes
-        // final; the timeout only asks again where the queue was full, and tells about a wait that
-        // looks stuck.
+        // Builders wake every waiter when they start (to be hurried along), when they put a program
+        // aside and when the state becomes final; the timeout only asks again where the queue was full,
+        // and tells about a wait that looks stuck.
         if (!WaitOnAddress(&p->state, &state, sizeof(state), 1000) && GetLastError() == ERROR_TIMEOUT) {
             hurry(p);
             if (++waited_s == 10)
@@ -139,15 +294,26 @@ bool shader_program_wait(ShaderProgram* p) {
     }
 }
 
-bool shader_program_wait_started(ShaderProgram* p) {
-    for (;;) {
-        u32 state = p->state;
-        if (is_final(state))
-            return true;
-        if (state == PROGRAM_PENDING)
-            return false;
-        WaitOnAddress(&p->state, &state, sizeof(state), INFINITE);
+bool shader_program_then(ShaderProgram* p, void (*run)(void* context), void* context) {
+    if (is_final(p->state))
+        return false;
+    ProgramThen* then = (ProgramThen*)malloc(sizeof(ProgramThen));
+    if (!then)
+        return false;
+    then->run = run;
+    then->context = context;
+    // Under the lock that finishing takes after the final state is set: either this sees the final
+    // state, or finishing sees this job.
+    AcquireSRWLockExclusive(&g_job_lock);
+    bool final = is_final(p->state);
+    if (!final) {
+        then->next = p->then;
+        p->then = then;
     }
+    ReleaseSRWLockExclusive(&g_job_lock);
+    if (final)
+        free(then);
+    return !final;
 }
 
 // --- building ----------------------------------------------------------------------------------------
@@ -197,105 +363,218 @@ static void dump(const ShaderProgram* p, const char* hlsl, const char* reason) {
     }
 }
 
-// Translates and compiles the program into `out`; false (logged) if it can't be.
-static bool translate_program(Worker& w, const ShaderProgram* p, ShaderBinary* out) {
-    TranslatedShader t = {};
-    bool ok = false;
-    bool translated = shader_translate(p->code, p->code_size, p->info, g_target, &t);
+// Translates the program to HLSL in `t`; false (logged, and the HLSL released) if it can't be.
+static bool translate_program(const ShaderProgram* p, TranslatedShader* t) {
+    bool translated = shader_translate(p->code, p->code_size, p->info, g_target, t);
     // The pipeline's wave size (unverified) against what the code proves, where both tell; the code wins.
-    if (p->info.wave_size && t.code_wave_size && t.code_wave_size != p->info.wave_size)
+    if (p->info.wave_size && t->code_wave_size && t->code_wave_size != p->info.wave_size)
         LOG_W("gpu", "shader %016llx: launched as wave%u, but its code is wave%u", (unsigned long long)p->key,
-              p->info.wave_size, t.code_wave_size);
+              p->info.wave_size, t->code_wave_size);
     if (!translated) {
-        LOG_W("gpu", "shader %016llx: translation failed: %s", (unsigned long long)p->key, t.error);
-        dump(p, t.hlsl.data, t.error);
-    } else if (t.uses_int64_atomics && !gpu_int64_image_atomics()) {
+        LOG_W("gpu", "shader %016llx: translation failed: %s", (unsigned long long)p->key, t->error);
+        dump(p, t->hlsl.data, t->error);
+    } else if (t->uses_int64_atomics && !gpu_int64_image_atomics()) {
         // The pipeline would fail to create (or worse); the adapter's lack was logged at startup.
         LOG_W("gpu", "shader %016llx: needs 64-bit atomics on typed views, which the adapter lacks",
               (unsigned long long)p->key);
-        dump(p, t.hlsl.data, "needs 64-bit atomics on typed views");
-    } else {
-        DxcBuffer source = {t.hlsl.data, t.hlsl.length, DXC_CP_UTF8};
-        const wchar_t* args[] = {L"-E",
-                                 L"main",
-                                 L"-T",
-                                 profile_of(p->stage),
-                                 L"-O3",
-                                 L"-HV",
-                                 L"2021",
-                                 L"-Qstrip_debug",
-                                 L"-Qstrip_reflect"};
-        IDxcResult* result = nullptr;
-        HRESULT status = E_FAIL;
-        if (SUCCEEDED(w.compiler->Compile(&source, args, ARRAY_COUNT(args), nullptr, IID_PPV_ARGS(&result))))
-            result->GetStatus(&status);
-        IDxcBlob* object = nullptr;
-        if (SUCCEEDED(status))
-            result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr);
-        if (object && object->GetBufferSize()) {
-            out->dxil = malloc(object->GetBufferSize());
-            if (out->dxil) {
-                memcpy(out->dxil, object->GetBufferPointer(), object->GetBufferSize());
-                out->dxil_size = object->GetBufferSize();
-                out->vertex_element_mask = t.vertex_element_mask;
-                memcpy(out->element_format, t.element_format, sizeof(out->element_format));
-                out->ps_target_mask = t.ps_target_mask;
-                out->ps_writes_depth = t.ps_writes_depth;
-                out->sampler_count = t.sampler_count;
-                memcpy(out->samplers, t.samplers, sizeof(out->samplers));
-                memcpy(out->table_reach, t.table_reach, sizeof(out->table_reach));
-                out->vs_param_mask = t.vs_param_mask;
-                ok = true;
-                dump(p, t.hlsl.data, nullptr);
-            }
-        } else {
-            IDxcBlobUtf8* errors = nullptr;
-            if (result)
-                result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
-            const char* text =
-                errors && errors->GetStringLength() ? errors->GetStringPointer() : "unknown error";
-            LOG_W("gpu", "shader %016llx: compiling the translation failed: %.300s",
-                  (unsigned long long)p->key, text);
-            dump(p, t.hlsl.data, text);
-            if (errors)
-                errors->Release();
-        }
-        if (object)
-            object->Release();
-        if (result)
-            result->Release();
+        dump(p, t->hlsl.data, "needs 64-bit atomics on typed views");
+        translated = false;
     }
-    t.hlsl.release();
+    if (!translated)
+        t->hlsl.release();
+    return translated;
+}
+
+// Compiles the translation into `out`; false (logged) if it can't be.
+static bool compile_program(Worker& w, const ShaderProgram* p, const TranslatedShader& t, ShaderBinary* out) {
+    DxcBuffer source = {t.hlsl.data, t.hlsl.length, DXC_CP_UTF8};
+    const wchar_t* args[] = {L"-E",
+                             L"main",
+                             L"-T",
+                             profile_of(p->stage),
+                             L"-O3",
+                             L"-HV",
+                             L"2021",
+                             L"-Qstrip_debug",
+                             L"-Qstrip_reflect"};
+    IDxcResult* result = nullptr;
+    HRESULT status = E_FAIL;
+    if (SUCCEEDED(w.compiler->Compile(&source, args, ARRAY_COUNT(args), nullptr, IID_PPV_ARGS(&result))))
+        result->GetStatus(&status);
+    IDxcBlob* object = nullptr;
+    if (SUCCEEDED(status))
+        result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&object), nullptr);
+    bool ok = false;
+    if (object && object->GetBufferSize()) {
+        out->dxil = malloc(object->GetBufferSize());
+        if (out->dxil) {
+            memcpy(out->dxil, object->GetBufferPointer(), object->GetBufferSize());
+            out->dxil_size = object->GetBufferSize();
+            out->vertex_element_mask = t.vertex_element_mask;
+            memcpy(out->element_format, t.element_format, sizeof(out->element_format));
+            out->ps_target_mask = t.ps_target_mask;
+            out->ps_writes_depth = t.ps_writes_depth;
+            out->sampler_count = t.sampler_count;
+            memcpy(out->samplers, t.samplers, sizeof(out->samplers));
+            memcpy(out->table_reach, t.table_reach, sizeof(out->table_reach));
+            out->vs_param_mask = t.vs_param_mask;
+            ok = true;
+            dump(p, t.hlsl.data, nullptr);
+        }
+    } else {
+        IDxcBlobUtf8* errors = nullptr;
+        if (result)
+            result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+        const char* text = errors && errors->GetStringLength() ? errors->GetStringPointer() : "unknown error";
+        LOG_W("gpu", "shader %016llx: compiling the translation failed: %.300s", (unsigned long long)p->key,
+              text);
+        dump(p, t.hlsl.data, text);
+        if (errors)
+            errors->Release();
+    }
+    if (object)
+        object->Release();
+    if (result)
+        result->Release();
     return ok;
 }
 
-static void build_program(Worker& w, ShaderProgram* p) {
-    // Programs can be queued in both lanes; the first worker to get one builds it.
-    if (InterlockedCompareExchange((volatile LONG*)&p->state, PROGRAM_BUILDING, PROGRAM_PENDING) !=
-        PROGRAM_PENDING)
-        return;
-    InterlockedExchange(&p->worker, (long)w.index + 1);
-    // A thread waiting since before the start hurries this worker: it may be a background one, and
-    // it was asked first by the program's creation.
-    WakeByAddressAll((void*)&p->state);
-    ShaderBinary b;
-    memset(&b, 0, sizeof(b));
-    // Dumps are made by building, so they bypass the cache (and refresh it).
-    bool ready = !g_dump_dir[0] && shader_cache_load(p->key, p->code_size, &b);
-    if (ready) {
-        InterlockedIncrement(&g_stats.cached);
-    } else {
-        ready = translate_program(w, p, &b);
-        InterlockedIncrement(ready ? &g_stats.built : &g_stats.failed);
-        if (ready && g_cache_open && !shader_cache_store(p->key, p->code_size, b))
-            LOG_W_ONCE("gpu", "shader cache: cannot write to %ls; programs are translated again next run",
-                       shader_cache_folder());
-    }
+// The program is built (or failed): waiters are woken and the jobs waiting for it queued.
+static void finish_program(ShaderProgram* p, bool ready, const ShaderBinary& b) {
     p->binary = b;
     free(p->code);
     p->code = nullptr;
     InterlockedExchange((volatile LONG*)&p->state, ready ? PROGRAM_READY : PROGRAM_FAILED);
     WakeByAddressAll((void*)&p->state);
+    AcquireSRWLockExclusive(&g_job_lock);
+    ProgramThen* then = p->then;
+    p->then = nullptr;
+    ReleaseSRWLockExclusive(&g_job_lock);
+    while (then) {
+        ProgramThen* next = then->next;
+        // A job the full queue can't take runs here: it was promised to run.
+        if (!queue({nullptr, then->run, then->context}, false, 0))
+            then->run(then->context);
+        free(then);
+        then = next;
+    }
+}
+
+// Compiles the translation, whose memory is reserved as `cost`, and finishes the program.
+static void compile_and_finish(Worker& w, ShaderProgram* p, TranslatedShader& t, u64 cost) {
+    ShaderBinary b;
+    memset(&b, 0, sizeof(b));
+    bool ready = compile_program(w, p, t, &b);
+    t.hlsl.release();
+    AcquireSRWLockExclusive(&g_job_lock);
+    g_compile_in_flight -= cost;
+    ReleaseSRWLockExclusive(&g_job_lock);
+    InterlockedIncrement(ready ? &g_stats.built : &g_stats.failed);
+    if (ready && g_cache_open && !shader_cache_store(p->key, p->code_size, b))
+        LOG_W_ONCE("gpu", "shader cache: cannot write to %ls; programs are translated again next run",
+                   shader_cache_folder());
+    finish_program(p, ready, b);
+}
+
+// The worker has the program from here on: a thread waiting since before hurries it (it may run in
+// the background, as the program was asked for first by its creation). A waiter that read the worker
+// before it was named here can't, and would sleep out its timeout while the build crawls at background
+// speed, so the worker raises itself for a program something waits for. The waiter marks `urgent`
+// under g_job_lock before it reads the worker, and the worker reads `urgent` under it after naming
+// itself: one of the two sees the other.
+static void start_program(Worker& w, ShaderProgram* p) {
+    u32 token = job_token(w);
+    InterlockedExchange(&p->worker, (long)token);
+    AcquireSRWLockShared(&g_job_lock);
+    bool urgent = p->urgent;
+    ReleaseSRWLockShared(&g_job_lock);
+    if (urgent)
+        gpu_job_hurry(token);
+    WakeByAddressAll((void*)&p->state);
+}
+
+// A translated program that waited for memory, now compiled (taken by take_job, its memory reserved).
+static void compile_translated(Worker& w, ShaderProgram* p) {
+    start_program(w, p);
+    TranslatedShader* t = p->translation;
+    p->translation = nullptr;
+    compile_and_finish(w, p, *t, p->compile_cost);
+    free(t);
+}
+
+// A program from a lane: loaded from the disk cache, or translated and compiled. A background compile
+// that doesn't fit the memory budget is put aside translated (the HLSL is a fraction of the compile's
+// memory), and the worker goes on with other work.
+static void build_program(Worker& w, ShaderProgram* p, bool urgent) {
+    // Urgent jobs take over programs put aside; the compile starts whatever the memory.
+    if (urgent && p->state == PROGRAM_TRANSLATED) {
+        AcquireSRWLockExclusive(&g_job_lock);
+        bool taken = p->state == PROGRAM_TRANSLATED;
+        if (taken) {
+            InterlockedExchange((volatile LONG*)&p->state, PROGRAM_BUILDING);
+            reserve_compile(p->compile_cost);
+        }
+        ReleaseSRWLockExclusive(&g_job_lock);
+        if (taken)
+            compile_translated(w, p);
+        return;
+    }
+    // Programs can be queued in both lanes; the first worker to get one builds it.
+    if (InterlockedCompareExchange((volatile LONG*)&p->state, PROGRAM_BUILDING, PROGRAM_PENDING) !=
+        PROGRAM_PENDING)
+        return;
+    start_program(w, p);
+    ShaderBinary b;
+    memset(&b, 0, sizeof(b));
+    // Dumps are made by building, so they bypass the cache (and refresh it).
+    if (!g_dump_dir[0] && shader_cache_load(p->key, p->code_size, &b)) {
+        InterlockedIncrement(&g_stats.cached);
+        finish_program(p, true, b);
+        return;
+    }
+    TranslatedShader t = {};
+    if (!translate_program(p, &t)) {
+        InterlockedIncrement(&g_stats.failed);
+        finish_program(p, false, b);
+        return;
+    }
+    u64 cost = shader_compile_cost(t.hlsl.length);
+    u64 room = urgent ? 0 : commit_room();
+    TranslatedShader* aside = nullptr;
+    AcquireSRWLockExclusive(&g_job_lock);
+    bool admitted = shader_compile_admitted(g_compile_in_flight, cost, g_schedule.compile_budget, room,
+                                            urgent || p->urgent);
+    bool short_of_commit = !admitted && g_compile_in_flight + cost > room;
+    if (!admitted) {
+        aside = (TranslatedShader*)malloc(sizeof(TranslatedShader));
+        // Out of memory or the heap full (more programs than it holds can't be): compiled now.
+        if (!aside || !shader_job_heap_push(&g_compiles, {p, nullptr, nullptr}, t.hlsl.length)) {
+            free(aside);
+            aside = nullptr;
+            admitted = true;
+        }
+    }
+    if (admitted) {
+        reserve_compile(cost);
+    } else {
+        *aside = t; // the HLSL goes with it
+        p->translation = aside;
+        p->compile_cost = cost;
+        InterlockedExchange(&p->worker, 0);
+        InterlockedExchange((volatile LONG*)&p->state, PROGRAM_TRANSLATED);
+        g_stats.compile_waits++;
+    }
+    ReleaseSRWLockExclusive(&g_job_lock);
+    if (admitted) {
+        compile_and_finish(w, p, t, cost);
+    } else {
+        if (short_of_commit)
+            LOG_W_ONCE("gpu",
+                       "shader compiles nothing waits for wait: the system has little commit left (%llu MiB "
+                       "to spare)",
+                       (unsigned long long)(room >> 20));
+        WakeByAddressAll((void*)&p->state);
+    }
 }
 
 // Logs what the workers did since the last report, once the queue drains after enough programs (a
@@ -308,6 +587,8 @@ static void report_drained(const LARGE_INTEGER& start) {
     bool report = since >= 64;
     if (report)
         g_stats.reported = total;
+    long compile_waits = g_stats.compile_waits;
+    u64 compile_peak = g_stats.compile_peak;
     ReleaseSRWLockExclusive(&g_job_lock);
     if (!report)
         return;
@@ -316,39 +597,48 @@ static void report_drained(const LARGE_INTEGER& start) {
     QueryPerformanceFrequency(&frequency);
     LOG_I("gpu",
           "shader queue drained (busy %.1f s): %ld programs since the last report; in all %ld from the disk "
-          "cache, %ld translated, %ld failed",
-          (f64)(now.QuadPart - start.QuadPart) / (f64)frequency.QuadPart, since, cached, built, failed);
+          "cache, %ld translated, %ld failed; %ld compiles waited for memory, at most %llu MiB of compiles "
+          "estimated at once",
+          (f64)(now.QuadPart - start.QuadPart) / (f64)frequency.QuadPart, since, cached, built, failed,
+          compile_waits, (unsigned long long)(compile_peak >> 20));
 }
 
 static DWORD WINAPI worker_main(void* param) {
     Worker& w = *(Worker*)param;
-    int resting = w.urgent_only ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL;
     for (;;) {
+        ShaderJob job;
         AcquireSRWLockExclusive(&g_job_lock);
-        while (g_lanes[0].count == 0 && (w.urgent_only || g_lanes[1].count == 0))
-            SleepConditionVariableSRW(w.urgent_only ? &g_urgent_ready : &g_job_ready, &g_job_lock, INFINITE,
-                                      0);
-        bool urgent = g_lanes[0].count != 0;
-        JobLane& lane = g_lanes[urgent ? 0 : 1];
-        Job job = lane.jobs[lane.head];
-        lane.head = (lane.head + 1) % JOB_CAPACITY;
-        lane.count--;
+        ShaderPick pick;
+        // Compiles waiting for memory are looked at again now and then: commit other processes and
+        // the title give back wakes no one.
+        while ((pick = take_job(&job)) == PICK_NOTHING)
+            SleepConditionVariableSRW(&g_job_ready, &g_job_lock, g_compiles.count ? 500 : INFINITE, 0);
+        bool background = pick != PICK_URGENT;
         g_active++;
+        if (background)
+            g_background_running++;
+        // Queuing wakes one worker, and the end of a job brings back only the worker that ran it: one
+        // that finds more work than its own wakes the next.
+        bool more = shader_pick(queue_state()) != PICK_NOTHING;
         ReleaseSRWLockExclusive(&g_job_lock);
-        // Urgent work runs at normal priority: something is waiting for it.
-        bool raised = urgent && !w.urgent_only;
-        if (raised)
-            SetThreadPriority(w.thread, THREAD_PRIORITY_NORMAL);
-        if (job.program)
-            build_program(w, job.program);
+        if (more)
+            WakeConditionVariable(&g_job_ready);
+
+        begin_job(w, !background);
+        if (pick == PICK_COMPILE)
+            compile_translated(w, job.program);
+        else if (job.program)
+            build_program(w, job.program, !background);
         else
             job.run(job.context);
-        if (InterlockedExchange(&w.boosted, 0))
-            raised = true;
-        if (raised && !w.urgent_only)
-            SetThreadPriority(w.thread, resting);
+        end_job(w);
+
         AcquireSRWLockExclusive(&g_job_lock);
-        bool drained = --g_active == 0 && !g_lanes[0].count && !g_lanes[1].count;
+        g_active--;
+        if (background)
+            g_background_running--;
+        drop_taken_compiles();
+        bool drained = !g_active && queues_empty();
         LARGE_INTEGER start = g_stats.start;
         ReleaseSRWLockExclusive(&g_job_lock);
         if (drained)
@@ -517,6 +807,21 @@ static void open_cache(const wchar_t* root, IDxcCompiler3* compiler) {
     gpu_job_queue_background(prune_cache, nullptr);
 }
 
+// Cores rather than logical processors (gpu/shader_schedule.cpp); 0 if Windows doesn't tell.
+static u32 count_physical_cores() {
+    DWORD size = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &size);
+    u8* info = size ? (u8*)malloc(size) : nullptr;
+    u32 cores = 0;
+    if (info && GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                                 (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)info, &size)) {
+        for (DWORD at = 0; at < size; at += ((SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(info + at))->Size)
+            cores++;
+    }
+    free(info);
+    return cores;
+}
+
 bool shader_programs_init(const ShaderTarget& target, const wchar_t* cache_root) {
     rdna_init();
     g_target = target;
@@ -528,22 +833,19 @@ bool shader_programs_init(const ShaderTarget& target, const wchar_t* cache_root)
         LOG_E("gpu", "dxcompiler.dll is missing: shaders cannot be translated");
         return false;
     }
-    for (JobLane& lane : g_lanes)
-        lane.jobs = (Job*)calloc(JOB_CAPACITY, sizeof(Job));
+    g_urgent.jobs = (ShaderJob*)calloc(JOB_CAPACITY, sizeof(ShaderJob));
     g_programs = (ShaderProgram**)calloc(PROGRAM_TABLE_SIZE, sizeof(ShaderProgram*));
-    if (!g_lanes[0].jobs || !g_lanes[1].jobs || !g_programs)
+    if (!g_urgent.jobs || !g_programs || !shader_job_heap_init(&g_background, JOB_CAPACITY) ||
+        !shader_job_heap_init(&g_compiles, JOB_CAPACITY))
         return false;
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    u32 general = si.dwNumberOfProcessors > 4 ? si.dwNumberOfProcessors - 2 : 2;
-    if (general > MAX_GENERAL_WORKERS)
-        general = MAX_GENERAL_WORKERS;
+    MEMORYSTATUSEX memory = {sizeof(memory)};
+    g_schedule =
+        shader_schedule_for(count_physical_cores(), GlobalMemoryStatusEx(&memory) ? memory.ullTotalPhys : 0);
     // Compilers first: a pool without them would leave waits for programs hanging.
-    g_worker_count = general + 1;
-    for (u32 i = 0; i < g_worker_count; i++) {
+    for (u32 i = 0; i < g_schedule.workers; i++) {
         Worker& w = g_workers[i];
         w.index = i;
-        w.urgent_only = i == general;
+        w.lock = SRWLOCK_INIT;
         if (FAILED(g_dxc_create(CLSID_DxcCompiler, IID_PPV_ARGS(&w.compiler)))) {
             LOG_E("gpu", "cannot create a shader compiler: shaders cannot be translated");
             return false;
@@ -551,17 +853,27 @@ bool shader_programs_init(const ShaderTarget& target, const wchar_t* cache_root)
     }
     g_ready = true; // jobs can be queued from here on; the workers take them once started
     open_cache(cache_root, g_workers[0].compiler);
-    for (u32 i = 0; i < g_worker_count; i++) {
+    bool yielding = true;
+    for (u32 i = 0; i < g_schedule.workers; i++) {
         Worker& w = g_workers[i];
         w.thread = CreateThread(nullptr, 1 << 20, worker_main, &w, CREATE_SUSPENDED, &w.thread_id);
         if (!w.thread)
             FATAL("cannot start shader workers");
-        SetThreadPriority(w.thread, w.urgent_only ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
-        SetThreadDescription(w.thread,
-                             w.urgent_only ? L"sludgemu shader worker (urgent)" : L"sludgemu shader worker");
+        yielding &= set_speed(w, false);
+        SetThreadDescription(w.thread, L"sludgemu shader worker");
+        g_worker_count = i + 1; // gpu_job_worker and gpu_job_hurry look at started workers only
         ResumeThread(w.thread);
     }
-    LOG_I("gpu", "shader translation: %u workers and one for work draws wait for", general);
+    if (!yielding)
+        LOG_W("gpu",
+              "shader workers: cannot lower their priority, efficiency mode or memory priority (error %lu); "
+              "background work competes with the title",
+              GetLastError());
+    LOG_I("gpu",
+          "shader workers: %u, background work on at most %u of them (lowest priority, efficiency mode), "
+          "compiles started while their estimated memory fits %llu MiB",
+          g_schedule.workers, g_schedule.background_slots,
+          (unsigned long long)(g_schedule.compile_budget >> 20));
     return true;
 }
 
@@ -602,7 +914,8 @@ ShaderProgram* shader_program_get(const void* code, u32 code_size, const ShaderI
     }
     ReleaseSRWLockExclusive(&g_program_lock);
     // A program no queue holds would never be built, and a draw waiting for it would wait forever.
-    if (p && !queue({p, nullptr, nullptr}, false)) {
+    // Ordered by code size: the HLSL, and with it the compile, grows with it.
+    if (p && !queue({p, nullptr, nullptr}, false, code_size)) {
         InterlockedExchange((volatile LONG*)&p->state, PROGRAM_FAILED);
         WakeByAddressAll((void*)&p->state);
     }
