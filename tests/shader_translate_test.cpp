@@ -117,6 +117,8 @@ enum : u32 {
     SOP2_ADDC_U32 = 4,
     SOP2_SUBB_U32 = 5,
     SOP2_CSELECT_B32 = 10,
+    SOP2_CSELECT_B64 = 11,
+    MIMG_LOAD = 0,
     SOP1_GETPC_B64 = 31,
     SOP1_SETPC_B64 = 32,
     SMEM_LOAD_DWORDX2 = 1,
@@ -1050,6 +1052,102 @@ static void test_gathers_at_a_mip() {
     }
 }
 
+// --- descriptors on several paths ----------------------------------------------------------------------
+
+// Every table indexes the same desktop heap, so where descriptors from different tables meet, they are
+// still descriptors of the heap; what can't be placed says where its tag went.
+static void test_descriptors_on_paths() {
+    ShaderInfo info = compute_info();
+    info.parameters[1].kind = USER_DATA_RESOURCE_TABLE; // a second resource table in s1
+    info.parameters[1].range_count = 1;
+    info.parameters[1].ranges[0] = {RANGE_SRV, 0, ~0u};
+    {
+        // The table address comes from either table; the descriptor is loaded after the join.
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, 2, 0); // 0x00
+        a.sop1(SOP1_MOV_B32, 3, ZERO);
+        a.sopc(SOPC_CMP_EQ_U32, 4, ZERO);
+        a.sopp(SOPP_CBRANCH_SCC0, 1); // 0x0C -> 0x14
+        a.sop1(SOP1_MOV_B32, 2, 1);   // 0x10
+        a.smem(SMEM_LOAD_DWORDX8, 8, 2, 64);
+        a.mimg(MIMG_LOAD, 4, 0, 8, 0, 0x1);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("Texture2D<float4> tex_ = ResourceDescriptorHeap[s8 >> 5];"));
+        CHECK(hlsl_has("if (g_descriptor_info.Load((s8 & ~31u) + 16u) == 2u) {"));
+    }
+    {
+        // A table address and a sampler table's are of different heaps: nothing to place.
+        ShaderInfo mixed = compute_info();
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, 2, 0);
+        a.sop1(SOP1_MOV_B32, 3, ZERO);
+        a.sopc(SOPC_CMP_EQ_U32, 4, ZERO);
+        a.sopp(SOPP_CBRANCH_SCC0, 1);
+        a.sop1(SOP1_MOV_B32, 2, 1);
+        a.smem(SMEM_LOAD_DWORDX8, 8, 2, 64); // 0x14
+        a.mimg(MIMG_LOAD, 4, 0, 8, 0, 0x1);
+        a.end();
+        CHECK(!translate(a, mixed));
+        CHECK(error_has(
+            "s_load_dwordx8 at 0x14 from an address the translator cannot place (joining at 0x14: a "
+            "table address at 0xc, a table address at 0x10)"));
+    }
+    {
+        // s_cselect picking one of two descriptors keeps their heap addresses as they are.
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, 2, 0);
+        a.sop1(SOP1_MOV_B32, 3, ZERO);
+        a.smem(SMEM_LOAD_DWORDX8, 8, 2, 0);
+        a.smem(SMEM_LOAD_DWORDX8, 16, 2, 32);
+        a.sopc(SOPC_CMP_EQ_U32, 4, ZERO);
+        for (u32 i = 0; i < 8; i += 2)
+            a.sop2(SOP2_CSELECT_B64, 24 + i, 8 + i, 16 + i);
+        a.mimg(MIMG_LOAD, 4, 0, 24, 0, 0x1);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("uint r0_ = scc ? s8 : s16;"));
+        CHECK(hlsl_has("ResourceDescriptorHeap[s24 >> 5]"));
+    }
+    {
+        // Between a buffer descriptor's dword and a constant it selects a value: the dword's.
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.sopc(SOPC_CMP_EQ_U32, 4, ZERO);
+        a.sop2(SOP2_CSELECT_B32, 20, 10, ZERO);
+        a.sop2(SOP2_ADD_U32, 21, 20, ZERO + 1);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("uint r0_ = scc ? g_descriptor_info.Load(s10) : 0x00000000u;"));
+    }
+    {
+        // An image descriptor selected against constants reads its dwords as values, which it can't.
+        Asm a = {};
+        load_descriptors(a, false);
+        a.sopc(SOPC_CMP_EQ_U32, 4, ZERO);
+        for (u32 i = 0; i < 8; i += 2)
+            a.sop2(SOP2_CSELECT_B64, 24 + i, 8 + i, ZERO);
+        a.mimg(MIMG_LOAD, 4, 0, 24, 0, 0x1);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("image descriptor dword read as a value at 0x14"));
+    }
+    {
+        // A descriptor on one path only says where it went.
+        Asm a = {};
+        load_descriptors(a, false);         // 0x00..0x08
+        a.sopc(SOPC_CMP_EQ_U32, 4, ZERO);   // 0x10
+        a.sopp(SOPP_CBRANCH_SCC0, 1);       // 0x14 -> 0x1C
+        a.sop1(SOP1_MOV_B32, 8, ZERO);      // 0x18
+        a.mimg(MIMG_LOAD, 4, 0, 8, 0, 0x1); // 0x1C
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has(
+            "with an image descriptor changed after loading (joining at 0x1c: a descriptor at 0x14, "
+            "a value at 0x18)"));
+    }
+}
+
 // --- descriptor shadow records -------------------------------------------------------------------------
 
 // What the runtime writes into the shadow for a slot, read back the way translated programs read it.
@@ -1116,6 +1214,7 @@ void test_shader_translate() {
     test_long_branches();
     test_image_atomics();
     test_gathers_at_a_mip();
+    test_descriptors_on_paths();
     test_descriptor_shadow_records();
     g_out.hlsl.release();
 }

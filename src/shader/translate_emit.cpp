@@ -462,7 +462,7 @@ static void emit_block(Translator& t, u32 b) {
     for (u32 i = blk.first; i < blk.end && !t.failed; i++) {
         const RdnaInst& in = t.program.insts[i];
         t.inst_offset = in.offset;
-        t.copying = copies_tags(t, in, i);
+        t.copying = copies_tags(t, t.tags, in, i);
         emit_instruction(t, in);
         tags_transfer(t, t.tags, in, i);
     }

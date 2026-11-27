@@ -506,9 +506,11 @@ static bool same_table(Tag a, Tag b) {
 }
 
 // A register's tag where two paths join (or where an instruction leaves either of two values): what both
-// agree on, or nothing. Loaded descriptor dwords are held as heap addresses, which must not pass for
-// values: a loaded dword on both paths stays one, of its table (of a table not known, 0x3F, where the
-// paths' tables differ). On one path only, a scalar register at a join of blocks becomes a value
+// agree on, or nothing. Every table indexes the same desktop heap, so table addresses of one heap on both
+// paths stay a heap address, of a table not known (HEAP_NO_TABLE) where the paths' tables differ. Loaded
+// descriptor dwords are held as heap addresses, which must not pass for values: a loaded dword on both
+// paths stays one, of its table (of a table not known where the paths' tables differ). On one path only, a
+// scalar register at a join of blocks becomes a value
 // (`converting`: the path holding the address reads the dword from the shadow at the jump, see
 // emit_join_conversions); otherwise it is marked HEAP_MODIFIED, which nothing can use.
 //
@@ -521,14 +523,18 @@ static Tag merged_tag(Tag a, Tag b, bool converting = false) {
     if (a == b)
         return a;
     bool la = heap_loaded(a), lb = heap_loaded(b);
-    if (!la && !lb)
+    if (!la && !lb) {
+        bool tables = tag_kind(a) == TAG_HEAP && tag_kind(b) == TAG_HEAP;
+        if (tables && ((tag_payload(a) ^ tag_payload(b)) & 1) == 0)
+            return make_tag(TAG_HEAP, (tag_payload(a) & 1) | HEAP_NO_TABLE << 1);
         return TAG_NONE;
+    }
     if (converting && la != lb)
         return TAG_NONE;
     u32 pa = la ? tag_payload(a) : 0, pb = lb ? tag_payload(b) : 0;
     u32 parameter = la ? heap_parameter(a) : heap_parameter(b);
     if (la && lb && !same_table(a, b))
-        parameter = 0x3F;
+        parameter = HEAP_NO_TABLE;
     u32 payload = ((pa | pb) & 1) | parameter << 1 | HEAP_LOADED | ((pa | pb) & (HEAP_MODIFIED | HEAP_IMAGE));
     if (!la || !lb || ((pa ^ pb) & 1))
         payload |= HEAP_MODIFIED;
@@ -555,8 +561,23 @@ static bool plain_vector_move(const RdnaInst& in) {
     return !in.has_sdwa && !in.has_dpp && !in.src[0].abs && !in.src[0].neg && !in.omod && !in.clamp;
 }
 
-bool copies_tags(const Translator& t, const RdnaInst& in, u32 inst_idx) {
+// An s_cselect between loaded descriptor dwords of one heap (picking one of two descriptors): it leaves
+// either heap address, copied as it is. Between anything else it computes a value.
+static bool selects_descriptors(const TagState& s, const RdnaInst& in) {
+    if ((in.op != OP_S_CSELECT_B32 && in.op != OP_S_CSELECT_B64) || is_exec_or_vcc(in.dst[0]))
+        return false;
+    for (u32 i = 0; i < in.dst[0].count; i++) {
+        Tag a = tag_of(s, in.src[0], i), b = tag_of(s, in.src[1], i);
+        if (!heap_loaded(a) || !heap_loaded(b) || ((tag_payload(a) ^ tag_payload(b)) & 1))
+            return false;
+    }
+    return true;
+}
+
+bool copies_tags(const Translator& t, const TagState& s, const RdnaInst& in, u32 inst_idx) {
     if (inst_idx != ~0u && t.xor_swap_role && t.xor_swap_role[inst_idx])
+        return true;
+    if (selects_descriptors(s, in))
         return true;
     u32 lane;
     switch (in.op) {
@@ -831,6 +852,37 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
         set_tag(s, in.dst[0], 0, TAG_NONE);
         set_descriptor(s, in.dst[0], 0, NO_DESCRIPTOR);
         return;
+    case OP_S_CSELECT_B32:
+    case OP_S_CSELECT_B64:
+        if (!mask_source(s, in.src[0]) && !mask_source(s, in.src[1]) && !is_exec_or_vcc(in.dst[0])) {
+            // Either value: what both have, as at a join. Two descriptors' dwords stay addresses (the
+            // instruction copies them, see selects_descriptors), and so do two table addresses (read
+            // as they are); a descriptor dword with anything else is read as its value.
+            bool descriptors = selects_descriptors(s, in);
+            u32 parts = in.dst[0].count;
+            Tag tags[2];
+            u32 descriptors_at[2], values[2];
+            bool known[2];
+            for (u32 i = 0; i < parts; i++) {
+                Tag a = tag_of(s, in.src[0], i), b = tag_of(s, in.src[1], i);
+                bool tables =
+                    tag_kind(a) == TAG_HEAP && tag_kind(b) == TAG_HEAP && !heap_loaded(a) && !heap_loaded(b);
+                tags[i] = descriptors || tables ? merged_tag(a, b) : TAG_NONE;
+                u32 da = descriptor_of(s, in.src[0], i), db = descriptor_of(s, in.src[1], i);
+                descriptors_at[i] = tags[i] != TAG_NONE && da == db && same_table(a, b) ? da : NO_DESCRIPTOR;
+                u32 va = 0, vb = 0;
+                known[i] = constant_of(s, in.src[0], i, &va) && constant_of(s, in.src[1], i, &vb) && va == vb;
+                values[i] = va;
+            }
+            for (u32 i = 0; i < parts; i++) {
+                set_tag(s, in.dst[0], i, tags[i]);
+                set_descriptor(s, in.dst[0], i, descriptors_at[i]);
+                if (known[i])
+                    set_constant(s, in.dst[0], i, values[i]);
+            }
+            return;
+        }
+        [[fallthrough]];
     case OP_S_AND_B64:
     case OP_S_OR_B64:
     case OP_S_XOR_B64:
@@ -841,13 +893,11 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
     case OP_S_XNOR_B64:
     case OP_S_NOT_B64:
     case OP_S_WQM_B64:
-    case OP_S_CSELECT_B64:
     case OP_S_BITREPLICATE_B64_B32:
     case OP_S_ANDN2_B32:
     case OP_S_ORN2_B32:
     case OP_S_XOR_B32:
     case OP_S_NOT_B32:
-    case OP_S_CSELECT_B32:
     case OP_S_WQM_B32: {
         bool mask = mask_source(s, in.src[0]) || (in.num_src > 1 && mask_source(s, in.src[1])) ||
                     is_exec_or_vcc(in.dst[0]) || in.op == OP_S_WQM_B64 || in.op == OP_S_WQM_B32 ||
@@ -1016,11 +1066,11 @@ static void tags_entry(const ShaderInfo& info, TagState& s) {
             break;
         }
     }
-    // Heap bases: parameter 0x3F stands for no table (the place in the heap is unknown).
+    // Heap bases: no table (the place in the heap is unknown).
     if (info.resource_heap_sgpr != NO_HEAP_SGPR)
-        s.sgpr[info.resource_heap_sgpr & 127] = make_tag(TAG_HEAP, HEAP_RESOURCES | (0x3F << 1));
+        s.sgpr[info.resource_heap_sgpr & 127] = make_tag(TAG_HEAP, HEAP_RESOURCES | (HEAP_NO_TABLE << 1));
     if (info.sampler_heap_sgpr != NO_HEAP_SGPR)
-        s.sgpr[info.sampler_heap_sgpr & 127] = make_tag(TAG_HEAP, HEAP_SAMPLERS | (0x3F << 1));
+        s.sgpr[info.sampler_heap_sgpr & 127] = make_tag(TAG_HEAP, HEAP_SAMPLERS | (HEAP_NO_TABLE << 1));
     if (info.stage == SHADER_VERTEX) {
         s.sgpr[0] = make_tag(TAG_VB_TABLE, 0);
         s.sgpr[1] = make_tag(TAG_VB_TABLE, 1);
@@ -1262,8 +1312,8 @@ static bool analyze_tags(Translator& t) {
     bool* reached = t.block_reached;
     tags_entry(*t.info, t.block_entry[0]);
     reached[0] = true;
-    // Iterate to a fixed point; joins only ever lower tags (to modified heap tags, then to TAG_NONE), so
-    // this terminates.
+    // Iterate to a fixed point; joins only ever lower tags (table addresses to a table not known, loaded
+    // dwords to modified ones, anything to TAG_NONE), so this terminates.
     for (bool changed = true; changed;) {
         changed = false;
         for (u32 b = 0; b < p.block_count; b++) {
@@ -1287,6 +1337,77 @@ static bool analyze_tags(Translator& t) {
         }
     }
     return find_live_sgprs(t);
+}
+
+// --- failure details ---------------------------------------------------------------------------------
+
+static const char* tag_text(Tag tag) {
+    switch (tag_kind(tag)) {
+    case TAG_MASK:
+        return "a lane mask";
+    case TAG_HEAP:
+        if (!heap_loaded(tag))
+            return "a table address";
+        return tag_payload(tag) & HEAP_MODIFIED ? "a descriptor on some paths" : "a descriptor";
+    case TAG_ROOT_HI:
+        return "a root buffer address";
+    case TAG_VB_TABLE:
+    case TAG_VB_DESC:
+        return "vertex buffers";
+    case TAG_PC:
+        return "a code address";
+    default:
+        return "a value";
+    }
+}
+
+static bool writes_register(const RdnaInst& in, bool vector, u32 reg) {
+    for (u32 d = 0; d < 2; d++) {
+        const RdnaOperand& o = in.dst[d];
+        if (vector && o.kind == OPND_VGPR) {
+            u32 count = o.count ? o.count : 1u;
+            if (reg >= o.reg && reg < o.reg + count)
+                return true;
+        } else if (!vector && overlaps(o, reg, 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void describe_tag_loss(const Translator& t, bool vector, u32 reg, char* out, usize size) {
+    const Program& p = t.program;
+    out[0] = 0;
+    s32 at = find_instruction(p, t.inst_offset);
+    if (at < 0)
+        return;
+    u32 b = p.block_of[at];
+    for (u32 i = (u32)at; i-- > p.blocks[b].first;) {
+        if (writes_register(p.insts[i], vector, reg)) {
+            snprintf(out, size, " (written at 0x%x by %s)", p.insts[i].offset, rdna_op_name(p.insts[i].op));
+            return;
+        }
+    }
+    if (b == 0) {
+        snprintf(out, size, " (not written since the program's start)");
+        return;
+    }
+    // What each way into the block brings.
+    usize n = (usize)snprintf(out, size, " (joining at 0x%x:", p.insts[p.blocks[b].first].offset);
+    u32 listed = 0;
+    for (u32 k = 0; k < p.block_count && n < size; k++) {
+        const Block& from = p.blocks[k];
+        if (!t.block_reached[k] || (from.next[0] != (s32)b && from.next[1] != (s32)b))
+            continue;
+        TagState s = t.block_entry[k];
+        for (u32 i = from.first; i < from.end; i++)
+            tags_transfer(t, s, p.insts[i], i);
+        Tag tag = vector ? s.vgpr[reg & 255] : s.sgpr[reg & 127];
+        n += (usize)snprintf(out + n, size - n, "%s %s at 0x%x", listed++ ? "," : "", tag_text(tag),
+                             p.insts[from.end - 1].offset);
+    }
+    if (n < size)
+        snprintf(out + n, size - n, ")");
 }
 
 // --- driver ------------------------------------------------------------------------------------------

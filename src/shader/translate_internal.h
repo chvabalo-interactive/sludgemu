@@ -36,8 +36,8 @@ enum TagKind : u16 {
 
 // TAG_HEAP payload bits:
 //   bit 0      which heap (HEAP_RESOURCES or HEAP_SAMPLERS)
-//   bits 1-6   the root parameter of the table the address is in (0x3F: a directly indexed heap, or
-//              a table not known)
+//   bits 1-6   the root parameter of the table the address is in (HEAP_NO_TABLE: a directly indexed
+//              heap, or a table not known)
 //   bit 7      HEAP_LOADED: a descriptor dword loaded from the heap (translated code holds its byte
 //              address), as opposed to a table address. Arithmetic on table addresses indexes the table;
 //              reading a loaded dword as a value reads the descriptor shadow at that address instead
@@ -51,6 +51,7 @@ enum TagKind : u16 {
 enum : u16 {
     HEAP_RESOURCES = 0,
     HEAP_SAMPLERS = 1,
+    HEAP_NO_TABLE = 0x3F, // the parameter field's value for no table
     HEAP_LOADED = 0x80,
     HEAP_MODIFIED = 0x100,
     HEAP_IMAGE = 0x200,
@@ -216,7 +217,7 @@ void tags_transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 ins
 // Whether an instruction copies register values as they are, so that its results keep their sources'
 // tags (moves, spills, recognized swaps). Everything else computes values: its sources are read as
 // values (register_data). tags_transfer and emission both decide by this.
-bool copies_tags(const Translator& t, const RdnaInst& in, u32 inst_idx);
+bool copies_tags(const Translator& t, const TagState& s, const RdnaInst& in, u32 inst_idx);
 // Whether a scalar register holding a loaded descriptor dword on one path into a block only becomes a
 // value there: the path reads the dword from the descriptor shadow as it jumps (see tags_merge).
 bool join_converts(Tag tag);
@@ -236,6 +237,10 @@ u8 slot_use(const Translator& t, Tag tag, u16 index);
 // wave's lane range.
 bool constant_lane(const Translator& t, const RdnaOperand& o, u32* lane);
 void emit_program(Translator& t);
+// For failure messages: why register `reg` (a VGPR if `vector`) holds nothing the translator can place
+// where the instruction being emitted reads it: the instruction that last wrote it in the block, or
+// what each path into the block brings. Failure paths only (it repeats analysis).
+void describe_tag_loss(const Translator& t, bool vector, u32 reg, char* out, usize size);
 
 // Formatting into the scratch ring.
 const char* fmt(Translator& t, const char* format, ...);

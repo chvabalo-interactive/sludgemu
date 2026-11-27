@@ -296,7 +296,7 @@ static bool emit_scalar_memory(Translator& t, const RdnaInst& in) {
         // How far into its table the program reads: console tables are plain memory, and programs may
         // read past the ranges their root signature declares.
         u32 parameter = heap_parameter(lo);
-        if (parameter < SHADER_MAX_ROOT_PARAMETERS) {
+        if (parameter != HEAP_NO_TABLE && parameter < SHADER_MAX_ROOT_PARAMETERS) {
             u32 slot = (tag_payload(lo) & 1) == HEAP_SAMPLERS ? 16 : 32;
             u32 at = t.tags.descriptor[base & 127];
             bool constant = in.src[1].kind == OPND_SPECIAL && in.src[1].reg == SRC_NULL;
@@ -375,8 +375,10 @@ static bool emit_scalar_memory(Translator& t, const RdnaInst& in) {
             return true;
         }
     }
-    translator_fail(t, "%s at 0x%x from an address the translator cannot place", rdna_op_name(in.op),
-                    in.offset);
+    char why[96];
+    describe_tag_loss(t, false, base, why, sizeof(why));
+    translator_fail(t, "%s at 0x%x from an address the translator cannot place%s", rdna_op_name(in.op),
+                    in.offset, why);
     return false;
 }
 
@@ -1158,9 +1160,12 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
     if (origin == ORIGIN_MODIFIED || origin == ORIGIN_MIXED)
         translator_fail(t, "%s at 0x%x through a buffer descriptor %s", rdna_op_name(in.op), in.offset,
                         origin_text(origin));
-    else
-        translator_fail(t, "%s at 0x%x through a descriptor the translator cannot place", rdna_op_name(in.op),
-                        in.offset);
+    else {
+        char why[96];
+        describe_tag_loss(t, false, rsrc, why, sizeof(why));
+        translator_fail(t, "%s at 0x%x through a descriptor the translator cannot place%s",
+                        rdna_op_name(in.op), in.offset, why);
+    }
     return false;
 }
 
@@ -1650,12 +1655,14 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
     if (tag_kind(tag) != TAG_HEAP || (tag_payload(tag) & 1) != HEAP_RESOURCES) {
         DescriptorOrigin origin =
             descriptor_origin(t, rsrc, in.src[1].count ? in.src[1].count : 8, HEAP_RESOURCES);
+        char why[96];
+        describe_tag_loss(t, false, rsrc, why, sizeof(why));
         if (origin == ORIGIN_MODIFIED)
-            translator_fail(t, "%s at 0x%x with an image descriptor %s", rdna_op_name(in.op), in.offset,
-                            origin_text(origin));
+            translator_fail(t, "%s at 0x%x with an image descriptor %s%s", rdna_op_name(in.op), in.offset,
+                            origin_text(origin), why);
         else
-            translator_fail(t, "%s at 0x%x with a resource not from a descriptor table", rdna_op_name(in.op),
-                            in.offset);
+            translator_fail(t, "%s at 0x%x with a resource not from a descriptor table%s",
+                            rdna_op_name(in.op), in.offset, why);
         return false;
     }
     DescriptorOrigin origin =
@@ -2230,8 +2237,13 @@ static bool emit_global(Translator& t, const RdnaInst& in) {
         }
     }
     if (parameter == ~0u) {
-        translator_fail(t, "%s at 0x%x from an address the translator cannot place", rdna_op_name(in.op),
-                        in.offset);
+        char why[96];
+        if (saddr.kind == OPND_SGPR)
+            describe_tag_loss(t, false, saddr.reg, why, sizeof(why));
+        else
+            describe_tag_loss(t, true, in.src[0].reg, why, sizeof(why));
+        translator_fail(t, "%s at 0x%x from an address the translator cannot place%s", rdna_op_name(in.op),
+                        in.offset, why);
         return false;
     }
     t.root_used |= 1ull << parameter;
