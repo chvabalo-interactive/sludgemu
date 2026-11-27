@@ -1177,6 +1177,17 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         translator_fail(t, "%s at 0x%x: address layout mismatch", rdna_op_name(in.op), in.offset);
         return false;
     }
+    // Cube arrays can be sampled with the 2D array dimension, the layer being cube index * 8 + face. A
+    // Texture2DArray reading a cube array view would be wrong twice over; only a v_cubeid face with an
+    // index folded in says so for certain (a bare face may be a layer of a real 2D array).
+    if (m.dim == DIM_2D_ARRAY && !m.a16 && (form.sample || form.gather || in.op == OP_IMAGE_GET_LOD)) {
+        Tag layer = t.tags.vgpr[addr.regs[coord_at + 2] & 255];
+        if (tag_kind(layer) == TAG_CUBE_FACE && tag_payload(layer) == 1) {
+            translator_fail(t, "%s at 0x%x: cube array sampling through the 2D array dimension",
+                            rdna_op_name(in.op), in.offset);
+            return false;
+        }
+    }
     // Texel offsets: 6-bit signed fields at bits 0, 8 and 16 of a register whose value is known. Kept
     // out of the scratch ring (", offsets" or empty), since many expressions are formatted after it.
     char offset_arg[48] = {};

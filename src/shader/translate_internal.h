@@ -26,12 +26,13 @@ typedef u16 Tag;
 
 enum TagKind : u16 {
     TAG_NONE = 0,
-    TAG_MASK,     // a lane mask (broadcast form)
-    TAG_HEAP,     // a byte address in a desktop descriptor heap; payload: heap | parameter << 1
-    TAG_ROOT_HI,  // the high dword of a root descriptor (maybe with stride bits); payload: parameter
-    TAG_VB_TABLE, // the vertex buffer table address
-    TAG_VB_DESC,  // a vertex buffer descriptor dword; payload: slot
-    TAG_PC,       // code-relative constant data offset (s_getpc_b64 + offset)
+    TAG_MASK,      // a lane mask (broadcast form)
+    TAG_HEAP,      // a byte address in a desktop descriptor heap; payload: heap | parameter << 1
+    TAG_ROOT_HI,   // the high dword of a root descriptor (maybe with stride bits); payload: parameter
+    TAG_VB_TABLE,  // the vertex buffer table address
+    TAG_VB_DESC,   // a vertex buffer descriptor dword; payload: slot
+    TAG_PC,        // code-relative constant data offset (s_getpc_b64 + offset)
+    TAG_CUBE_FACE, // a v_cubeid face (VGPR); payload 1 once a cube index is folded in (index * 8 + face)
 };
 
 enum : u16 {
