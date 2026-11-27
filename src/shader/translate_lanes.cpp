@@ -16,7 +16,8 @@
 //   EXEC (s_and_saveexec, s_and/s_andn2 of EXEC, v_cmpx) holds a subset of the lanes of the one before,
 //   and moving a saved copy back (s_mov exec, s[n:n+1], s_or exec, exec, s[n:n+1]) returns to the saved
 //   version. So at each point the analysis keeps a chain of versions, outermost first, each a subset of
-//   the one before and the last one EXEC itself, and which SGPRs hold a copy of which version. A
+//   the one before and the last one EXEC itself, and which SGPRs hold a copy of which version (or a
+//   mask inside one: EXEC & x, compare results); copies travel through moves, swaps and spill lanes. A
 //   version's name stands for its latest instance: making a version again drops the chain entries and
 //   copies of the previous one. Whole-wave code (EXEC = -1) keeps the chain to return to.
 // - Liveness (backward). Per vector register, the lanes later reads may see of its current value:
@@ -29,8 +30,9 @@
 // Instructions that keep part of their destination (16-bit halves, accumulators, SDWA preserving the
 // other bits) read the destination as well. Anything not modelled exactly keeps its EXEC guards, which
 // is always correct: only the writes the analysis marks change. Emission double-checks that a write
-// the analysis treated as replacing its destination doesn't read it (see lane_write_replaces), and
-// translation starts over without the analysis if one did.
+// the analysis treated as replacing its destination doesn't read it and that every destination
+// register is written (see lane_write_replaces, lane_write_complete); translation starts over without
+// the analysis if not.
 
 #include <stdlib.h>
 #include <string.h>
@@ -832,7 +834,9 @@ bool analyze_lane_writes(Translator& t) {
     t.lane_write = (u8*)calloc(p.count + 1, 1);
     if (!t.lane_write)
         return false;
-    if (t.keep_exec_guards)
+    // Graphics programs are short and compile quickly as they are; there, the guarded writes compile to
+    // fewer instructions (branches on EXEC the desktop compiler merges into larger ones).
+    if (t.keep_exec_guards || !t.exact)
         return true;
     for (u32 i = 0; i < p.count; i++)
         if (picks_registers_at_run_time(p.insts[i].op))

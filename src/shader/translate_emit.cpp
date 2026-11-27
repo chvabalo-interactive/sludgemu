@@ -345,12 +345,13 @@ void write_vgpr(Translator& t, const RdnaInst& in, u32 reg, const char* value) {
             return;
         }
     }
-    // The lanes outside EXEC keep the old value. A select says so without a branch (long programs full
-    // of branches on EXEC keep the desktop compiler's jump threading busy for minutes); it computes the
-    // value in every lane.
+    // The lanes outside EXEC keep the old value. In compute programs a select says so without a branch
+    // (long programs full of branches on EXEC keep the desktop compiler's jump threading busy for
+    // minutes); it computes the value in every lane. Graphics programs keep the branches, which the
+    // compiler merges into fewer instructions there.
     if (t.dpp_has_mask)
         emit(t, "if (%s && dpp_en_) %s = %s;", exec_cond(t), dst, value);
-    else if (every_lane)
+    else if (every_lane && t.exact)
         emit(t, "%s = select(%s, %s, %s);", dst, exec_cond(t), value, dst);
     else
         emit(t, "if (%s) %s = %s;", exec_cond(t), dst, value);
