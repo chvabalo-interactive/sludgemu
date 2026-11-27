@@ -148,7 +148,7 @@ enum : u32 {
 
 // A compute program with a resource table in s0 (all SRVs) and a sampler table in s1. Launched as wave32
 // (these programs don't tell): one console lane per desktop thread, one variable per register. Wave64
-// lane mapping has tests of its own (shader_lanes_test.cpp).
+// lane mapping has tests of its own (test_wave64_emission, shader_lanes_test.cpp).
 static ShaderInfo compute_info() {
     ShaderInfo info = {};
     info.stage = SHADER_COMPUTE;
@@ -1226,6 +1226,58 @@ static void test_descriptor_shadow_records() {
     }
 }
 
+// --- wave64 programs ------------------------------------------------------------------------------------
+
+// Whether the HLSL tests EXEC as one lane per thread does. Wave64 compute programs have no EXEC: a test
+// per half (EXEC0, EXEC1), so that an emission site written for one lane fails to compile.
+static bool hlsl_tests_one_exec() {
+    return hlsl_has("(EXEC)") || hlsl_has("(EXEC ") || hlsl_has("(EXEC &&");
+}
+
+// Two console lanes per desktop thread: every per-lane emission names each half's registers and tests its
+// half's EXEC, including shadow reads, image atomics and gathers at a mip.
+static void test_wave64_emission() {
+    ShaderInfo info = compute_info();
+    info.wave_size = 64;
+    {
+        // A loaded descriptor dword in a vector register read as a value.
+        Asm a = {};
+        load_buffer_descriptor(a, 0);
+        a.vop1(VOP1_MOV_B32, 6, 10);
+        a.vop2(VOP2_ADD_NC_U32, 7, V0 + 6, 0);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("g_descriptor_info.Load(EXEC0 ? v6_0 : 0u)"));
+        CHECK(hlsl_has("g_descriptor_info.Load(EXEC1 ? v6_1 : 0u)"));
+        CHECK(!hlsl_tests_one_exec());
+    }
+    {
+        // An image atomic with the old value back.
+        Asm a = {};
+        load_descriptors(a, false);
+        a.mimg_full(MIMG_ATOMIC_UMAX, 4, 0, 8, 0, 0x1, 1, true);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("uint2 at_ = uint2(v0_0, v1_0);"));
+        CHECK(hlsl_has("uint2 at_ = uint2(v0_1, v1_1);"));
+        CHECK(hlsl_has("if (EXEC0) InterlockedMax(tex_[at_], v4_0, o_);"));
+        CHECK(hlsl_has("if (EXEC1) v4_1 = (uint)o_;"));
+        CHECK(!hlsl_tests_one_exec());
+    }
+    {
+        // A gather at an explicit LOD from a heap sampler.
+        Asm a = {};
+        load_descriptors(a, true);
+        a.mimg_full(MIMG_GATHER4_L, 4, 0, 8, 16, 0x1, 1, false);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("float l_ = asfloat(v2_0);"));
+        CHECK(hlsl_has("float l_ = asfloat(v2_1);"));
+        CHECK(hlsl_has("float2 b_ = floor(float2(asfloat(v0_1), asfloat(v1_1)) * sz_ - 0.5f)"));
+        CHECK(!hlsl_tests_one_exec());
+    }
+}
+
 void test_shader_translate() {
     rdna_init();
     test_constant_sampler_in_vcc();
@@ -1241,5 +1293,6 @@ void test_shader_translate() {
     test_gathers_at_a_mip();
     test_descriptors_on_paths();
     test_descriptor_shadow_records();
+    test_wave64_emission();
     g_out.hlsl.release();
 }
