@@ -31,6 +31,42 @@ static bool ends_program(RdnaOp op) {
     return op == OP_S_ENDPGM || op == OP_S_ENDPGM_SAVED || op == OP_S_ENDPGM_ORDERED_PS_DONE;
 }
 
+// A jump to a place known at translation time: the SOPP branches, and s_setpc_b64 long branches, whose
+// targets decode_program resolves (see long_branch_target).
+static bool is_jump(const RdnaInst& in) {
+    return is_branch(in.op) || in.op == OP_S_SETPC_B64;
+}
+
+// Whether control never falls through to the next instruction.
+static bool is_unconditional_jump(const RdnaInst& in) {
+    return in.op == OP_S_BRANCH || in.op == OP_S_SETPC_B64;
+}
+
+// The target of the s_setpc_b64 at `i`, or ~0u. Programs bigger than a branch's reach (+-128 KiB) jump
+// with s_getpc_b64 s[n:n+1]; s_add_u32 (or s_sub_u32) sn, sn, literal; s_addc_u32 (s_subb_u32) sn+1,
+// sn+1, 0; s_setpc_b64 s[n:n+1]: a target relative to the instruction after the s_getpc_b64. Only that
+// exact sequence is a long branch; anything else jumps to an address computed at run time.
+static u32 long_branch_target(const RdnaInst* insts, u32 i) {
+    if (i < 3 || insts[i].op != OP_S_SETPC_B64 || insts[i].src[0].kind != OPND_SGPR)
+        return ~0u;
+    const RdnaInst& pc = insts[i - 3];
+    const RdnaInst& lo = insts[i - 2];
+    const RdnaInst& hi = insts[i - 1];
+    u32 r = insts[i].src[0].reg;
+    bool add = lo.op == OP_S_ADD_U32;
+    if (pc.op != OP_S_GETPC_B64 || pc.dst[0].kind != OPND_SGPR || pc.dst[0].reg != r)
+        return ~0u;
+    if ((!add && lo.op != OP_S_SUB_U32) || lo.dst[0].kind != OPND_SGPR || lo.dst[0].reg != r ||
+        lo.src[0].kind != OPND_SGPR || lo.src[0].reg != r || lo.src[1].kind != OPND_LITERAL)
+        return ~0u;
+    if (hi.op != (add ? OP_S_ADDC_U32 : OP_S_SUBB_U32) || hi.dst[0].kind != OPND_SGPR ||
+        hi.dst[0].reg != r + 1 || hi.src[0].kind != OPND_SGPR || hi.src[0].reg != r + 1 ||
+        hi.src[1].kind != OPND_INLINE || hi.src[1].reg != SRC_ZERO)
+        return ~0u;
+    u32 base = pc.offset + 4;
+    return add ? base + lo.src[1].value : base - lo.src[1].value;
+}
+
 static s32 find_instruction(const Program& p, u32 offset) {
     u32 lo = 0, hi = p.count;
     while (lo < hi) {
@@ -65,10 +101,20 @@ static bool decode_program(const void* code, u32 size, Program& p, char* error, 
             break;
         p.count++;
         offset += in.dwords * 4u;
-        if (is_branch(in.op) && in.branch_target > furthest_target)
+        if (in.op == OP_S_SETPC_B64) {
+            u32 target = long_branch_target(p.insts, p.count - 1);
+            if (target == ~0u) {
+                snprintf(error, error_size, "s_setpc_b64 at 0x%x to a computed address", in.offset);
+                return false;
+            }
+            in.branch_target = target;
+        }
+        if (is_jump(in) && in.branch_target > furthest_target)
             furthest_target = in.branch_target;
-        // The program ends at an S_ENDPGM no branch jumps past.
-        if (ends_program(in.op) && offset > furthest_target)
+        // The program ends where control can't go on and no branch jumps past: at an s_endpgm, or after
+        // an unconditional jump (long branches go to trampolines after the last s_endpgm, and what
+        // follows the last one may be data).
+        if ((ends_program(in.op) || is_unconditional_jump(in)) && offset > furthest_target)
             break;
     }
     return true;
@@ -81,7 +127,7 @@ static bool build_blocks(Program& p, char* error, usize error_size) {
     leader[0] = true;
     for (u32 i = 0; i < p.count; i++) {
         const RdnaInst& in = p.insts[i];
-        if (is_branch(in.op)) {
+        if (is_jump(in)) {
             s32 target = find_instruction(p, in.branch_target);
             if (target < 0) {
                 snprintf(error, error_size, "branch at 0x%x into the middle of an instruction", in.offset);
@@ -120,10 +166,10 @@ static bool build_blocks(Program& p, char* error, usize error_size) {
         blk.next[0] = blk.next[1] = -1;
         if (ends_program(last.op))
             continue;
-        if (is_branch(last.op)) {
+        if (is_jump(last)) {
             s32 target = (s32)p.block_of[find_instruction(p, last.branch_target)];
             blk.next[0] = target;
-            if (last.op != OP_S_BRANCH)
+            if (!is_unconditional_jump(last))
                 blk.next[1] = i + 1 < p.block_count ? (s32)(i + 1) : -1;
         } else {
             blk.next[0] = i + 1 < p.block_count ? (s32)(i + 1) : -1;
@@ -1210,11 +1256,10 @@ static bool analyze_tags(Translator& t) {
         return false;
     find_xor_swaps(t);
     t.block_entry = (TagState*)calloc(p.block_count, sizeof(TagState));
-    bool* reached = (bool*)calloc(p.block_count, 1);
-    if (!t.block_entry || !reached) {
-        free(reached);
+    t.block_reached = (bool*)calloc(p.block_count, 1);
+    if (!t.block_entry || !t.block_reached)
         return false;
-    }
+    bool* reached = t.block_reached;
     tags_entry(*t.info, t.block_entry[0]);
     reached[0] = true;
     // Iterate to a fixed point; joins only ever lower tags (to modified heap tags, then to TAG_NONE), so
@@ -1241,7 +1286,6 @@ static bool analyze_tags(Translator& t) {
             }
         }
     }
-    free(reached);
     return find_live_sgprs(t);
 }
 
@@ -1262,6 +1306,7 @@ static void release(Translator& t) {
     free(t.program.blocks);
     free(t.program.block_of);
     free(t.block_entry);
+    free(t.block_reached);
     free(t.xor_swap_role);
     free(t.live_sgprs);
     t.body.release();

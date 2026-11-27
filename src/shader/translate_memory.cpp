@@ -201,6 +201,8 @@ void find_slot_uses(Translator& t) {
     t.slot_use_count = 0;
     const Program& p = t.program;
     for (u32 b = 0; b < p.block_count; b++) {
+        if (!t.block_reached[b])
+            continue;
         TagState s = t.block_entry[b];
         for (u32 i = p.blocks[b].first; i < p.blocks[b].end; i++) {
             const RdnaInst& in = p.insts[i];

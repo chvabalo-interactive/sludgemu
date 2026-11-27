@@ -538,6 +538,10 @@ static void emit_blocks(Translator& t) {
     t.depth++;
     emit(t, "switch (pc) {");
     for (u32 b = 0; b < p.block_count && !t.failed; b++) {
+        // Blocks nothing jumps to (padding after a long branch's trampoline, say) get no case: no tags
+        // reach them, and neither can the program.
+        if (!t.block_reached[b])
+            continue;
         emit(t, "case %u: {", b);
         t.depth++;
         emit_block(t, b);

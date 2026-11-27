@@ -157,6 +157,7 @@ struct Translator {
     u32 code_size;
     Program program;
     TagState* block_entry; // tags at each block's start
+    bool* block_reached;   // per block: control can get there (the others aren't emitted)
     u8* xor_swap_role;     // per-instruction: 1 = start of 3-xor swap, 2 = swap continuation
     u64* live_sgprs;       // per block, two words: scalar registers live at its start
     TagState tags;         // tags before the instruction being emitted

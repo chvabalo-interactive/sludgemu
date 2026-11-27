@@ -465,6 +465,17 @@ static bool emit_scalar(Translator& t, const RdnaInst& in) {
         return true;
     case OP_S_SWAPPC_B64:
         return emit_fetch_subroutine(t, in);
+    case OP_S_SETPC_B64: {
+        // A long branch: the block ends here, jumping to the target decode_program resolved. The
+        // register's constant, folded from the s_getpc_b64 and the add, must say the same.
+        u32 target = 0;
+        if (!sgpr_constant(t.tags, in.src[0].reg, &target) || target != in.branch_target) {
+            translator_fail(t, "long branch at 0x%x whose registers don't hold its target 0x%x", in.offset,
+                            in.branch_target);
+            return false;
+        }
+        return true;
+    }
     case OP_S_GETREG_B32:
         write_sgpr(t, d, 0, "0u"); // hardware registers: nothing a translated program depends on
         return true;

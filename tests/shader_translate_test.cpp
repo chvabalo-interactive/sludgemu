@@ -103,7 +103,17 @@ enum : u32 {
     MIMG_SAMPLE_C_LZ = 47,
     VOPC_CMP_EQ_U32 = 0xC2,
     SOPC_CMP_EQ_U32 = 6,
+    SOPP_NOP = 0,
+    SOPP_BRANCH = 2,
     SOPP_CBRANCH_SCC0 = 4,
+    SOPP_CBRANCH_EXECNZ = 9,
+    SOP2_SUB_U32 = 1,
+    SOP2_ADDC_U32 = 4,
+    SOP2_SUBB_U32 = 5,
+    SOP2_CSELECT_B32 = 10,
+    SOP1_GETPC_B64 = 31,
+    SOP1_SETPC_B64 = 32,
+    SMEM_LOAD_DWORDX2 = 1,
     MUBUF_LOAD_DWORD = 12,
     MUBUF_STORE_DWORD = 28,
     MUBUF_ATOMIC_ADD = 50,
@@ -776,6 +786,86 @@ static void test_descriptor_values() {
     }
 }
 
+// --- long branches -------------------------------------------------------------------------------------
+
+// s_getpc_b64 s[reg:reg+1]; s_add_u32 / s_sub_u32 with `delta`; s_addc_u32 / s_subb_u32; s_setpc_b64:
+// a jump to the s_getpc_b64's offset + 4 + delta (negative: backwards).
+static void long_branch(Asm& a, u32 reg, s32 delta) {
+    a.sop1(SOP1_GETPC_B64, reg, 0);
+    if (delta >= 0) {
+        a.sop2(SOP2_ADD_U32, reg, reg, LIT, (u32)delta);
+        a.sop2(SOP2_ADDC_U32, reg + 1, reg + 1, ZERO);
+    } else {
+        a.sop2(SOP2_SUB_U32, reg, reg, LIT, (u32)-delta);
+        a.sop2(SOP2_SUBB_U32, reg + 1, reg + 1, ZERO);
+    }
+    a.sop1(SOP1_SETPC_B64, 0, reg);
+}
+
+static void test_long_branches() {
+    ShaderInfo info = compute_info();
+    {
+        // Over a long branch to a trampoline after the last s_endpgm, which comes back with an s_branch
+        // around padding nothing reaches.
+        Asm a = {};
+        a.sopp(SOPP_CBRANCH_EXECNZ, 5);    // 0x00 -> 0x18
+        long_branch(a, 20, 0x18);          // 0x04..0x14 -> 0x20
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 1); // 0x18
+        a.end();                           // 0x1C
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 2); // 0x20: the trampoline
+        a.sopp(SOPP_BRANCH, 1);            // 0x24 -> 0x2C
+        a.sopp(SOPP_NOP, 0);               // 0x28
+        a.end();                           // 0x2C
+        a.put(0xFFFFFFFFu);                // data, never decoded
+        CHECK(translate(a, info));
+        // Blocks: 0x00, 0x04 (the long branch), 0x18, 0x20 (the trampoline), 0x28, 0x2C.
+        CHECK(hlsl_has("case 1: {"));
+        CHECK(hlsl_has("pc = 3u;"));
+        CHECK(hlsl_has("case 3: {"));
+        CHECK(hlsl_has("pc = 5u;"));
+        CHECK(!hlsl_has("case 4: {")); // the padding
+    }
+    {
+        // A trampoline jumping back into the program with s_sub_u32 / s_subb_u32, data right after it.
+        Asm a = {};
+        a.sopp(SOPP_CBRANCH_EXECNZ, 5);    // 0x00 -> 0x18
+        long_branch(a, 20, 0x18);          // 0x04..0x14 -> 0x20
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 1); // 0x18
+        a.end();                           // 0x1C
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 2); // 0x20
+        long_branch(a, 22, -0x10);         // 0x24..0x34 -> 0x18
+        a.put(0xFFFFFFFFu);                // 0x38: data
+        a.put(0xFFFFFFFFu);
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("case 3: {"));
+        CHECK(hlsl_has("pc = 2u;"));
+    }
+    {
+        // A jump to an address loaded from memory isn't a long branch.
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, 2, 0);
+        a.sop1(SOP1_MOV_B32, 3, ZERO);
+        a.smem(SMEM_LOAD_DWORDX2, 20, 2, 0);
+        a.sop1(SOP1_SETPC_B64, 0, 20);
+        a.end();
+        CHECK(!translate(a, info));
+        CHECK(error_has("s_setpc_b64 at 0x10 to a computed address"));
+    }
+    {
+        // A path joining in the middle of the sequence with other register values: the jump goes
+        // somewhere else on that path, so the registers must hold the target, not only the code.
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, 20, ZERO + 64); // 0x00
+        a.sop1(SOP1_MOV_B32, 21, ZERO);      // 0x04
+        a.sopc(SOPC_CMP_EQ_U32, 0, ZERO);    // 0x08
+        a.sopp(SOPP_CBRANCH_SCC0, 1);        // 0x0C -> 0x14
+        long_branch(a, 20, 0x10);            // 0x10..0x20 -> 0x24
+        a.end();                             // 0x24
+        CHECK(!translate(a, info));
+        CHECK(error_has("registers don't hold its target"));
+    }
+}
+
 // --- descriptor shadow records -------------------------------------------------------------------------
 
 // What the runtime writes into the shadow for a slot, read back the way translated programs read it.
@@ -839,6 +929,7 @@ void test_shader_translate() {
     test_changed_descriptors();
     test_view_kinds();
     test_descriptor_values();
+    test_long_branches();
     test_descriptor_shadow_records();
     g_out.hlsl.release();
 }
