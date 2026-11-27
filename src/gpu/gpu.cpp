@@ -5,6 +5,7 @@
 #include <stdlib.h>
 
 #include "common/log.h"
+#include "core/title.h"
 #include "gpu/shader_programs.h"
 
 static GpuOptions g_options;
@@ -275,7 +276,12 @@ static BOOL CALLBACK create_device(PINIT_ONCE, void*, void**) {
     if (g_options.debug_layer)
         route_debug_messages(g_device);
     watch_for_removal(g_device);
-    shader_programs_init(shader_target(g_device));
+    // Translated shaders are kept with the title's other data (%LOCALAPPDATA%\sludgemu\<title id>\).
+    wchar_t cache_root[MAX_PATH];
+    bool cache = title_data_dir(L"shader_cache", cache_root, MAX_PATH);
+    if (!cache)
+        LOG_W("gpu", "no folder for the shader cache; programs are translated on every run");
+    shader_programs_init(shader_target(g_device), cache ? cache_root : nullptr);
     return TRUE;
 }
 

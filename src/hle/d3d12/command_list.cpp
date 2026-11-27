@@ -236,9 +236,9 @@ static u32 table_reach(const ConsolePipelineState* pso, u32 index, u32 declared)
     u32 extent = declared;
     for (u32 i = 0; pso && i < 2 && index < SHADER_MAX_ROOT_PARAMETERS; i++) {
         const ShaderProgram* p = pso->programs[i];
-        if (p && p->state == PROGRAM_READY && p->table_reach[index] != TABLE_REACH_UNKNOWN &&
-            p->table_reach[index] > extent)
-            extent = p->table_reach[index];
+        if (p && p->state == PROGRAM_READY && p->binary.table_reach[index] != TABLE_REACH_UNKNOWN &&
+            p->binary.table_reach[index] > extent)
+            extent = p->binary.table_reach[index];
     }
     return extent;
 }
