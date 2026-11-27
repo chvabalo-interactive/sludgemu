@@ -64,3 +64,9 @@ const D3D12_SHADER_BYTECODE* shader_rect_list_gs(u32 param_mask);
 // programs, background jobs after them. False (logged) if the queue is full; the job won't run.
 bool gpu_job_queue(void (*job)(void* context), void* context);
 bool gpu_job_queue_background(void (*job)(void* context), void* context);
+
+// The worker the calling thread is (1..), or 0 for threads outside the pool.
+u32 gpu_job_worker();
+// Something waits for what `worker` (from gpu_job_worker) is doing: it leaves background priority
+// until its current job ends.
+void gpu_job_hurry(u32 worker);

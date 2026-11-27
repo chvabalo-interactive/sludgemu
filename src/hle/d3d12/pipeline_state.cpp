@@ -792,9 +792,11 @@ static PipelineVariant* find_variant(ConsolePipelineState* pso, const PipelineOu
     return nullptr;
 }
 
-// The variant for `key`: an existing one, or a new one being built (`*added`: the caller builds it).
-// nullptr (logged once) when the pipeline has no room for more.
-static PipelineVariant* add_variant(ConsolePipelineState* pso, const PipelineOutputs& key, bool* added) {
+// The variant for `key`: an existing one, or a new one being built (`*added`: the caller builds it,
+// `builder` being the background worker that does, or 0). nullptr (logged once) when the pipeline has
+// no room for more.
+static PipelineVariant* add_variant(ConsolePipelineState* pso, const PipelineOutputs& key, u32 builder,
+                                    bool* added) {
     *added = false;
     AcquireSRWLockExclusive(&pso->lock);
     PipelineVariant* v = find_variant(pso, key);
@@ -802,6 +804,7 @@ static PipelineVariant* add_variant(ConsolePipelineState* pso, const PipelineOut
         v = &pso->variants[pso->variant_count];
         v->outputs = key;
         v->state = VARIANT_BUILDING;
+        v->builder = builder;
         v->desktop = nullptr;
         v->signature = nullptr;
         InterlockedIncrement(&pso->variant_count); // publishes it, filled in
@@ -854,6 +857,9 @@ static void variant_job(void* context) {
 }
 
 static bool wait_variant(PipelineVariant* v) {
+    // One built ahead is made at background priority (urgent jobs run at normal priority already).
+    if (v->builder)
+        gpu_job_hurry(v->builder);
     for (;;) {
         u32 state = v->state;
         if (state != VARIANT_BUILDING)
@@ -867,7 +873,7 @@ static void remember_variant(const ConsolePipelineState* pso, const PipelineOutp
 // A new variant a draw needs, built on a worker ahead of other work.
 static PipelineVariant* request_variant(ConsolePipelineState* pso, const PipelineOutputs& key) {
     bool added;
-    PipelineVariant* v = add_variant(pso, key, &added);
+    PipelineVariant* v = add_variant(pso, key, 0, &added);
     if (!added)
         return v;
     VariantJob* job = (VariantJob*)malloc(sizeof(VariantJob));
@@ -1111,9 +1117,10 @@ static void prepare_job(void* context) {
         }
     }
     if (programs_ready(pso) && desktop_signature_exists(pso)) {
+        u32 worker = gpu_job_worker();
         for (u32 i = 0; i < job->count; i++) {
             bool added;
-            PipelineVariant* v = add_variant(pso, job->outputs[i], &added);
+            PipelineVariant* v = add_variant(pso, job->outputs[i], worker, &added);
             if (added)
                 build_variant(pso, v);
         }

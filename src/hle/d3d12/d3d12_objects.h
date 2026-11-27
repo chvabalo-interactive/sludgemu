@@ -584,6 +584,7 @@ enum PipelineVariantState : u32 {
 struct PipelineVariant {
     PipelineOutputs outputs;
     volatile u32 state; // PipelineVariantState; builders wake waiters (WaitOnAddress) when it's final
+    u32 builder;        // the background worker building it ahead (gpu_job_worker), or 0
     ID3D12PipelineState* desktop;
     ID3D12RootSignature* signature; // the desktop signature it was made with (owned by the signature)
 };

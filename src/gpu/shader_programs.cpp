@@ -34,9 +34,10 @@ struct JobLane {
 struct Worker {
     IDxcCompiler3* compiler;
     HANDLE thread;
+    DWORD thread_id;
     u32 index;
     bool urgent_only;      // takes urgent work alone, so that waits never sit behind background work
-    volatile long boosted; // raised to normal priority for a program something waits for
+    volatile long boosted; // raised to normal priority: something waits for its job (gpu_job_hurry)
 };
 
 #define MAX_GENERAL_WORKERS 8
@@ -93,12 +94,18 @@ static void hurry(ShaderProgram* p) {
         InterlockedExchange(&p->urgent, 0); // asked again by the next wait
 }
 
-// A program being built while something waits for it: its worker leaves background priority until
-// the job ends (the waiting thread would otherwise wait for what busy cores leave over).
-static void boost(const ShaderProgram* p) {
-    long w = p->worker;
-    if (w > 0 && w <= (long)g_worker_count && InterlockedExchange(&g_workers[w - 1].boosted, 1) == 0)
-        SetThreadPriority(g_workers[w - 1].thread, THREAD_PRIORITY_NORMAL);
+u32 gpu_job_worker() {
+    DWORD id = GetCurrentThreadId();
+    for (u32 i = 0; i < g_worker_count; i++)
+        if (g_workers[i].thread_id == id)
+            return i + 1;
+    return 0;
+}
+
+// The waiting thread would otherwise wait for what busy cores leave over.
+void gpu_job_hurry(u32 worker) {
+    if (worker > 0 && worker <= g_worker_count && InterlockedExchange(&g_workers[worker - 1].boosted, 1) == 0)
+        SetThreadPriority(g_workers[worker - 1].thread, THREAD_PRIORITY_NORMAL);
 }
 
 static bool is_final(u32 state) {
@@ -116,12 +123,13 @@ bool shader_program_wait(ShaderProgram* p) {
         state = p->state;
         if (is_final(state))
             return state == PROGRAM_READY;
-        if (state == PROGRAM_BUILDING && !boosted) {
-            boost(p);
+        if (state == PROGRAM_BUILDING && !boosted && p->worker) {
+            gpu_job_hurry((u32)p->worker);
             boosted = true;
         }
-        // Builders wake every waiter when the state becomes final; the timeout only asks again where
-        // the queue was full, and tells about a wait that looks stuck.
+        // Builders wake every waiter when they start (to be hurried along) and when the state becomes
+        // final; the timeout only asks again where the queue was full, and tells about a wait that
+        // looks stuck.
         if (!WaitOnAddress(&p->state, &state, sizeof(state), 1000) && GetLastError() == ERROR_TIMEOUT) {
             hurry(p);
             if (++waited_s == 10)
@@ -267,6 +275,9 @@ static void build_program(Worker& w, ShaderProgram* p) {
         PROGRAM_PENDING)
         return;
     InterlockedExchange(&p->worker, (long)w.index + 1);
+    // A thread waiting since before the start hurries this worker: it may be a background one, and
+    // it was asked first by the program's creation.
+    WakeByAddressAll((void*)&p->state);
     ShaderBinary b;
     memset(&b, 0, sizeof(b));
     // Dumps are made by building, so they bypass the cache (and refresh it).
@@ -542,7 +553,7 @@ bool shader_programs_init(const ShaderTarget& target, const wchar_t* cache_root)
     open_cache(cache_root, g_workers[0].compiler);
     for (u32 i = 0; i < g_worker_count; i++) {
         Worker& w = g_workers[i];
-        w.thread = CreateThread(nullptr, 1 << 20, worker_main, &w, CREATE_SUSPENDED, nullptr);
+        w.thread = CreateThread(nullptr, 1 << 20, worker_main, &w, CREATE_SUSPENDED, &w.thread_id);
         if (!w.thread)
             FATAL("cannot start shader workers");
         SetThreadPriority(w.thread, w.urgent_only ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
