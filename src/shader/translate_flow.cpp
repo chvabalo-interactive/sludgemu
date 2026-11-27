@@ -15,7 +15,7 @@
 // it leaves passes it on. Conditions are evaluated where the blocks end, as with the dispatcher, so the
 // lanes of a wave all go the same way. Graphs that are not reducible (a loop entered at more than one
 // block), which compilers don't produce, fall back to the dispatcher: a loop over a switch on the block
-// number.
+// number. So do graphs with a loop that nothing leaves, which the desktop compiler rejects.
 
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +43,7 @@ struct Flow {
     u32* loop;        // the innermost loop holding the block, by header, or FLOW_NONE
     u32* loop_parent; // headers: the loop around theirs, or FLOW_NONE
     bool* header;
+    bool* leaves;     // headers: some edge leaves their loop
     bool* labeled;    // reached through a label (see the top of the file)
     u32* place;       // labeled blocks: the block whose code their label goes around...
     bool* after_loop; // ... or whose loop, for blocks outside it
@@ -62,6 +63,7 @@ static void flow_release(Flow& f) {
     free(f.loop);
     free(f.loop_parent);
     free(f.header);
+    free(f.leaves);
     free(f.labeled);
     free(f.place);
     free(f.after_loop);
@@ -84,6 +86,7 @@ static bool flow_alloc(Flow& f, u32 count) {
     f.loop = (u32*)calloc(n, sizeof(u32));
     f.loop_parent = (u32*)calloc(n, sizeof(u32));
     f.header = (bool*)calloc(n, 1);
+    f.leaves = (bool*)calloc(n, 1);
     f.labeled = (bool*)calloc(n, 1);
     f.place = (u32*)calloc(n, sizeof(u32));
     f.after_loop = (bool*)calloc(n, 1);
@@ -93,8 +96,8 @@ static bool flow_alloc(Flow& f, u32 count) {
     f.flatten = (bool*)calloc(n, 1);
     f.emitted = (bool*)calloc(n, 1);
     return f.rpo && f.order && f.pred_at && f.preds && f.idom && f.loop && f.loop_parent && f.header &&
-           f.labeled && f.place && f.after_loop && f.child_at && f.children && f.wrapped && f.flatten &&
-           f.emitted;
+           f.leaves && f.labeled && f.place && f.after_loop && f.child_at && f.children && f.wrapped &&
+           f.flatten && f.emitted;
 }
 
 // Block b's successors other than the program's end: up to two, a jump taken both ways counted once.
@@ -292,6 +295,33 @@ static bool flow_loops(Flow& f) {
     }
     free(work);
     free(mark);
+    return true;
+}
+
+// Whether every loop has a way out: an edge leaving it, or the program's end. The desktop compiler
+// rejects a loop without one (a console program that got there would never end, but may never get
+// there), while the dispatcher's loop always has one.
+static bool flow_loops_leave(Flow& f, const Program& p) {
+    for (u32 i = 0; i < f.reached; i++) {
+        u32 b = f.rpo[i];
+        if (f.loop[b] == FLOW_NONE)
+            continue;
+        const Block& blk = p.blocks[b];
+        for (u32 k = 0; k < 2; k++) {
+            s32 next = blk.next[k];
+            if (next < 0 && k == 1)
+                continue; // no second way (a first one below zero is the program's end)
+            // Loops nest: the first one around b that holds `next` holds it in all those around it too.
+            for (u32 l = f.loop[b]; l != FLOW_NONE; l = f.loop_parent[l]) {
+                if (next >= 0 && in_loop(f, (u32)next, l))
+                    break;
+                f.leaves[l] = true;
+            }
+        }
+    }
+    for (u32 i = 0; i < f.reached; i++)
+        if (f.header[f.rpo[i]] && !f.leaves[f.rpo[i]])
+            return false;
     return true;
 }
 
@@ -938,6 +968,8 @@ void emit_control_flow(Translator& t) {
             why = "a loop with several entries";
         else if (!flow_loops(f))
             why = "out of memory";
+        else if (!flow_loops_leave(f, p))
+            why = "a loop with no way out";
         else {
             flow_labels(f);
             if (!flow_children(f))

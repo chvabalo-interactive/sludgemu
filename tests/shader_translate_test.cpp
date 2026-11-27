@@ -997,6 +997,20 @@ static void test_control_flow() {
         CHECK(hlsl_has("// blocks dispatched: a loop with several entries"));
         CHECK(hlsl_has("switch (pc) {"));
     }
+    {
+        // A loop nothing leaves, on a path the program may not take: the desktop compiler rejects a
+        // `for (;;)` without a break, so the dispatcher.
+        Asm a = {};
+        a.sopc(SOPC_CMP_EQ_U32, 0, ZERO);  // 0x00
+        a.sopp(SOPP_CBRANCH_SCC1, 2);      // 0x04 -> 0x10
+        a.sopk(SOPK_ADDK_I32, 20, 1);      // 0x08
+        a.sopp(SOPP_BRANCH, (u32)-2);      // 0x0C -> 0x08
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 1); // 0x10
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("// blocks dispatched: a loop with no way out"));
+        CHECK(!hlsl_has("for (;;)"));
+    }
 }
 
 // --- image atomics -------------------------------------------------------------------------------------
