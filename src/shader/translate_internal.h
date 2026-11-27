@@ -182,6 +182,7 @@ struct Translator {
     u8 sgpr_used[128];
     u8 vgpr_used[256];
     bool scc_used;
+    bool far_jumps;         // the control flow jumps through go_ (see translate_flow.cpp)
     u32 ps_input_vgpr[16];  // pixel shaders: first VGPR of each SPI_PS_INPUT_ADDR input, or ~0u
     u8 attribute_modes[32]; // pixel shaders: interpolations each attribute is read with (1 << mode)
     u8 vs_fetch_components[SHADER_MAX_VERTEX_ELEMENTS]; // vertex shaders: dwords fetched per element
@@ -267,6 +268,15 @@ bool sgpr_live_in(const Translator& t, u32 block, u32 reg);
 // Exact lanes: whether an SGPR holds data that reads the same as a mask (all bits clear or set).
 bool sgpr_neutral(const TagState& s, u32 reg);
 void emit_program(Translator& t);
+// A block's instructions; t.tags ends as the state where it ends. translate_emit.cpp
+void emit_block(Translator& t, u32 b);
+// The condition under which the jump ending a block is taken (with `negate`: not taken).
+const char* branch_condition(Translator& t, const RdnaInst& in, bool negate);
+// The program's blocks as structured control flow (or the dispatcher). translate_flow.cpp
+void emit_control_flow(Translator& t);
+// Join conversions on the edge to block `next` (see translate_flow.cpp); with `emitting` false, only
+// whether there are any.
+bool emit_join_conversions(Translator& t, s32 next, bool emitting);
 // For failure messages: why register `reg` (a VGPR if `vector`) holds nothing the translator can place
 // where the instruction being emitted reads it: the instruction that last wrote it in the block, or
 // what each path into the block brings. Failure paths only (it repeats analysis).

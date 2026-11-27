@@ -674,7 +674,7 @@ static void emit_lanes(Translator& t, const RdnaInst& in) {
     }
 }
 
-static void emit_block(Translator& t, u32 b) {
+void emit_block(Translator& t, u32 b) {
     const Block& blk = t.program.blocks[b];
     t.tags = t.block_entry[b];
     for (u32 i = blk.first; i < blk.end && !t.failed; i++) {
@@ -689,130 +689,30 @@ static void emit_block(Translator& t, u32 b) {
     }
 }
 
-// The condition under which a block's last instruction branches.
-static const char* branch_condition(Translator& t, const RdnaInst& in) {
+const char* branch_condition(Translator& t, const RdnaInst& in, bool negate) {
+    const char* test = "true";
+    bool taken_if_set = true;
     switch (in.op) {
     case OP_S_CBRANCH_SCC0:
-        t.scc_used = true;
-        return "!scc";
     case OP_S_CBRANCH_SCC1:
         t.scc_used = true;
-        return "scc";
+        test = "scc";
+        taken_if_set = in.op == OP_S_CBRANCH_SCC1;
+        break;
     case OP_S_CBRANCH_VCCZ:
-        return fmt(t, "!%s", mask_nonzero(t, SRC_VCC_LO));
     case OP_S_CBRANCH_VCCNZ:
-        return mask_nonzero(t, SRC_VCC_LO);
+        test = mask_nonzero(t, SRC_VCC_LO);
+        taken_if_set = in.op == OP_S_CBRANCH_VCCNZ;
+        break;
     case OP_S_CBRANCH_EXECZ:
-        return fmt(t, "!%s", mask_nonzero(t, SRC_EXEC_LO));
     case OP_S_CBRANCH_EXECNZ:
-        return mask_nonzero(t, SRC_EXEC_LO);
+        test = mask_nonzero(t, SRC_EXEC_LO);
+        taken_if_set = in.op == OP_S_CBRANCH_EXECNZ;
+        break;
     default:
-        return "true";
+        return negate ? "false" : "true";
     }
-}
-
-#define PC_EXIT 0xFFFFFFFFu
-
-// Scalar registers whose form changes where block `next` starts, converted on the way there (t.tags holds
-// the state where the current block ends), where something may still read them:
-// - loaded descriptor dwords, held as heap addresses here but values there (another way in holds a
-//   value, see tags_merge): read from the shadow;
-// - with exact lanes, masks here that are data there (see merge_tag): their bits.
-// With `emitting` false, only whether there are any.
-static bool emit_join_conversions(Translator& t, s32 next, bool emitting) {
-    if (next < 0)
-        return false;
-    const TagState& entry = t.block_entry[next];
-    bool any = false;
-    for (u32 r = 0; r < 128; r++) {
-        if (!sgpr_live_in(t, (u32)next, r))
-            continue;
-        if (join_converts(t.tags.sgpr[r]) && !heap_loaded(entry.sgpr[r])) {
-            any = true;
-            if (emitting) {
-                t.needs_descriptor_info = true;
-                emit(t, "%s = g_descriptor_info.Load(%s);", sgpr(t, r), sgpr(t, r));
-            }
-        } else if (r != SRC_EXEC_LO && r != SRC_EXEC_HI && edge_converts(t, t.tags.sgpr[r], entry.sgpr[r])) {
-            any = true;
-            if (emitting)
-                emit(t, "%s = mask_bits(%s);", sgpr(t, r), sgpr(t, r));
-        }
-    }
-    for (u32 slot = 0; slot < t.spill_vgpr_count; slot++)
-        for (u32 lane = 0; lane < 64; lane++) {
-            if (!(t.spill_lanes[slot] & (1ull << lane)))
-                continue;
-            Tag out = t.tags.spill_tag[slot][lane], in = entry.spill_tag[slot][lane];
-            if (join_converts(out) && !heap_loaded(in)) {
-                any = true;
-                if (emitting) {
-                    t.needs_descriptor_info = true;
-                    emit(t, "spill%u_%u = g_descriptor_info.Load(spill%u_%u);", slot, lane, slot, lane);
-                }
-            } else if (edge_converts(t, out, in)) {
-                any = true;
-                if (emitting)
-                    emit(t, "spill%u_%u = mask_bits(spill%u_%u);", slot, lane, slot, lane);
-            }
-        }
-    return any;
-}
-
-// Several blocks: a loop over a switch on the block number. Branch conditions are uniform, so the
-// whole wave always takes the same case.
-static void emit_blocks(Translator& t) {
-    const Program& p = t.program;
-    if (p.block_count == 1) {
-        emit_block(t, 0);
-        return;
-    }
-    emit(t, "uint pc = 0;");
-    emit(t, "[loop] while (pc != 0x%08xu) {", PC_EXIT);
-    t.depth++;
-    emit(t, "switch (pc) {");
-    for (u32 b = 0; b < p.block_count && !t.failed; b++) {
-        // Blocks nothing jumps to (padding after a long branch's trampoline, say) get no case: no tags
-        // reach them, and neither can the program.
-        if (!t.block_reached[b])
-            continue;
-        emit(t, "case %u: {", b);
-        t.depth++;
-        emit_block(t, b);
-        const Block& blk = p.blocks[b];
-        const RdnaInst& last = p.insts[blk.end - 1];
-        u32 next0 = blk.next[0] < 0 ? PC_EXIT : (u32)blk.next[0];
-        bool convert0 = emit_join_conversions(t, blk.next[0], false);
-        bool convert1 = emit_join_conversions(t, blk.next[1], false);
-        if (blk.next[1] >= 0 && (convert0 || convert1)) {
-            emit(t, "{ bool taken_ = %s;", branch_condition(t, last));
-            t.depth++;
-            emit(t, "if (taken_) {");
-            t.depth++;
-            emit_join_conversions(t, blk.next[0], true);
-            t.depth--;
-            emit(t, "} else {");
-            t.depth++;
-            emit_join_conversions(t, blk.next[1], true);
-            t.depth--;
-            emit(t, "}");
-            emit(t, "pc = taken_ ? %uu : %uu;", next0, (u32)blk.next[1]);
-            t.depth--;
-            emit(t, "}");
-        } else if (blk.next[1] >= 0) {
-            emit(t, "pc = %s ? %uu : %uu;", branch_condition(t, last), next0, (u32)blk.next[1]);
-        } else {
-            emit_join_conversions(t, blk.next[0], true);
-            emit(t, "pc = %uu;", next0);
-        }
-        emit(t, "break;");
-        t.depth--;
-        emit(t, "}");
-    }
-    emit(t, "default: pc = 0x%08xu; break;", PC_EXIT);
-    emit(t, "}");
-    t.depth--;
-    emit(t, "}");
+    return taken_if_set != negate ? test : fmt(t, "!%s", test);
 }
 
 // --- the program -------------------------------------------------------------------------------------
@@ -842,7 +742,8 @@ static const char k_preamble[] =
     // The first clear bit of a console mask `width` bits wide: lanes the desktop wave lacks count as clear.
     "uint wave_first_zero(uint m, uint width) { uint4 b = WaveActiveBallot(m != 0u); uint lo = ~b.x, hi = "
     "width > 32u ? ~b.y : 0u; return lo ? firstbitlow(lo) : hi ? 32u + firstbitlow(hi) : 0xffffffffu; }\n"
-    "uint read_first(uint v, uint m) { uint lane = WaveActiveMin(m != 0u ? WaveGetLaneIndex() : 0xffffffffu); "
+    "uint read_first(uint v, uint m) { uint lane = WaveActiveMin(m != 0u ? WaveGetLaneIndex() : "
+    "0xffffffffu); "
     "return WaveActiveBitOr(WaveGetLaneIndex() == (lane == 0xffffffffu ? 0u : lane) ? v : 0u); }\n"
     "float mul_legacy(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }\n"
     "uint f32_to_u32(float f) { return f != f ? 0u : f >= 4294967040.0f ? 0xffffffffu : f <= 0.0f ? 0u : "
@@ -1171,6 +1072,8 @@ static void write_declarations(Translator& t, Text& h) {
         h.put("    s126 = mask_of(thread0 < %uu);\n    s127 = s126;\n", t.wave_threads);
     if (t.scc_used)
         h.put("    bool scc = false;\n");
+    if (t.far_jumps)
+        h.put("    uint go_ = 0u;\n");
     for (u32 r = 0; r < 256; r++) {
         if (!t.vgpr_used[r])
             continue;
@@ -1261,7 +1164,7 @@ void emit_program(Translator& t) {
         layout_ps_inputs(t);
     t.depth = 1;
     t.sgpr_used[SRC_EXEC_LO] = t.sgpr_used[SRC_EXEC_HI] = 1;
-    emit_blocks(t);
+    emit_control_flow(t);
     if (t.failed)
         return;
     if (t.info->stage == SHADER_VERTEX && !t.position_exported) {

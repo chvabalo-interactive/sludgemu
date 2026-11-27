@@ -112,6 +112,7 @@ enum : u32 {
     SOPP_NOP = 0,
     SOPP_BRANCH = 2,
     SOPP_CBRANCH_SCC0 = 4,
+    SOPP_CBRANCH_SCC1 = 5,
     SOPP_CBRANCH_EXECNZ = 9,
     SOP2_SUB_U32 = 1,
     SOP2_ADDC_U32 = 4,
@@ -231,6 +232,12 @@ static bool error_has(const char* text) {
 
 static bool hlsl_has(const char* text) {
     return g_out.hlsl.data && strstr(g_out.hlsl.data, text) != nullptr;
+}
+
+// Whether the HLSL has `first`, and `second` after it.
+static bool hlsl_before(const char* first, const char* second) {
+    const char* at = g_out.hlsl.data ? strstr(g_out.hlsl.data, first) : nullptr;
+    return at && strstr(at + strlen(first), second) != nullptr;
 }
 
 // --- constant samplers ---------------------------------------------------------------------------------
@@ -855,16 +862,16 @@ static void test_long_branches() {
         a.end();                           // 0x1C
         a.vop1(VOP1_MOV_B32, 1, ZERO + 2); // 0x20: the trampoline
         a.sopp(SOPP_BRANCH, 1);            // 0x24 -> 0x2C
-        a.sopp(SOPP_NOP, 0);               // 0x28
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 3); // 0x28: the padding
         a.end();                           // 0x2C
         a.put(0xFFFFFFFFu);                // data, never decoded
         CHECK(translate(a, info));
-        // Blocks: 0x00, 0x04 (the long branch), 0x18, 0x20 (the trampoline), 0x28, 0x2C.
-        CHECK(hlsl_has("case 1: {"));
-        CHECK(hlsl_has("pc = 3u;"));
-        CHECK(hlsl_has("case 3: {"));
-        CHECK(hlsl_has("pc = 5u;"));
-        CHECK(!hlsl_has("case 4: {")); // the padding
+        // The long branch and the trampoline in line in the else arm, the padding left out.
+        CHECK(hlsl_has("if (wave_any(s126)) {"));
+        CHECK(hlsl_before("if (EXEC) v1 = 0x00000001u;", "} else {"));
+        CHECK(hlsl_before("} else {", "if (EXEC) v1 = 0x00000002u;"));
+        CHECK(!hlsl_has("0x00000003u"));
+        CHECK(!hlsl_has("switch (pc)"));
     }
     {
         // A trampoline jumping back into the program with s_sub_u32 / s_subb_u32, data right after it.
@@ -878,8 +885,9 @@ static void test_long_branches() {
         a.put(0xFFFFFFFFu);                // 0x38: data
         a.put(0xFFFFFFFFu);
         CHECK(translate(a, info));
-        CHECK(hlsl_has("case 3: {"));
-        CHECK(hlsl_has("pc = 2u;"));
+        // The long branches and the trampoline skipped over, the join after them.
+        CHECK(hlsl_has("if (!wave_any(s126)) {"));
+        CHECK(hlsl_before("if (EXEC) v1 = 0x00000002u;", "if (EXEC) v1 = 0x00000001u;"));
     }
     {
         // A jump to an address loaded from memory isn't a long branch.
@@ -904,6 +912,90 @@ static void test_long_branches() {
         a.end();                             // 0x24
         CHECK(!translate(a, info));
         CHECK(error_has("registers don't hold its target"));
+    }
+}
+
+// --- control flow --------------------------------------------------------------------------------------
+
+// The shapes the structured emission writes (what the programs compute is checked on the GPU, see
+// shader_lanes_test.cpp).
+static void test_control_flow() {
+    ShaderInfo info = compute_info();
+    {
+        // A skip-over: the code skipped nests in an if, the join follows.
+        Asm a = {};
+        a.sopc(SOPC_CMP_EQ_U32, 0, ZERO);  // 0x00
+        a.sopp(SOPP_CBRANCH_SCC1, 1);      // 0x04 -> 0x0C
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 1); // 0x08
+        a.vop1(VOP1_MOV_B32, 2, ZERO + 2); // 0x0C
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_before("if (!scc) {", "if (EXEC) v1 = 0x00000001u;"));
+        CHECK(hlsl_before("}", "if (EXEC) v2 = 0x00000002u;"));
+        CHECK(!hlsl_has("switch") && !hlsl_has("for (;;)"));
+    }
+    {
+        // A counted loop: falling off the body goes on, the way out breaks.
+        Asm a = {};
+        a.sopk(SOPK_MOVK_I32, 20, 0);       // 0x00
+        a.sopk(SOPK_ADDK_I32, 20, 1);       // 0x04
+        a.sopk(SOPK_CMPK_LG_U32, 20, 10);   // 0x08
+        a.sopp(SOPP_CBRANCH_SCC1, (u32)-3); // 0x0C -> 0x04
+        a.vop1(VOP1_MOV_B32, 1, 20);        // 0x10
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_before("[loop] for (;;) {", "if (!scc) break;"));
+        CHECK(hlsl_before("if (!scc) break;", "if (EXEC) v1 = s20;"));
+        CHECK(!hlsl_has("continue"));
+    }
+    {
+        // Two joins of one block, the later one reached from inside the code before the earlier one: a
+        // label to break to.
+        Asm a = {};
+        a.sopc(SOPC_CMP_EQ_U32, 0, ZERO);  // 0x00
+        a.sopp(SOPP_CBRANCH_SCC0, 3);      // 0x04 -> 0x14
+        a.sopc(SOPC_CMP_EQ_U32, 1, ZERO);  // 0x08
+        a.sopp(SOPP_CBRANCH_SCC1, 2);      // 0x0C -> 0x18
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 1); // 0x10
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 2); // 0x14: the earlier join
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 3); // 0x18: the later one
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_before("switch (0u) { default: // break: to 0x18", "if (scc) break;"));
+        CHECK(hlsl_before("if (scc) break;", "if (EXEC) v1 = 0x00000001u;"));
+        CHECK(!hlsl_has("go_"));
+    }
+    {
+        // A loop leaving to one place two ways, one through a block of its own: the other way leaves the
+        // loop and that block's label at once, through go_.
+        Asm a = {};
+        a.sopk(SOPK_MOVK_I32, 20, 0);       // 0x00
+        a.sopk(SOPK_ADDK_I32, 20, 1);       // 0x04
+        a.sopc(SOPC_CMP_EQ_U32, 20, 0);     // 0x08
+        a.sopp(SOPP_CBRANCH_SCC1, 3);       // 0x0C -> 0x1C
+        a.sopk(SOPK_CMPK_LG_U32, 20, 100);  // 0x10
+        a.sopp(SOPP_CBRANCH_SCC1, (u32)-5); // 0x14 -> 0x04
+        a.vop1(VOP1_MOV_B32, 1, ZERO + 2);  // 0x18
+        a.vop1(VOP1_MOV_B32, 2, 20);        // 0x1C
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("uint go_ = 0u;"));
+        CHECK(hlsl_before("if (scc) { go_ = ", "if (go_ == "));
+        CHECK(hlsl_before("if (go_ == ", "if (EXEC) v1 = 0x00000002u;"));
+    }
+    {
+        // A loop entered at two blocks: the dispatcher.
+        Asm a = {};
+        a.sopc(SOPC_CMP_EQ_U32, 0, ZERO);   // 0x00
+        a.sopp(SOPP_CBRANCH_SCC1, 1);       // 0x04 -> 0x0C
+        a.sopk(SOPK_ADDK_I32, 20, 10);      // 0x08
+        a.sopk(SOPK_ADDK_I32, 20, 1);       // 0x0C
+        a.sopk(SOPK_CMPK_LG_U32, 20, 30);   // 0x10
+        a.sopp(SOPP_CBRANCH_SCC1, (u32)-4); // 0x14 -> 0x08
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("// blocks dispatched: a loop with several entries"));
+        CHECK(hlsl_has("switch (pc) {"));
     }
 }
 
@@ -1289,6 +1381,7 @@ void test_shader_translate() {
     test_view_kinds();
     test_descriptor_values();
     test_long_branches();
+    test_control_flow();
     test_image_atomics();
     test_gathers_at_a_mip();
     test_descriptors_on_paths();
