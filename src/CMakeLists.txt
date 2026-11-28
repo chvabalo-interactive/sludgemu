@@ -107,6 +107,9 @@ add_executable(sludgemu WIN32
     hle/d3d12/command_list.h
     hle/d3d12/command_list.cpp
     hle/d3d12/command_list_work.cpp
+    hle/d3d12/command_list_x.cpp
+    hle/d3d12/command_args.h
+    hle/d3d12/command_args.cpp
     hle/d3d12/barriers.h
     hle/d3d12/barriers.cpp
     hle/d3d12/frame_pacing.h

@@ -92,6 +92,13 @@ void console_counter_wait(u64 address, u64 value);
 typedef void* (*ConsoleAllocatorCallback)(void* allocator, void* list, u32 xmem_type, usize size,
                                           u32 alignment, u32 flags, u64 context);
 
+// Memory handed out by AllocateFromCommandAllocatorX: GPU-visible chunks used front to back, rewound
+// when the allocator is reset (the title has waited for the GPU then, as for the command memory).
+struct AllocatorChunk {
+    u8* memory;
+    u32 size;
+};
+
 struct ConsoleCommandAllocator {
     ConsoleObjectHeader header;
 
@@ -99,7 +106,15 @@ struct ConsoleCommandAllocator {
     ID3D12CommandAllocator* desktop;
     ConsoleAllocatorCallback callback;
     u64 callback_context;
+    AllocatorChunk* chunks;
+    u32 chunk_count;
+    u32 current_chunk; // the chunk allocations come from
+    u32 chunk_used;    // bytes of it handed out
 };
+
+// `size` bytes at `alignment` (a power of two, at most 64 KiB) from the allocator's memory, valid until
+// it is reset; nullptr when out of memory.
+void* console_allocator_allocate(ConsoleCommandAllocator* allocator, u32 size, u32 alignment);
 
 // The command buffer write cursor of a console command list. Inlined title code writes packets only
 // while current < limit_draw / limit_api; we keep them null.
@@ -124,6 +139,9 @@ struct PipelineOutputs {
     u8 depth_format;
     u8 sample_count;
     u8 rect_list; // drawn as console rectangle lists (geometry shader expansion)
+    // Samples the console quad sample mask (OMSetSampleMaskX) leaves out, which the desktop pipeline's
+    // sample mask leaves out too; 0 for none (the default).
+    u16 dropped_samples;
 };
 
 // Root arguments: tables as desktop heap indices, root descriptors as desktop GPU addresses. They
@@ -180,6 +198,24 @@ struct ListState {
     ID3D12Resource* predication;
     u64 predication_offset;
     D3D12_PREDICATION_OP predication_op;
+    u16 dropped_samples; // see PipelineOutputs
+    // Variable rate shading: the base rate and combiners (1x1, passthrough when never set), the
+    // shading rate image (borrowed: the title keeps it alive while lists use it).
+    bool has_shading_rate;
+    D3D12_SHADING_RATE shading_rate;
+    D3D12_SHADING_RATE_COMBINER shading_rate_combiners[2];
+    ID3D12Resource* shading_rate_image;
+    bool has_view_instance_mask;
+    u32 view_instance_mask;
+    // Programmable sample positions: per_pixel * pixels of them; none set when per_pixel is 0.
+    u8 sample_positions_per_pixel;
+    u8 sample_position_pixels;
+    D3D12_SAMPLE_POSITION sample_positions[64];
+    u32 stream_output_mask; // stream output targets set
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW stream_output[D3D12_SO_BUFFER_SLOT_COUNT];
+    // Between BeginRenderPass and EndRenderPass: the resolves the pass ends with (see
+    // command_list.cpp, render passes).
+    bool in_render_pass;
 };
 
 // What happens on the queue between two parts of a split list.
