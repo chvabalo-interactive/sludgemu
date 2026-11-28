@@ -864,12 +864,18 @@ static void WINAPI list_end_render_pass(ConsoleCommandList* self) {
 // A console bundle recorded onto a desktop bundle (one part: bundles neither signal nor wait). The
 // desktop list leaves the bundle with the bundle's pipeline, root arguments and input state; the
 // console list's own state goes on again so later commands see what the title set.
+//
+// Not D3D12's inheritance: the bundle's draws flush the root arguments the bundle itself recorded, not
+// the caller's, and what the bundle sets doesn't carry over to the caller. Titles relying on either
+// draw differently (warned once).
 static void WINAPI list_execute_bundle(ConsoleCommandList* self, ConsoleCommandList* bundle) {
     if (!bundle || bundle->type != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->segment_count != 1 ||
         !bundle->segments[0].closed || self->type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
         LOG_W_ONCE("d3d12", "ExecuteBundle with an unclosed or unsplittable bundle skipped");
         return;
     }
+    LOG_W_ONCE("d3d12", "ExecuteBundle: bundles don't inherit root arguments from the calling list, nor pass "
+                        "their state back to it");
     self->desktop->ExecuteBundle(bundle->segments[0].list);
     // Its descriptor tables are mirrored again when this list is submitted.
     for (u32 t = 0; t < bundle->table_count; t++) {
