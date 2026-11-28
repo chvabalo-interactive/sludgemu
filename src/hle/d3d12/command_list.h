@@ -26,5 +26,9 @@ ID3D12Resource* list_resource(void* console_resource, u64* offset, GpuAccess acc
 // `counter`: for waits on a title counter (see console_sync_fence), its address; otherwise 0.
 bool list_split(ConsoleCommandList* list, ListSyncKind sync, ID3D12Fence* fence, u64 value, u64 counter);
 
+// Reapplies the list's tracked desktop state after external work (e.g. FidelityFX) records directly
+// to `list->desktop`.
+void list_restore_state(ConsoleCommandList* list);
+
 extern const ConsoleEntry k_list_work_entries[];
 extern const u32 k_list_work_entry_count;

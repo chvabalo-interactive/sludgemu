@@ -235,6 +235,12 @@ static bool texture_view_format(const ConsoleResource* r, DXGI_FORMAT view, bool
         return false;
     }
     DXGI_FORMAT f = view != DXGI_FORMAT_UNKNOWN ? view : r->desc.Format;
+    DXGI_FORMAT target = format_desktop_target(r->desc.Format, r->desc.Flags);
+    if (r->desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && target == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        f == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
+        *out = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        return true;
+    }
     *out = shader_read ? format_desktop_shader_read(f) : format_desktop(f);
     return *out != DXGI_FORMAT_UNKNOWN;
 }

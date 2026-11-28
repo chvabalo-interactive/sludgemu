@@ -107,6 +107,7 @@ add_executable(sludgemu WIN32
     hle/d3d12/frame_pacing.h
     hle/d3d12/frame_pacing.cpp
     hle/d3d12/bvh_builder.cpp
+    hle/fidelityfx/fidelityfx.cpp
     hle/dstorage/bcpack.cpp
     hle/dstorage/dstorage.cpp
 

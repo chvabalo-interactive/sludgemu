@@ -1,5 +1,7 @@
 #include "gpu/formats.h"
 
+#include <d3d12.h>
+
 static FormatInfo color(u8 bytes) {
     return {FORMAT_KIND_COLOR, bytes, 1, 1};
 }
@@ -202,6 +204,15 @@ DXGI_FORMAT format_desktop_resource(DXGI_FORMAT f) {
     default:
         return d;
     }
+}
+
+DXGI_FORMAT format_desktop_target(DXGI_FORMAT f, u32 resource_flags) {
+    // Console titles render/UAV-write R9G9B9E5_SHAREDEXP (e.g. FSR output); desktop only allows
+    // sampled reads, so stand in R16G16B16A16_FLOAT when RT or UAV access is requested.
+    const u32 writable = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (f == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && (resource_flags & writable))
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    return format_desktop_resource(f);
 }
 
 DXGI_FORMAT format_desktop_shader_read(DXGI_FORMAT f) {

@@ -55,6 +55,10 @@ DXGI_FORMAT format_desktop(DXGI_FORMAT format);
 // only way desktop shaders may read a depth texture (console shaders can read any).
 DXGI_FORMAT format_desktop_resource(DXGI_FORMAT format);
 
+// Same as format_desktop_resource, but substitutes a renderable/UAV stand-in when `format` (such
+// as R9G9B9E5_SHAREDEXP) cannot take RT or UAV flags on desktop.
+DXGI_FORMAT format_desktop_target(DXGI_FORMAT format, u32 resource_flags);
+
 // The desktop format a shader reads a texture through when its view names no format: the depth
 // plane for depth formats, format_desktop otherwise.
 DXGI_FORMAT format_desktop_shader_read(DXGI_FORMAT format);
