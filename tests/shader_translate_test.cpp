@@ -1517,6 +1517,26 @@ static void test_spills_apart() {
     }
 }
 
+// --- LDS ---------------------------------------------------------------------------------------------
+
+// Console groups may allocate up to 64 KiB of LDS, desktop ones 32 KiB.
+static void test_lds_size() {
+    static const u32 k_program[] = {
+        0x7e020280,             // v_mov_b32 v1, 0
+        0xd8340000, 0x00000001, // ds_write_b32 v1, v0
+        0xbf810000,             // s_endpgm
+    };
+    ShaderInfo info = compute_info();
+    Asm a = {};
+    put_words(a, k_program, ARRAY_COUNT(k_program));
+    info.lds_bytes = 32768;
+    CHECK(translate(a, info));
+    CHECK(hlsl_has("groupshared uint g_lds[8192];"));
+    info.lds_bytes = 65536;
+    CHECK(!translate(a, info));
+    CHECK(error_has("65536 bytes of LDS"));
+}
+
 void test_shader_translate() {
     rdna_init();
     test_constant_sampler_in_vcc();
@@ -1536,5 +1556,6 @@ void test_shader_translate() {
     test_wave64_emission();
     test_half_interpolation();
     test_spills_apart();
+    test_lds_size();
     g_out.hlsl.release();
 }

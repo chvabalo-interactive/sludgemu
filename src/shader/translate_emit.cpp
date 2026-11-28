@@ -1033,14 +1033,22 @@ static const char* thread_id(Translator& t, u32 axis, u32 half) {
     return tz == 1 ? "0u" : fmt(t, "(%s / %uu)", c, tx * ty);
 }
 
+// Desktop groups get 32 KiB of LDS, console ones up to 64 KiB.
 #define DESKTOP_MAX_LDS_BYTES 32768
+
+// The LDS the program's group allocates (all of it where the pipeline doesn't say), or 0 without LDS
+// accesses.
+static u32 program_lds_bytes(const Translator& t) {
+    if (!t.uses_lds)
+        return 0;
+    return t.info->lds_bytes ? t.info->lds_bytes : 65536;
+}
 
 // Compute with exact lanes (see translate.h): desktop groups of whole desktop waves of 32, one console
 // wave each. Which threads a driver puts in a wave is its business, so waves take console wave numbers
 // from a counter, and console thread IDs follow from the wave and lane.
 static void write_compute_head(Translator& t, Text& h) {
-    const ShaderInfo& info = *t.info;
-    u32 lds_bytes = t.uses_lds ? (info.lds_bytes ? info.lds_bytes : 65536) : 0;
+    u32 lds_bytes = program_lds_bytes(t);
     // Without room for the counter next to the program's LDS, its first dword holds it at the start:
     // console LDS starts undefined.
     bool borrow = lds_bytes + 4 > DESKTOP_MAX_LDS_BYTES;
@@ -1105,7 +1113,7 @@ static void write_declarations(Translator& t, Text& h) {
               t.sampler_compare & (1u << i) ? "SamplerComparisonState" : "SamplerState", i, i,
               SHADER_INLINE_SAMPLER_SPACE);
     if (t.uses_lds)
-        h.put("groupshared uint g_lds[%u];\n", (info.lds_bytes ? info.lds_bytes : 65536) / 4);
+        h.put("groupshared uint g_lds[%u];\n", program_lds_bytes(t) / 4);
     h.put("struct CbArray { uint4 c[4096]; };\n");
 
     if (info.stage == SHADER_VERTEX) {
@@ -1269,6 +1277,10 @@ void emit_program(Translator& t) {
         return;
     if (t.info->stage == SHADER_VERTEX && !t.position_exported) {
         translator_fail(t, "vertex shader without a position export");
+        return;
+    }
+    if (program_lds_bytes(t) > DESKTOP_MAX_LDS_BYTES) {
+        translator_fail(t, "%u bytes of LDS, more than a desktop group has", program_lds_bytes(t));
         return;
     }
     // Desktop input formats for the fetched elements.
