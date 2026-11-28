@@ -12,6 +12,7 @@
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
 #include "hle/d3d12/frame_pacing.h"
+#include "hle/d3d12/target_tiles.h"
 #include "hle/d3d12/texture_sync.h"
 #include "hle/d3d12/views.h"
 
@@ -344,6 +345,7 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
         gpu_window_init();
         gpu_page_tables_init();
         texture_sync_init();
+        target_tiles_init();
         console_resource_init();
         console_descriptor_heap_init();
         console_query_heap_init();

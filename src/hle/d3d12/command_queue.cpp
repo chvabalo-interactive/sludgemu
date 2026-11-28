@@ -17,6 +17,7 @@
 #include "hle/d3d12/frame_pacing.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
+#include "hle/d3d12/target_tiles.h"
 #include "hle/d3d12/texture_sync.h"
 
 static_assert(offsetof(ConsoleCommandQueue, type) == 0x10, "command queue layout");
@@ -37,8 +38,10 @@ static void* const* g_queue_table = nullptr;
 static void run_op(ConsoleCommandQueue* self, BacklogOp& op) {
     switch (op.kind) {
     case BACKLOG_EXECUTE:
-        if (op.count)
+        if (op.count) {
+            target_tiles_submit(self->desktop); // textures recorded into the lists get their tiles first
             gpu_page_tables_submit(self->desktop);
+        }
         gpu_queue_execute_reserved(self->desktop, self->slot, op.number, op.count, op.lists);
         for (u32 i = 0; i < op.count; i++)
             gpu_retire(op.lists[i]);
@@ -159,16 +162,20 @@ static u64 submit(ConsoleCommandQueue* self, u32 count, ID3D12CommandList* const
                   u32 after_generation, u64 after) {
     bool ready = after_slot == GPU_NO_QUEUE || gpu_queue_reached(after_slot, after_generation, after);
     if (!self->backlog.count && ready) {
-        if (count)
+        if (count) {
+            target_tiles_submit(self->desktop); // textures recorded into the lists get their tiles first
             gpu_page_tables_submit(self->desktop);
+        }
         return gpu_queue_execute(self->desktop, self->slot, count, lists);
     }
     BacklogOp* op = hold_back(self);
     if (!op) {
         if (!ready)
             gpu_queue_wait(after_slot, after);
-        if (count)
+        if (count) {
+            target_tiles_submit(self->desktop); // textures recorded into the lists get their tiles first
             gpu_page_tables_submit(self->desktop);
+        }
         return gpu_queue_execute(self->desktop, self->slot, count, lists);
     }
     op->kind = BACKLOG_EXECUTE;

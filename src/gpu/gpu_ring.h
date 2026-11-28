@@ -27,3 +27,6 @@ bool gpu_ring_alloc(GpuRing* ring, u64 bytes, u64 alignment, u64* offset);
 void gpu_ring_submitted(GpuRing* ring, u64 number);
 
 void gpu_ring_release(GpuRing* ring);
+
+// Bytes of every ring's buffer (memory reports): upload heap (system memory) and default heap (VRAM).
+void gpu_ring_usage(u64* upload, u64* local);

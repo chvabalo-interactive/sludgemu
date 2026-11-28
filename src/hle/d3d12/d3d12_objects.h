@@ -336,6 +336,9 @@ struct ConsoleResource {
     SRWLOCK lock;            // guards creating the desktop texture
     ID3D12Resource* texture; // textures only
     bool reserved;           // the desktop texture is reserved, its tiles mapped by texture_sync
+    // Render target, depth and UAV textures: the desktop texture is reserved, its tiles shared with
+    // textures over the same title memory (hle/d3d12/target_tiles.h).
+    struct TargetTexture* target;
     GpuSlots slots;          // the desktop texture is small, placed in these slots of the tile pool
     // The console mip the desktop texture's first mip is (textures of placed memory only): titles
     // streaming textures view only the mips they have loaded, and the desktop texture holds just those.

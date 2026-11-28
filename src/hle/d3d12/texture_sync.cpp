@@ -65,11 +65,15 @@ static u64 mapped_bytes(u64 start, u64 end) {
 }
 
 // Copies [start, end) of title memory to `dst`. What isn't mapped is zeros, or left as it is when only
-// tiles without memory read it (reserved textures).
+// tiles without memory read it (reserved textures). Frames nothing has written yet are zeros too, read
+// without backing them: memory only the GPU uses (render targets seen through views of placed memory)
+// stays without system memory.
 static void copy_mapped(u8* dst, u64 start, u64 end, bool zero_unmapped) {
     for (u64 at = start; at < end; at = piece_end(at, end)) {
         u64 n = piece_end(at, end) - at;
-        if (mem_is_mapped((const void*)at, n)) {
+        if (mem_any_pending((const void*)at, n)) {
+            memset(dst + (at - start), 0, n); // a write after this marks the texture again (its watch)
+        } else if (mem_is_mapped((const void*)at, n)) {
             mem_prepare((const void*)at, n);
             memcpy(dst + (at - start), (const void*)at, n);
         } else if (zero_unmapped) {

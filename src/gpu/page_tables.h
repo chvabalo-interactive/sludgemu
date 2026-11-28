@@ -47,7 +47,8 @@ void gpu_page_tables_release();
 
 // Where the GPU reads [address, address + size) as it is now: through the page tables if they hold any
 // of it (GPU work may have written their copy), else through a window over title memory if it is one
-// block of it. False if neither (the caller reads title memory itself). For texture uploads.
+// block of it and nothing in it is pending (mem_any_pending). False otherwise (the caller reads title
+// memory itself). For texture uploads.
 bool gpu_translate_current(u64 address, u64 size, GpuAddress* out);
 
 // Memory reports: bytes of tiles the page tables hold, and the downloads so far.

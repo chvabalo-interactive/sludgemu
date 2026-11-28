@@ -9,10 +9,12 @@
 #include "core/memory.h"
 #include "hle/d3d12/barriers.h"
 #include "hle/d3d12/d3d12_objects.h"
+#include "hle/d3d12/target_tiles.h"
 #include "hle/d3d12/texture_sync.h"
 #include "hle/d3d12/d3d12_tables.h"
 #include "gpu/console_layout.h"
 #include "gpu/formats.h"
+#include "gpu/gpu_ring.h"
 #include "gpu/gpu_window.h"
 #include "gpu/tile_pool.h"
 #include "hle/xmem/xmem.h"
@@ -175,6 +177,36 @@ static ID3D12Resource* create_small_texture(ConsoleResource* r, const D3D12_RESO
     return texture;
 }
 
+// Render target, depth and UAV textures over title memory get reserved desktop textures whose tiles are
+// those of the memory (see target_tiles): textures the title aliases share video memory. nullptr where
+// that can't be.
+static ID3D12Resource* create_target_texture(ConsoleResource* r, const D3D12_RESOURCE_DESC1& desc,
+                                             D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear) {
+    if (!target_tiles_eligible(r) || !reserved_texture_supported(desc))
+        return nullptr;
+    D3D12_RESOURCE_DESC reserved = desc0_from_desc1(desc);
+    reserved.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    ID3D12Resource* texture = nullptr;
+    HRESULT hr = gpu_device()->CreateReservedResource2(&reserved, layout, clear, nullptr, 0, nullptr,
+                                                       IID_PPV_ARGS(&texture));
+    if (hr == E_INVALIDARG && clear) // see create_texture
+        hr = gpu_device()->CreateReservedResource2(&reserved, layout, nullptr, nullptr, 0, nullptr,
+                                                   IID_PPV_ARGS(&texture));
+    if (FAILED(hr)) {
+        if (!gpu_device_lost(hr))
+            LOG_W_ONCE("d3d12",
+                       "cannot create a reserved render target texture (format %d, flags 0x%x): 0x%08lx; "
+                       "such textures are whole",
+                       desc.Format, desc.Flags, (unsigned long)hr);
+        return nullptr;
+    }
+    if (!target_tiles_add(r, texture, desc)) {
+        texture->Release(); // never used
+        return nullptr;
+    }
+    return texture;
+}
+
 static ID3D12Resource* create_texture(ConsoleResource* r) {
     D3D12_RESOURCE_DESC1 desc = desktop_texture_desc(r->desc, r->first_mip);
     if (desc.Format == DXGI_FORMAT_UNKNOWN) {
@@ -198,9 +230,12 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
     texture = create_small_texture(r, desc, layout);
     if (!texture)
         texture = create_reserved_texture(r, desc, layout);
+    if (!texture)
+        texture = create_target_texture(r, desc, layout, clear);
     if (texture) {
-        gpu_set_name(texture, "%s texture at 0x%llx (dim %d, %llux%ux%u, format %d, from mip %u)",
-                     r->reserved ? "reserved" : "small", r->gpu_address, r->desc.Dimension, r->desc.Width,
+        const char* kind = r->reserved ? "reserved" : r->target ? "render target" : "small";
+        gpu_set_name(texture, "%s texture at 0x%llx (dim %d, %llux%ux%u, format %d, from mip %u)", kind,
+                     r->gpu_address, r->desc.Dimension, r->desc.Width,
                      r->desc.Height, r->desc.DepthOrArraySize, r->desc.Format, r->first_mip);
         count_texture(r, desc);
         return texture;
@@ -286,6 +321,7 @@ static void resource_destroy(void* object) {
     if (texture_sync_tracks(r->desc))
         texture_sync_remove(r);
     uncount_texture(r);
+    target_tiles_remove(r);
     gpu_retire(r->texture);
     gpu_slots_free(r->slots); // handed out again once the GPU is done with the texture
     if (r->owned_memory)
@@ -620,11 +656,11 @@ static TextureKind texture_kind(const ConsoleResource* r) {
 
 // Counts the desktop texture just created for `r`.
 static void count_texture(ConsoleResource* r, const D3D12_RESOURCE_DESC1& desktop_desc) {
-    // Reserved textures take tiles, which the tile pool counts.
+    // Reserved textures take tiles, which the tile pool counts (and target_tiles, for render targets).
     D3D12_RESOURCE_ALLOCATION_INFO desktop = {};
     if (r->slots.count)
         desktop.SizeInBytes = (u64)r->slots.count * GPU_SLOT_SIZE;
-    else if (!r->reserved)
+    else if (!r->reserved && !r->target)
         desktop = gpu_device()->GetResourceAllocationInfo2(0, 1, &desktop_desc, nullptr);
     D3D12_RESOURCE_ALLOCATION_INFO console = console_resource_allocation_info(r->desc);
     AcquireSRWLockExclusive(&g_textures.lock);
@@ -704,6 +740,34 @@ static u64 mapped_bytes(u64 start, u64 end) {
     return mapped;
 }
 
+// Frames of physical memory under [start, end) not counted in `seen` yet: counts them there and in
+// `distinct`, and in `earlier` those `before` holds (frames under textures of another kind).
+static void count_frames(u64 start, u64 end, u64* seen, const u64* before, u64* distinct, u64* earlier) {
+    const u32 batch = 256;
+    u64 pfns[batch];
+    for (u64 at = ALIGN_DOWN(start, MEM_PAGE_SIZE); at < end;) {
+        u64 left = (end - at + MEM_PAGE_SIZE - 1) >> MEM_PAGE_SHIFT;
+        u32 n = left < batch ? (u32)left : batch;
+        if (!mem_frames_at((const void*)at, n, pfns)) { // not one placeholder range: page by page
+            for (u32 k = 0; k < n; k++)
+                if (!mem_frames_at((const void*)(at + ((u64)k << MEM_PAGE_SHIFT)), 1, &pfns[k]))
+                    pfns[k] = MEM_INVALID_PFN;
+        }
+        for (u32 k = 0; k < n; k++) {
+            if (pfns[k] == MEM_INVALID_PFN)
+                continue;
+            u64 id = pfns[k] >> MEM_PAGE_NUMBER_SHIFT;
+            if (seen[id / 64] & (1ull << (id % 64)))
+                continue;
+            seen[id / 64] |= 1ull << (id % 64);
+            (*distinct)++;
+            if (before[id / 64] & (1ull << (id % 64)))
+                (*earlier)++;
+        }
+        at += (u64)n << MEM_PAGE_SHIFT;
+    }
+}
+
 void console_memory_report(const char* why) {
     AcquireSRWLockShared(&g_textures.lock);
     u32 count = g_textures.count;
@@ -727,6 +791,11 @@ void console_memory_report(const char* why) {
     gpu_window_usage(&chunk_windows, &block_windows, &replaced_windows);
     u64 page_table_tiles = 0, downloads = 0;
     gpu_page_tables_usage(&page_table_tiles, &downloads);
+    TargetTileUsage targets = {};
+    target_tiles_usage(&targets);
+    u64 upload_rings = 0, local_rings = 0;
+    gpu_ring_usage(&upload_rings, &local_rings);
+    u64 chunks = (u64)mem_physical_chunks_created() * MEM_CHUNK_SIZE;
     LOG_I("d3d12",
           "memory (%s): whole desktop textures %llu MiB, tiles %llu MiB (heaps %llu MiB); VRAM %llu of %llu "
           "MiB, shared %llu of %llu MiB; title physical memory %llu of %llu MiB used; commit %llu MiB",
@@ -742,19 +811,49 @@ void console_memory_report(const char* why) {
         "MiB of tiles, %llu pages copied back",
         (u64)system.CommitTotal * system.PageSize >> 20, (u64)system.CommitLimit * system.PageSize >> 20,
         (u64)system.PhysicalAvailable * system.PageSize >> 20, (u64)process.PrivateUsage >> 20,
-        (u64)process.WorkingSetSize >> 20, ((u64)mem_physical_chunks_created() * MEM_CHUNK_SIZE) >> 20,
-        (mem_physical_bound_pages() << MEM_PAGE_SHIFT) >> 20, chunk_windows >> 20, block_windows >> 20,
-        replaced_windows >> 20, page_table_tiles >> 20, downloads);
+        (u64)process.WorkingSetSize >> 20, chunks >> 20, (mem_physical_bound_pages() << MEM_PAGE_SHIFT) >> 20,
+        chunk_windows >> 20, block_windows >> 20, replaced_windows >> 20, page_table_tiles >> 20, downloads);
+
+    // Where the counters come from. VRAM: whole textures, tile heaps and the rest (rings, descriptor
+    // heaps, the driver's). Shared memory is mostly windows, heaps opened over title memory, which pin it
+    // but charge no commit of their own; the rest is system memory heaps of ours (upload rings) or of the
+    // driver (also VRAM it moved out under pressure). Private bytes hold VRAM and those heaps too; the
+    // rest is plain CPU memory, the title's and ours. Physical memory chunks and title GPU memory
+    // (sections) are charged to the system, not the process.
+    u64 windows = chunk_windows + block_windows + replaced_windows;
+    u64 vram_known = total + tile_heaps;
+    u64 vram_other = video.local_usage > vram_known ? video.local_usage - vram_known : 0;
+    u64 shared_other = video.shared_usage > windows ? video.shared_usage - windows : 0;
+    u64 gpu_charged = video.local_usage + shared_other;
+    u64 cpu_private = (u64)process.PrivateUsage > gpu_charged ? (u64)process.PrivateUsage - gpu_charged : 0;
+    LOG_I("d3d12",
+          "memory:   by consumer: VRAM %llu MiB = whole textures %llu + tile heaps %llu (page tables "
+          "%llu, render targets %llu) + other %llu (rings %llu); shared %llu MiB = windows over title "
+          "memory %llu + other heaps %llu (upload rings %llu); private %llu MiB = VRAM + other heaps + CPU "
+          "memory %llu; outside the process: physical memory chunks %llu, title GPU memory windowed %llu",
+          video.local_usage >> 20, total >> 20, tile_heaps >> 20, page_table_tiles >> 20,
+          (targets.shared + targets.own) >> 20, vram_other >> 20, local_rings >> 20, video.shared_usage >> 20,
+          windows >> 20, shared_other >> 20, upload_rings >> 20, (u64)process.PrivateUsage >> 20,
+          cpu_private >> 20, chunks >> 20, block_windows >> 20);
+    LOG_I("d3d12",
+          "memory:   render target tiles: %u textures; %llu MiB shared through title memory + %llu MiB their "
+          "own; %llu MiB as textures of their own",
+          targets.textures, targets.shared >> 20, targets.own >> 20, targets.referenced >> 20);
     if (!spans)
         return;
 
     // Per kind: what the desktop textures take, the title memory they describe, how much of that is
-    // distinct (aliased textures share it) and how much the title has mapped.
+    // distinct (aliased textures share it), how much the title has mapped and the frames of physical
+    // memory under it, counted once however many addresses show them (and how many of those are under
+    // textures of a kind listed before).
+    u64 words = (mem_physical_total_pages() + 63) / 64;
+    u64* seen = (u64*)calloc(words * 2, sizeof(u64));
+    u64* before = seen ? seen + words : nullptr;
     qsort(spans, count, sizeof(TextureSpan), compare_spans);
     for (u32 i = 0; i < count;) {
         TextureKind kind = spans[i].kind;
         u32 textures = 0;
-        u64 desktop = 0, console = 0, distinct = 0, mapped = 0, bound = 0;
+        u64 desktop = 0, console = 0, distinct = 0, mapped = 0, bound = 0, frames = 0, earlier = 0;
         u64 run_start = spans[i].start, run_end = spans[i].start;
         for (; i < count && spans[i].kind == kind; i++) {
             textures++;
@@ -764,6 +863,8 @@ void console_memory_report(const char* why) {
                 distinct += run_end - run_start;
                 mapped += mapped_bytes(run_start, run_end);
                 bound += mem_physical_bound_pages_at((const void*)run_start, run_end - run_start);
+                if (seen)
+                    count_frames(run_start, run_end, seen, before, &frames, &earlier);
                 run_start = spans[i].start;
             }
             run_end = spans[i].end > run_end ? spans[i].end : run_end;
@@ -771,11 +872,21 @@ void console_memory_report(const char* why) {
         distinct += run_end - run_start;
         mapped += mapped_bytes(run_start, run_end);
         bound += mem_physical_bound_pages_at((const void*)run_start, run_end - run_start);
+        if (seen) {
+            count_frames(run_start, run_end, seen, before, &frames, &earlier);
+            for (u64 w = 0; w < words; w++) {
+                before[w] |= seen[w];
+                seen[w] = 0;
+            }
+        }
         LOG_I("d3d12",
               "memory:   %s: %u, %llu MiB as whole desktop textures; %llu MiB of title memory, %llu MiB "
-              "distinct, %llu MiB mapped (%llu MiB bound to system memory)",
+              "distinct, %llu MiB mapped (%llu MiB bound to system memory); %llu MiB of distinct frames "
+              "(%llu MiB also under textures above)",
               k_texture_kind_names[kind], textures, desktop >> 20, console >> 20, distinct >> 20,
-              mapped >> 20, (bound << MEM_PAGE_SHIFT) >> 20);
+              mapped >> 20, (bound << MEM_PAGE_SHIFT) >> 20, (frames << MEM_PAGE_SHIFT) >> 20,
+              (earlier << MEM_PAGE_SHIFT) >> 20);
     }
+    free(seen);
     free(spans);
 }

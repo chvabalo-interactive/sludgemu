@@ -13,6 +13,7 @@ add_executable(sludgemu_tests
     shader_schedule_test.cpp
     submission_test.cpp
     command_args_test.cpp
+    shared_tiles_test.cpp
     ${PROJECT_SOURCE_DIR}/src/common/log.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory_tracking.cpp
@@ -24,6 +25,7 @@ add_executable(sludgemu_tests
     ${PROJECT_SOURCE_DIR}/src/gpu/reuse_order.cpp
     ${PROJECT_SOURCE_DIR}/src/gpu/ring_space.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/d3d12/queue_backlog.cpp
+    ${PROJECT_SOURCE_DIR}/src/gpu/shared_tiles.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/dstorage/bcpack.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/d3d12/descriptor_shadow.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/d3d12/command_args.cpp

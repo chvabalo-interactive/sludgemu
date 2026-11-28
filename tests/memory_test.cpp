@@ -316,6 +316,42 @@ static void test_lazy_backing() {
     mem_physical_free(pages, frames);
 }
 
+// Pages showing frames nothing has written are pending until touched; asking doesn't back them.
+static void test_pending_pages() {
+    const u32 pages = 4;
+    MemAddressLimits limits = {};
+    u8* base = (u8*)mem_reserve_placeholder(pages * PAGE, limits, 0, PAGE_READWRITE, 0);
+    CHECK(base != nullptr);
+    if (!base)
+        return;
+    CHECK(!mem_any_pending(base, pages * PAGE)); // nothing mapped
+    u64 frames[pages];
+    CHECK(mem_physical_alloc(pages, frames));
+    CHECK(mem_map_physical(base, pages, frames));
+    CHECK(mem_any_pending(base, pages * PAGE));
+    CHECK(mem_any_pending(base + 3 * PAGE, PAGE));
+    CHECK(mem_physical_bound_pages_at(base, pages * PAGE) == 0);
+    mem_prepare(base, PAGE); // backs the slice: every page here
+    CHECK(!mem_any_pending(base, pages * PAGE));
+    CHECK(mem_physical_bound_pages_at(base, pages * PAGE) == pages);
+    // A frame written through one address and shown at another has data there, though that page waits
+    // for its first touch: it isn't read as zeros.
+    base[5] = 42;
+    CHECK(mem_map_physical(base + PAGE, 1, &frames[0]));
+    CHECK(!mem_any_pending(base, pages * PAGE));
+    CHECK(base[PAGE + 5] == 42);
+    // A frame nothing has written, mapped over a backed page, is pending.
+    u64 fresh;
+    CHECK(mem_physical_alloc(1, &fresh));
+    CHECK(mem_map_physical(base + 2 * PAGE, 1, &fresh));
+    CHECK(mem_any_pending(base, pages * PAGE));
+    CHECK(mem_any_pending(base + 2 * PAGE, PAGE));
+    CHECK(!mem_any_pending(base + 3 * PAGE, PAGE));
+    CHECK(mem_release(base));
+    mem_physical_free(1, &fresh);
+    mem_physical_free(pages, frames);
+}
+
 // Large commits are reserved and committed as they're touched, a granule at a time.
 static void test_lazy_commit() {
     MemAddressLimits limits = {};
@@ -799,6 +835,7 @@ void test_shader_cache();
 void test_shader_schedule();
 void test_submission();
 void test_command_args();
+void test_shared_tiles();
 
 int main() {
     log_init(nullptr, LOG_LEVEL_WARN);
@@ -813,6 +850,7 @@ int main() {
     test_backed_release();
     test_frames_zeroed_on_reuse();
     test_lazy_backing();
+    test_pending_pages();
     test_lazy_commit();
     test_gpu_section_ranges();
     test_write_watches();
@@ -820,6 +858,7 @@ int main() {
     test_store_traps();
     test_taken_pages();
     test_device_writes();
+    test_shared_tiles();
     test_xapu_decode();
     test_xapu_convert();
     test_xdsp();
