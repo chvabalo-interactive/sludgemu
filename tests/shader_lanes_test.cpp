@@ -2,7 +2,8 @@
 // the comments) are translated, compiled and run on the desktop device, and what they store is checked
 // against what the console computes. Covers the lane mapping of wave64 programs onto desktop waves
 // (see shader/translate.h): cross-lane reads and writes across the halves, whole-mask queries, masks
-// written as data, DPP row masks, LDS append, console wave numbering in groups of several waves. And
+// written as data, DPP row masks, LDS append and atomics, 16-bit three-operand minimum, maximum and
+// median, console wave numbering in groups of several waves. And
 // control flow as the translator structures it: EXEC skip-overs, if/else on EXEC, scalar loops,
 // waterfall loops, loops lanes leave one by one, jumps out of several loops, and the dispatcher that
 // takes the graphs it can't structure; random graphs of scalar jumps against a walk on the CPU. And the
@@ -434,6 +435,79 @@ static const u32 k_lane_writes_program[] = {
     0xbf810000,             // 0x138: s_endpgm
 };
 
+// Program I: one console wave of 64 lanes, regions as in program A. Three-operand 16-bit minimum,
+// maximum and median (floats, signed and unsigned, a high half source and destination with op_sel) and
+// LDS atomics: subtraction with and without the old value, compare-and-store with and without it
+// (DATA0 compared, DATA1 stored).
+static const u32 k_alu16_lds_program[] = {
+    0xbe8203c1,                         // 0x0: s_mov_b32 s2, -1
+    0xbe830380,                         // 0x4: s_mov_b32 s3, 0
+    0xd7650001, 0x020100c1,             // 0x8: v_mbcnt_lo_u32_b32 v1, -1, 0
+    0xd7660001, 0x020202c1,             // 0x10: v_mbcnt_hi_u32_b32 v1, -1, v1
+    0x34040282,                         // 0x18: v_lshlrev_b32 v2, 2, v1
+    0x7e06a101,                         // 0x1c: v_cvt_f16_u16 v3, v1
+    0x360606ff, 0x0000ffff,             // 0x20: v_and_b32 v3, 0xffff, v3
+    0x4c0802bf,                         // 0x28: v_sub_nc_u32 v4, 63, v1
+    0x7e08a104,                         // 0x2c: v_cvt_f16_u16 v4, v4
+    0x360808ff, 0x0000ffff,             // 0x30: v_and_b32 v4, 0xffff, v4
+    0x7e0a02ff, 0x00005000,             // 0x38: v_mov_b32 v5, 0x5000 (32.0)
+    0xd7570006, 0x04160903,             // 0x40: v_med3_f16 v6, v3, v4, v5
+    0xe0701000, 0x80000602,             // 0x48: buffer_store_dword v6, v2, s[0:3], 0 offen
+    0xd7510007, 0x04160903,             // 0x50: v_min3_f16 v7, v3, v4, v5
+    0xe0701100, 0x80000702,             // 0x58: buffer_store_dword v7, v2, s[0:3], 0 offen offset:256
+    0xd7540008, 0x04160903,             // 0x60: v_max3_f16 v8, v3, v4, v5
+    0xe0701200, 0x80000802,             // 0x68: buffer_store_dword v8, v2, s[0:3], 0 offen offset:512
+    0xd76f0009, 0x04152103,             // 0x70: v_lshl_or_b32 v9, v3, 16, v5
+    0x7e1402ff, 0x00001234,             // 0x78: v_mov_b32 v10, 0x1234
+    0xd757480a, 0x04160909,             // 0x80: v_med3_f16 v10, v9, v4, v5 op_sel:[1,0,0,1]
+    0xe0701300, 0x80000a02,             // 0x88: buffer_store_dword v10, v2, s[0:3], 0 offen offset:768
+    0x4e1602a0,                         // 0x90: v_subrev_nc_u32 v11, 32, v1
+    0x7e1802ff, 0xabcd0000,             // 0x94: v_mov_b32 v12, 0xabcd0000
+    0xd758000c, 0x021d8b0b,             // 0x9c: v_med3_i16 v12, v11, -5, 7
+    0xe0701400, 0x80000c02,             // 0xa4: buffer_store_dword v12, v2, s[0:3], 0 offen offset:1024
+    0x7e1a0280,                         // 0xac: v_mov_b32 v13, 0
+    0xd753000d, 0x04115101,             // 0xb0: v_min3_u16 v13, v1, 40, v4
+    0xe0701500, 0x80000d02,             // 0xb8: buffer_store_dword v13, v2, s[0:3], 0 offen offset:1280
+    0x7e1c02ff, 0x77770000,             // 0xc0: v_mov_b32 v14, 0x77770000
+    0xd755000e, 0x0215ff0b, 0xffffffec, // 0xc8: v_max3_i16 v14, v11, -20, 5
+    0xe0701600, 0x80000e02,             // 0xd4: buffer_store_dword v14, v2, s[0:3], 0 offen offset:1536
+    0xbefc03c1,                         // 0xdc: s_mov_b32 m0, -1
+    0x4a1e02ff, 0x000003e8,             // 0xe0: v_add_nc_u32 v15, 0x3e8, v1
+    0xd8340100, 0x00000f02,             // 0xe8: ds_write_b32 v2, v15 offset:256
+    0x7e320280,                         // 0xf0: v_mov_b32 v25, 0
+    0x7e3402ff, 0x00000064,             // 0xf4: v_mov_b32 v26, 0x64
+    0xd8340000, 0x00001a19,             // 0xfc: ds_write_b32 v25, v26
+    0x36280281,                         // 0x104: v_and_b32 v20, 1, v1
+    0x7d842881,                         // 0x108: v_cmp_eq_u32 vcc, 1, v20
+    0x022402ff, 0x00000063,             // 0x10c: v_cndmask_b32 v18, 0x63, v1, vcc (odd lanes: v1)
+    0x4a2602ff, 0x000001f4,             // 0x114: v_add_nc_u32 v19, 0x1f4, v1
+    0xd8340200, 0x00000102,             // 0x11c: ds_write_b32 v2, v1 offset:512
+    0xbf8cc07f,                         // 0x124: s_waitcnt lgkmcnt(0)
+    0xbf8a0000,                         // 0x128: s_barrier
+    0xd8840100, 0x10000102,             // 0x12c: ds_sub_rtn_u32 v16, v2, v1 offset:256
+    0x7e360281,                         // 0x134: v_mov_b32 v27, 1
+    0xd8040000, 0x00001b19,             // 0x138: ds_sub_u32 v25, v27
+    0xd8c00200, 0x11131202,             // 0x140: ds_cmpst_rtn_b32 v17, v2, v18, v19 offset:512
+    0xbf8cc07f,                         // 0x148: s_waitcnt lgkmcnt(0)
+    0xbf8a0000,                         // 0x14c: s_barrier
+    0xd8d80100, 0x15000002,             // 0x150: ds_read_b32 v21, v2 offset:256
+    0xd8d80000, 0x16000019,             // 0x158: ds_read_b32 v22, v25
+    0xd8d80200, 0x17000002,             // 0x160: ds_read_b32 v23, v2 offset:512
+    0xbf8cc07f,                         // 0x168: s_waitcnt lgkmcnt(0)
+    0xe0701700, 0x80001002,             // 0x16c: buffer_store_dword v16, v2, s[0:3], 0 offen offset:1792
+    0xe0701800, 0x80001502,             // 0x174: buffer_store_dword v21, v2, s[0:3], 0 offen offset:2048
+    0xe0701900, 0x80001602,             // 0x17c: buffer_store_dword v22, v2, s[0:3], 0 offen offset:2304
+    0xe0701a00, 0x80001102,             // 0x184: buffer_store_dword v17, v2, s[0:3], 0 offen offset:2560
+    0xe0701b00, 0x80001702,             // 0x18c: buffer_store_dword v23, v2, s[0:3], 0 offen offset:2816
+    0x7e380287,                         // 0x194: v_mov_b32 v28, 7
+    0xd8400200, 0x001c1302,             // 0x198: ds_cmpst_b32 v2, v19, v28 offset:512
+    0xbf8cc07f,                         // 0x1a0: s_waitcnt lgkmcnt(0)
+    0xd8d80200, 0x18000002,             // 0x1a4: ds_read_b32 v24, v2 offset:512
+    0xbf8cc07f,                         // 0x1ac: s_waitcnt lgkmcnt(0)
+    0xe0701c00, 0x80001802,             // 0x1b0: buffer_store_dword v24, v2, s[0:3], 0 offen offset:3072
+    0xbf810000,                         // 0x1b8: s_endpgm
+};
+
 #define UNWRITTEN    0xDEADBEEFu // what the output buffer starts with
 #define OUTPUT_BYTES 4096
 
@@ -539,6 +613,60 @@ static u32 lane_writes_expected(u32 r, u32 i) {
         return 18;
     case 4: // a waterfall loop over lane & 3, each pass writing its lanes
         return (i & 3) + 3 * i;
+    default:
+        return UNWRITTEN;
+    }
+}
+
+// The half float bits of a whole number below 2048 (all exact).
+static u32 half_of(u32 n) {
+    if (n == 0)
+        return 0;
+    u32 e = 0;
+    while ((n >> (e + 1)) != 0)
+        e++;
+    return (e + 15) << 10 | ((n << (10 - e)) & 0x3FF);
+}
+
+static s32 med3(s32 a, s32 b, s32 c) {
+    s32 lo = a < b ? a : b, hi = a < b ? b : a;
+    return c < lo ? lo : c > hi ? hi : c;
+}
+
+// What program I stores in region `r` for lane `i`.
+static u32 alu16_lds_expected(u32 r, u32 i) {
+    s32 a = (s32)i, b = 63 - (s32)i, s = (s32)i - 32;
+    switch (r) {
+    case 0: // v_med3_f16 of i, 63 - i, 32
+        return half_of((u32)med3(a, b, 32));
+    case 1: // v_min3_f16
+        return half_of((u32)(a < b ? a : b));
+    case 2: // v_max3_f16
+        return half_of((u32)(a > b ? a : b));
+    case 3: // the median from a high half into the high half, the low half kept
+        return half_of((u32)med3(a, b, 32)) << 16 | 0x1234;
+    case 4: // v_med3_i16 of i - 32, -5, 7; the high half kept
+        return 0xABCD0000u | ((u32)med3(s, -5, 7) & 0xFFFF);
+    case 5: { // v_min3_u16 of i, 40 and the half float bits of 63 - i
+        u32 m = i < 40 ? i : 40;
+        return m < half_of((u32)b) ? m : half_of((u32)b);
+    }
+    case 6: { // v_max3_i16 of i - 32, -20, 5
+        s32 m = s > 5 ? s : 5;
+        return 0x77770000u | ((u32)m & 0xFFFF);
+    }
+    case 7: // ds_sub_rtn_u32: the old value
+        return 1000 + i;
+    case 8: // and what it left
+        return 1000;
+    case 9: // 64 lanes' ds_sub_u32 of 1 from 100
+        return 36;
+    case 10: // ds_cmpst_rtn_b32: the old value
+        return i;
+    case 11: // odd lanes compared equal and stored 500 + i
+        return (i & 1) ? 500 + i : i;
+    case 12: // ds_cmpst_b32 comparing with 500 + i: the odd lanes store 7
+        return (i & 1) ? 7 : i;
     default:
         return UNWRITTEN;
     }
@@ -1423,6 +1551,23 @@ void test_shader_lanes() {
     } else {
         g_failures++;
     }
+    static const char* const k_atomics[] = {"InterlockedCompareExchange(", "InterlockedCompareStore(",
+                                            nullptr};
+    if (run_program(b, k_alu16_lds_program, sizeof(k_alu16_lds_program), compute_info(64, 1024), out,
+                    k_atomics)) {
+        for (u32 r = 0; r < 16; r++)
+            for (u32 i = 0; i < 64; i++) {
+                u32 want = alu16_lds_expected(r, i);
+                if (out[r * 64 + i] != want) {
+                    printf("FAIL shader lanes: program I region %u lane %u: 0x%x, expected 0x%x\n", r, i,
+                           out[r * 64 + i], want);
+                    g_failures++;
+                    break;
+                }
+            }
+    } else {
+        g_failures++;
+    }
     // Programs F: the first GRAPH_PROGRAMS random graphs that end.
     static u32 code[16 + GRAPH_MAX_BLOCKS * GRAPH_BLOCK_WORDS + 8];
     u32 graphs = 0;
@@ -1475,7 +1620,7 @@ void test_shader_lanes() {
             break;
         }
     }
-    printf("shader lanes: %u programs run on the GPU (waves of %u-%u lanes)\n", 7 + graphs + maskings,
+    printf("shader lanes: %u programs run on the GPU (waves of %u-%u lanes)\n", 8 + graphs + maskings,
            b.target.wave_min, b.target.wave_max);
     bench_release(b);
 }
