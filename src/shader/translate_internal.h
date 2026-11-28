@@ -187,7 +187,8 @@ struct Translator {
     u8 fetch_class[SHADER_MAX_VERTEX_ELEMENTS]; // typed fetches: 0 float, 1 uint, 2 sint
     u8 param_components[32];
     u8 position_exported;
-    u8 vs_clip_mask;
+    bool clip_written; // vertex shaders: clip (cull) distances exported, declared from vs_out_cntl
+    bool cull_written;
     u8 target_compressed[8];
     bool needs_descriptor_info;
     bool uses_lds;

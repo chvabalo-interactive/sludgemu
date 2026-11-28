@@ -63,7 +63,7 @@ static u32 read_u32(const u8* p) {
 usize console_graphics_context_offset(const void* packet, usize packet_size) {
     if (packet_size < 8)
         return 0;
-    u32 config = read_u32((const u8*)packet + 4) & 3; // bit 0: tessellation, bit 1: geometry shader
+    u32 config = read_u32((const u8*)packet + PACKET_CONFIG) & 3;
     usize offset = 88;
     if (config & 1)
         offset += 24 + 16;
@@ -74,30 +74,64 @@ usize console_graphics_context_offset(const void* packet, usize packet_size) {
 
 #define METADATA_VERSION 4096
 
+static u8 user_sgprs_of(u32 rsrc2) {
+    return (u8)((rsrc2 >> 1) & 31);
+}
+
 bool console_parse_graphics(const void* packet, usize packet_size, const void* metadata, usize metadata_size,
                             ConsoleGraphicsShaders* out) {
     memset(out, 0, sizeof(*out));
     const u8* pk = (const u8*)packet;
     const u8* md = (const u8*)metadata;
-    if (packet_size < 160 || metadata_size < 68 || read_u32(md + 4) != METADATA_VERSION)
+    if (packet_size < 160 || metadata_size < 68 || read_u32(md + 4) != METADATA_VERSION) {
+        out->error = "packet or metadata of an unknown size or version";
         return false;
-    if (read_u32(pk + 4) & 3)
-        return false; // tessellation and geometry shader pipelines lay their blocks out differently
-    // Shader register block: RSRC2 of the pixel and vertex shaders hold their user SGPR counts.
-    const u8* spi = pk + 44;
-    out->ps_user_sgprs = (u8)((read_u32(spi + 16) >> 1) & 31);
-    out->vs_user_sgprs = (u8)((read_u32(spi + 36) >> 1) & 31);
+    }
+    u32 config = read_u32(pk + PACKET_CONFIG) & 3;
+    out->config = (u8)config;
+    if (config & 1) {
+        out->error = "tessellation pipeline";
+        return false;
+    }
+    // Shader registers: RSRC2 of each stage holds its user SGPR count. The pixel shader's are at the same
+    // place in both layouts; a pipeline without a stage has zeros for it.
+    out->vs_user_sgprs = user_sgprs_of(read_u32(pk + PACKET_VS_RSRC2));
+    out->ps_user_sgprs = user_sgprs_of(read_u32(pk + PACKET_PS_RSRC2));
     usize context = console_graphics_context_offset(packet, packet_size);
-    if (context + 28 > packet_size)
+    if (context + CTX_VS_OUT_CNTL + 4 > packet_size) {
+        out->error = "packet shorter than its context registers";
         return false;
-    out->ps_input_ena = read_u32(pk + context);
-    out->ps_color_format = read_u32(pk + context + 24);
+    }
+    if (config & 2) {
+        u32 rsrc2 = read_u32(pk + PACKET_GS_RSRC2);
+        // Bit 27 may extend the user SGPR count past 31; nothing has shown how, so it isn't guessed.
+        if ((rsrc2 >> 27) & 1) {
+            out->error = "geometry-stage user SGPR count with its extension bit set";
+            return false;
+        }
+        u32 onchip = read_u32(pk + PACKET_GS_ONCHIP);
+        out->geometry = true;
+        out->gs_user_sgprs = user_sgprs_of(rsrc2);
+        out->mesh_lds_bytes = ((rsrc2 >> 19) & 0xFF) * 512;
+        out->gs_onchip = onchip;
+        out->mesh_max_vertices = (u16)(onchip & 0x7FF);
+        out->mesh_max_primitives = (u16)((onchip >> 11) & 0x7FF);
+        out->mesh_threads = out->mesh_max_vertices > out->mesh_max_primitives ? out->mesh_max_vertices
+                                                                              : out->mesh_max_primitives;
+        out->gs_unknown[0] = read_u32(pk + 116);
+        out->gs_unknown[1] = read_u32(pk + 120);
+        out->gs_unknown[2] = read_u32(pk + 168);
+    }
+    out->ps_input_ena = read_u32(pk + context + CTX_PS_INPUT_ENA);
+    out->ps_color_format = read_u32(pk + context + CTX_PS_COLOR_FORMAT);
+    out->vs_out_cntl = read_u32(pk + context + CTX_VS_OUT_CNTL);
 
     out->sample_mask = read_u32(md + 28);
     out->primitive_topology_type = md[38] & 0x3F;
     // Stream output, then the input layout (dword aligned).
     u32 so_size = read_u32(md + 60);
     usize at = (64 + (usize)so_size + 3) & ~(usize)3;
+    out->error = "metadata with an unreadable input layout";
     if (at + 4 > metadata_size)
         return false;
     u32 count = read_u32(md + at);
@@ -124,7 +158,12 @@ bool console_parse_graphics(const void* packet, usize packet_size, const void* m
         at += 24;
     }
     out->element_count = (u8)count;
+    out->error = nullptr;
     return true;
+}
+
+bool console_mesh_pipeline(const ConsoleGraphicsShaders& g, bool has_gs, bool other_stages) {
+    return g.geometry && has_gs && !other_stages && g.element_count == 0;
 }
 
 // The compute packet: header, threads per group (x | y << 16, then z with launch flags above it),

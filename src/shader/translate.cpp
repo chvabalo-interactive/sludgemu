@@ -1862,6 +1862,20 @@ static bool translate_once(const void* code, u32 size, const ShaderInfo& info, c
 
 bool shader_translate(const void* code, u32 size, const ShaderInfo& info, const ShaderTarget& target,
                       TranslatedShader* out) {
+    if (info.stage == SHADER_MESH) {
+        // Pipelines describe their mesh shaders (and dumps keep them), but they aren't translated yet.
+        Text keep = out->hlsl;
+        memset(out, 0, sizeof(*out));
+        out->hlsl = keep;
+        out->hlsl.clear();
+        if (info.mesh_root_end != info.user_sgpr_first + info.user_sgprs)
+            snprintf(out->error, sizeof(out->error),
+                     "mesh shader whose root data ends at s%u, but its user SGPRs at s%u", info.mesh_root_end,
+                     info.user_sgpr_first + info.user_sgprs);
+        else
+            snprintf(out->error, sizeof(out->error), "mesh shader translation not implemented");
+        return false;
+    }
     bool recheck = false;
     bool ok = translate_once(code, size, info, target, out, false, &recheck);
     // The lane analysis is only an optimization: where emission disagrees with it, do without.

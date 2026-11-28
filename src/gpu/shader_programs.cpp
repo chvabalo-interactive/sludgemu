@@ -430,6 +430,8 @@ static const wchar_t* profile_of(ShaderStage stage) {
         return L"vs_6_6";
     case SHADER_PIXEL:
         return L"ps_6_6";
+    case SHADER_MESH:
+        return L"ms_6_6";
     default:
         return L"cs_6_6";
     }
@@ -471,7 +473,12 @@ static bool translate_program(const ShaderProgram* p, TranslatedShader* t) {
     if (p->info.wave_size && t->code_wave_size && t->code_wave_size != p->info.wave_size)
         LOG_W("gpu", "shader %016llx: launched as wave%u, but its code is wave%u", (unsigned long long)p->key,
               p->info.wave_size, t->code_wave_size);
-    if (!translated) {
+    if (!translated && p->stage == SHADER_MESH) {
+        // Every mesh shader fails the same way until mesh translation exists: once is enough.
+        LOG_W_ONCE("gpu", "mesh shaders aren't translated yet (%s); SLUDGE_SHADER_DUMP keeps them", t->error);
+        LOG_D("gpu", "shader %016llx: translation failed: %s", (unsigned long long)p->key, t->error);
+        dump(p, t->hlsl.data, t->error);
+    } else if (!translated) {
         LOG_W("gpu", "shader %016llx: translation failed: %s", (unsigned long long)p->key, t->error);
         dump(p, t->hlsl.data, t->error);
     } else if (t->uses_int64_atomics && !gpu_int64_image_atomics()) {

@@ -830,6 +830,7 @@ void test_xma();
 void test_layout_addressing();
 void test_bcpack();
 void test_shader_translate();
+void test_console_pipeline();
 void test_shader_lanes();
 void test_shader_cache();
 void test_shader_schedule();
@@ -866,6 +867,7 @@ int main() {
     test_layout_addressing();
     test_bcpack();
     test_shader_translate();
+    test_console_pipeline();
     test_shader_lanes();
     test_shader_cache();
     test_shader_schedule();

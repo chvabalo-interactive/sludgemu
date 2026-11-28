@@ -215,6 +215,7 @@ static bool translate(const Asm& a, const ShaderInfo& info) {
         snprintf(path, sizeof(path), "%s\\test%03u_%s.hlsl", dir, count++,
                  info.stage == SHADER_PIXEL    ? "ps"
                  : info.stage == SHADER_VERTEX ? "vs"
+                 : info.stage == SHADER_MESH   ? "ms"
                                                : "cs");
         FILE* f = fopen(path, "w");
         if (f) {
@@ -1846,6 +1847,132 @@ static void test_lds_size() {
     }
 }
 
+// --- vertex outputs and system SGPRs -----------------------------------------------------------------
+
+// A vertex shader exporting a position made of s8 (user data), pos1 with one component from s0 (a
+// console system SGPR) and a parameter.
+static const u32 k_clip_vs[] = {
+    0x7e020200,             // v_mov_b32 v1, s0
+    0x7e040208,             // v_mov_b32 v2, s8
+    0xf80000cf, 0x02020202, // exp pos0, v2, v2, v2, v2
+    0xf80008d1, 0x00000001, // exp pos1, v1, off, off, off done
+    0xf800020f, 0x02020202, // exp param0, v2, v2, v2, v2
+    0xbf810000,             // s_endpgm
+};
+
+static ShaderInfo vertex_info(u32 vs_out_cntl) {
+    ShaderInfo info = {};
+    info.stage = SHADER_VERTEX;
+    info.user_sgprs = 9;
+    info.resource_heap_sgpr = NO_HEAP_SGPR;
+    info.sampler_heap_sgpr = NO_HEAP_SGPR;
+    info.vs_out_cntl = vs_out_cntl;
+    return info;
+}
+
+// Writes v1 to every component of pos1 and pos2.
+static const u32 k_two_distance_vectors_vs[] = {
+    0x7e020200,             // v_mov_b32 v1, s0
+    0x7e040208,             // v_mov_b32 v2, s8
+    0xf80000cf, 0x02020202, // exp pos0, v2, v2, v2, v2
+    0xf80000df, 0x01010101, // exp pos1, v1, v1, v1, v1
+    0xf80008ef, 0x01010101, // exp pos2, v1, v1, v1, v1 done
+    0xf800020f, 0x02020202, // exp param0, v2, v2, v2, v2
+    0xbf810000,             // s_endpgm
+};
+
+static bool translate_two_vectors_vs(u32 vs_out_cntl) {
+    Asm a = {};
+    put_words(a, k_two_distance_vectors_vs, ARRAY_COUNT(k_two_distance_vectors_vs));
+    return translate(a, vertex_info(vs_out_cntl));
+}
+
+static bool translate_clip_vs(u32 vs_out_cntl) {
+    Asm a = {};
+    put_words(a, k_clip_vs, ARRAY_COUNT(k_clip_vs));
+    return translate(a, vertex_info(vs_out_cntl));
+}
+
+// PA_CL_VS_OUT_CNTL decides what position exports after pos0 hold: clip distances, cull distances,
+// the misc vector, or nothing.
+static void test_clip_distances() {
+    // Distances 0 and 1 clip; the export writes distance 0 only, distance 1 is written as 0 (unused
+    // outputs aren't zero everywhere).
+    CHECK(translate_clip_vs(0x01400303));
+    CHECK(hlsl_has("    float2 clip0 : SV_ClipDistance0;\n"));
+    CHECK(hlsl_has("output.clip0.x = asfloat(v1);"));
+    CHECK(hlsl_has("output.clip0.y = 0.0f;"));
+    CHECK(!hlsl_has("SV_CullDistance"));
+    // Graphics system SGPRs read as 0; user data from the root constants.
+    CHECK(hlsl_has("    uint s0 = 0u;\n"));
+    CHECK(hlsl_has("    uint s8 = g_user[2].x;\n"));
+    // One clip distance.
+    CHECK(translate_clip_vs(0x01400101));
+    CHECK(hlsl_has("    float clip0 : SV_ClipDistance0;\n"));
+    CHECK(hlsl_has("output.clip0.x = asfloat(v1);"));
+    CHECK(!hlsl_has("output.clip0.y"));
+    // Distance 0 clips, distance 1 only culls: the cull array starts at distance 1.
+    CHECK(translate_clip_vs(0x00400201));
+    CHECK(hlsl_has("    float clip0 : SV_ClipDistance0;\n"));
+    CHECK(hlsl_has("    float cull0 : SV_CullDistance0;\n"));
+    CHECK(hlsl_has("output.cull0.x = 0.0f;"));
+    CHECK(!hlsl_has("output.cull0.y"));
+    // Only distances 4-7 enabled: pos1 holds them, and the clip array starts at distance 4.
+    CHECK(translate_clip_vs(0x00800010));
+    CHECK(hlsl_has("    float clip0 : SV_ClipDistance0;\n"));
+    CHECK(!hlsl_has("clip1"));
+    CHECK(hlsl_has("output.clip0.x = asfloat(v1);"));
+    // With the misc vector enabled, pos1 is that vector (point size, layer, viewport).
+    CHECK(!translate_clip_vs(0x00600101));
+    CHECK(error_has("misc vector"));
+    // Nothing enabled: pos1 has no place.
+    CHECK(!translate_clip_vs(0));
+    CHECK(error_has("places nothing"));
+    // Clip and cull distances share the eight hardware distances; each desktop array starts at its
+    // first distance. 4 clip (0-3) + 1 cull (4).
+    CHECK(translate_two_vectors_vs(0x00C01F0F));
+    CHECK(hlsl_has("    float4 clip0 : SV_ClipDistance0;\n"));
+    CHECK(hlsl_has("    float cull0 : SV_CullDistance0;\n"));
+    CHECK(hlsl_has("output.clip0.w = asfloat(v1);"));
+    CHECK(hlsl_has("output.cull0.x = asfloat(v1);"));
+    CHECK(!hlsl_has("clip1") && !hlsl_has("cull1") && !hlsl_has("output.cull0.y"));
+    // 3 clip (0-2) + 3 cull (3-5).
+    CHECK(translate_two_vectors_vs(0x00C03F07));
+    CHECK(hlsl_has("    float3 clip0 : SV_ClipDistance0;\n"));
+    CHECK(hlsl_has("    float3 cull0 : SV_CullDistance0;\n"));
+    CHECK(hlsl_has("output.cull0.x = asfloat(v1);"));
+    CHECK(hlsl_has("output.cull0.z = asfloat(v1);"));
+    CHECK(!hlsl_has("output.clip0.w") && !hlsl_has("output.cull0.w"));
+    // Cull distances first: 4 cull (0-3) + 4 clip (4-7) use all eight.
+    CHECK(translate_two_vectors_vs(0x00C00FF0));
+    CHECK(hlsl_has("    float4 clip0 : SV_ClipDistance0;\n"));
+    CHECK(hlsl_has("    float4 cull0 : SV_CullDistance0;\n"));
+    CHECK(hlsl_has("output.clip0.x = asfloat(v1);"));
+    CHECK(hlsl_has("output.cull0.w = asfloat(v1);"));
+    // A hole between distances of one kind keeps its place: clip 0 and 2, cull 4.
+    CHECK(translate_two_vectors_vs(0x00C01505));
+    CHECK(hlsl_has("    float3 clip0 : SV_ClipDistance0;\n"));
+    CHECK(hlsl_has("output.clip0.y = 0.0f;"));
+    CHECK(hlsl_has("    float cull0 : SV_CullDistance0;\n"));
+}
+
+// Mesh shaders are described but not translated yet.
+static void test_mesh_not_translated() {
+    Asm a = {};
+    put_words(a, k_clip_vs, ARRAY_COUNT(k_clip_vs));
+    ShaderInfo info = vertex_info(0x01400101);
+    info.stage = SHADER_MESH;
+    info.user_sgpr_first = 8;
+    info.mesh_threads = 128;
+    info.mesh_root_end = 8 + 9; // where the user SGPRs end
+    CHECK(!translate(a, info));
+    CHECK(error_has("mesh shader translation not implemented"));
+    // Root data past the user SGPRs (a driver value the layout doesn't know) is refused by name.
+    info.mesh_root_end = 8 + 10;
+    CHECK(!translate(a, info));
+    CHECK(error_has("root data ends at s18, but its user SGPRs at s17"));
+}
+
 void test_shader_translate() {
     rdna_init();
     test_constant_sampler_in_vcc();
@@ -1867,5 +1994,7 @@ void test_shader_translate() {
     test_half_interpolation();
     test_spills_apart();
     test_lds_size();
+    test_clip_distances();
+    test_mesh_not_translated();
     g_out.hlsl.release();
 }

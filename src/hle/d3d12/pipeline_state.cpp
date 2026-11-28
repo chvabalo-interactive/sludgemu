@@ -313,11 +313,26 @@ static void decode_fixed_state(const u8* ctx, const u8* metadata, PipelineFixedS
 
 static void pipeline_created(ConsolePipelineState* pso);
 
+// The pixel shader of a vertex or mesh pipeline, if it has one.
+static void request_pixel_program(ConsolePipelineState* pso, const ConsoleSerializedPipeline* s,
+                                  const ConsoleGraphicsShaders& g) {
+    const ConsoleSerializedShader& ps = s->stages[HW_STAGE_PS];
+    if (!ps.code || !ps.code_size)
+        return;
+    ShaderInfo info;
+    memset(&info, 0, sizeof(info));
+    info.stage = SHADER_PIXEL;
+    console_user_data_layout(pso->root_signature->layout, CONSOLE_FIRST_ROOT_SGPR_GRAPHICS, &info);
+    info.user_sgprs = g.ps_user_sgprs;
+    info.ps_input_addr = g.ps_input_ena;
+    info.ps_color_format = g.ps_color_format;
+    pso->programs[1] = shader_program_get(ps.code, (u32)ps.code_size, info);
+}
+
 static void request_graphics_programs(ConsolePipelineState* pso, const ConsoleSerializedPipeline* s,
                                       const ConsoleGraphicsShaders& g) {
     const ConsoleRootSignature* rs = pso->root_signature;
     const ConsoleSerializedShader& vs = s->stages[HW_STAGE_VS];
-    const ConsoleSerializedShader& ps = s->stages[HW_STAGE_PS];
     if (!rs || !vs.code || !vs.code_size)
         return;
     ShaderInfo info;
@@ -327,17 +342,67 @@ static void request_graphics_programs(ConsolePipelineState* pso, const ConsoleSe
     info.user_sgprs = g.vs_user_sgprs;
     info.element_count = g.element_count;
     memcpy(info.elements, g.elements, sizeof(info.elements));
+    info.vs_out_cntl = g.vs_out_cntl;
     pso->programs[0] = shader_program_get(vs.code, (u32)vs.code_size, info);
-    if (ps.code && ps.code_size) {
-        memset(&info, 0, sizeof(info));
-        info.stage = SHADER_PIXEL;
-        console_user_data_layout(rs->layout, CONSOLE_FIRST_ROOT_SGPR_GRAPHICS, &info);
-        info.user_sgprs = g.ps_user_sgprs;
-        info.ps_input_addr = g.ps_input_ena;
-        info.ps_color_format = g.ps_color_format;
-        pso->programs[1] = shader_program_get(ps.code, (u32)ps.code_size, info);
-    }
+    request_pixel_program(pso, s, g);
     pso->translated = pso->programs[0] != nullptr;
+}
+
+// --- mesh pipelines ----------------------------------------------------------------------------------
+
+// Mesh pipelines run the mesh shader in the geometry stage. Its user SGPRs start at s8 (s0..s7 hold
+// console launch state) and root parameters at s16 (s8..s15 are the console driver's), so the root
+// signature's user data has to end where the packet's user SGPR count does: a driver value past it
+// would make the translated program expect root constants the desktop signature doesn't give. The
+// translator refuses such programs (ShaderInfo::mesh_root_end), but they and the pixel program are still
+// requested so that SLUDGE_SHADER_DUMP keeps them: their code shows what the extra SGPRs are.
+static void request_mesh_programs(ConsolePipelineState* pso, const ConsoleSerializedPipeline* s,
+                                  const ConsoleGraphicsShaders& g) {
+    const ConsoleRootSignature* rs = pso->root_signature;
+    const ConsoleSerializedShader& ms = s->stages[HW_STAGE_GS];
+    pso->mesh = true;
+    if (!rs) { // the user data layout is unknown without one
+        LOG_W_ONCE("d3d12", "a mesh pipeline without a root signature; draws with it are skipped");
+        return;
+    }
+    ShaderInfo info;
+    memset(&info, 0, sizeof(info));
+    info.stage = SHADER_MESH;
+    u32 root_end = console_user_data_layout(rs->layout, CONSOLE_MESH_FIRST_ROOT_SGPR, &info);
+    if (root_end != CONSOLE_MESH_FIRST_USER_SGPR + g.gs_user_sgprs)
+        LOG_W_ONCE(
+            "d3d12",
+            "a mesh pipeline's root data ends at s%u, but its user SGPRs at s%u: draws with it are skipped",
+            root_end, CONSOLE_MESH_FIRST_USER_SGPR + g.gs_user_sgprs);
+    info.mesh_root_end = (u8)root_end;
+    info.user_sgpr_first = CONSOLE_MESH_FIRST_USER_SGPR;
+    info.user_sgprs = g.gs_user_sgprs;
+    info.wave_size = 64;
+    info.lds_bytes = g.mesh_lds_bytes;
+    info.mesh_topology = g.primitive_topology_type;
+    info.mesh_threads = g.mesh_threads;
+    info.mesh_max_vertices = g.mesh_max_vertices;
+    info.mesh_max_primitives = g.mesh_max_primitives;
+    info.vs_out_cntl = g.vs_out_cntl;
+    pso->programs[0] = shader_program_get(ms.code, (u32)ms.code_size, info);
+    request_pixel_program(pso, s, g);
+    pso->translated = pso->programs[0] != nullptr;
+}
+
+// Whether any stage but the pixel and geometry stages has code.
+static bool other_stages(const ConsoleSerializedPipeline* s) {
+    for (u32 i = 0; i < HW_STAGE_COUNT; i++)
+        if (i != HW_STAGE_PS && i != HW_STAGE_GS && s->stages[i].code && s->stages[i].code_size)
+            return true;
+    return false;
+}
+
+static u32 stage_mask(const ConsoleSerializedPipeline* s) {
+    u32 mask = 0;
+    for (u32 i = 0; i < HW_STAGE_COUNT; i++)
+        if (s->stages[i].code && s->stages[i].code_size)
+            mask |= 1u << i;
+    return mask;
 }
 
 HRESULT console_deserialize_pipeline_state(ConsoleDevice*, bool compute, const ConsoleSerializedPipeline* s,
@@ -375,7 +440,10 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice*, bool compute, const C
     if (!s->metadata ||
         !console_parse_graphics(s->packet, s->packet_size, s->metadata, s->metadata_size, &g) ||
         context + CTX_SIZE > s->packet_size) {
-        LOG_W_ONCE("d3d12", "graphics pipeline in an unknown serialized form; draws with it are skipped");
+        LOG_W_ONCE("d3d12", "graphics pipeline in an unknown serialized form (%s); draws with it are skipped",
+                   !s->metadata ? "no metadata"
+                   : g.error    ? g.error
+                                : "packet shorter than its context registers");
         return console_return(pso, iid, out);
     }
     PipelineFixedState& f = pso->fixed;
@@ -392,7 +460,18 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice*, bool compute, const C
     memcpy(f.elements, g.elements, sizeof(f.elements));
     memcpy(f.element_per_instance, g.element_per_instance, sizeof(f.element_per_instance));
     memcpy(f.element_step_rate, g.element_step_rate, sizeof(f.element_step_rate));
-    request_graphics_programs(pso, s, g);
+    const ConsoleSerializedShader& gs = s->stages[HW_STAGE_GS];
+    if (console_mesh_pipeline(g, gs.code && gs.code_size, other_stages(s))) {
+        request_mesh_programs(pso, s, g);
+    } else if (g.geometry) {
+        LOG_W_ONCE(
+            "d3d12",
+            "geometry-stage pipeline (stages 0x%x, %u input elements) not translated; draws with it are "
+            "skipped",
+            stage_mask(s), g.element_count);
+    } else {
+        request_graphics_programs(pso, s, g);
+    }
     pipeline_created(pso);
     return console_return(pso, iid, out);
 }
@@ -720,6 +799,7 @@ HRESULT console_derive_pipeline_state(ConsoleDevice*, void* source, u32 count, c
     ConsolePipelineState* pso =
         new_pipeline_state(src->compute, src->root_signature, src->packet, sizeof(src->packet));
     pso->translated = src->translated;
+    pso->mesh = src->mesh;
     pso->programs[0] = src->programs[0];
     pso->programs[1] = src->programs[1];
     pso->fixed = src->fixed;

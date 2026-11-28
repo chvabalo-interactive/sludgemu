@@ -43,6 +43,13 @@
 // - Root descriptors (buffer addresses in user data) become desktop root SRVs/UAVs read as raw
 //   buffers; registers holding their high address dword are tracked statically.
 // - Vertex fetches (loads through the vertex buffer table) become desktop input assembler inputs.
+// - Graphics user SGPRs s0..s7 hold console system values (the vertex buffer table, base vertex, ...)
+//   that the desktop doesn't provide: translated vertex and pixel shaders read them as 0.
+// - Clip and cull distances: PA_CL_VS_OUT_CNTL (ShaderInfo::vs_out_cntl) says which position exports
+//   after pos0 hold them and which distances clip or cull (see emit_export).
+//
+// Mesh shaders (console geometry-stage programs of mesh pipelines) are described (SHADER_MESH and the
+// mesh fields of ShaderInfo) but not translated yet: translation fails with a stated reason.
 
 #pragma once
 
@@ -53,6 +60,7 @@ enum ShaderStage : u8 {
     SHADER_VERTEX,
     SHADER_PIXEL,
     SHADER_COMPUTE,
+    SHADER_MESH,
 };
 
 // What a root parameter places in user SGPRs.
@@ -135,6 +143,26 @@ struct ShaderInfo {
     // Mixed-interpolation split: 0 = keep flat reads on P<i>, 1 + dst = route flat reads/exports
     // of attribute i onto P<dst> so VS/PS don't need SV_Barycentrics / GetAttributeAtVertex.
     u8 flat_remap[32];
+
+    // Fields added later go below, so that dumps of older builds (shorter) load zero-extended.
+
+    // The first user SGPR (user_sgprs follow from it): 0, except mesh shaders (8).
+    u8 user_sgpr_first;
+    // Mesh shaders: the primitive topology type (D3D12_PRIMITIVE_TOPOLOGY_TYPE: 2 lines, 3 triangles),
+    // threads per group and the most vertices and primitives a group outputs. LDS is lds_bytes.
+    u8 mesh_topology;
+    u16 mesh_threads;
+    u16 mesh_max_vertices;
+    u16 mesh_max_primitives;
+    // Vertex and mesh shaders: PA_CL_VS_OUT_CNTL. Clip distance enables in bits 7:0, cull distance
+    // enables in 15:8; position exports after pos0 hold, in order, the misc vector (bit 21: point size,
+    // layer, viewport), distances 0-3 (bit 22) and distances 4-7 (bit 23), each only if enabled.
+    u32 vs_out_cntl;
+    // Mesh shaders: the SGPR after the root signature's user data as the pipeline lays it out (root
+    // parameters from s16, then the heap SGPRs). Translation refuses programs where this isn't
+    // user_sgpr_first + user_sgprs: the console driver puts a value there that the layout doesn't know, so
+    // the translated program would expect root data the desktop signature doesn't give.
+    u8 mesh_root_end;
 };
 
 // A sampler built into the program: console code can sample with a sampler descriptor made from

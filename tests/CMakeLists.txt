@@ -8,6 +8,7 @@ add_executable(sludgemu_tests
     layout_test.cpp
     bcpack_test.cpp
     shader_translate_test.cpp
+    console_pipeline_test.cpp
     shader_lanes_test.cpp
     shader_cache_test.cpp
     shader_schedule_test.cpp

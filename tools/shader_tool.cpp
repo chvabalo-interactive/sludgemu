@@ -8,14 +8,20 @@
 //                                                    the HLSL and a summary of failures
 //   shader_tool retranslate <dir> <out dir> [-v]     the same for a runtime dump (SLUDGE_SHADER_DUMP:
 //                                                    <key>.bin code and <key>.info); HLSL goes to
-//                                                    <key>_vs/ps/cs.hlsl; -v lists every failure
+//                                                    <key>_vs/ps/cs/ms.hlsl; -v lists every failure
+//   shader_tool pipelines <dir>                      what the graphics packets of a dump say: stages,
+//                                                    user SGPRs, clip and cull distances, mesh shapes
 //
 // Translations are for a desktop device running compute waves of 32 lanes; --wave <min> <max> (before
 // the command) names another range of wave sizes.
 //
 // Dumps hold, per pipeline pNNNNN: _g_packet.bin, _g_meta.bin, _rs.txt (root signature as text) and
-// _vs_code.bin / _ps_code.bin.
+// _vs_code.bin / _ps_code.bin. `pipelines` also reads dumps naming pipelines pNNN_mSS (SS: the stages
+// with code, a bit per stage in the order PS, VS, GS, ES, HS, LS, FS) with _packet.bin, _meta.bin and
+// _stage<i>_code.bin.
 
+#include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -240,6 +246,7 @@ static bool pipeline_info(const char* dir, const char* name, bool pixel, ShaderI
         info->stage = pixel ? SHADER_PIXEL : SHADER_VERTEX;
         console_user_data_layout(layout, CONSOLE_FIRST_ROOT_SGPR_GRAPHICS, info);
         info->user_sgprs = pixel ? g.ps_user_sgprs : g.vs_user_sgprs;
+        info->vs_out_cntl = pixel ? 0 : g.vs_out_cntl;
         info->ps_input_addr = g.ps_input_ena;
         info->ps_color_format = g.ps_color_format;
         info->element_count = g.element_count;
@@ -386,7 +393,7 @@ static int translate_all(const char* dir, const char* out_dir) {
 // doesn't show) to <out dir>.samplers.txt.
 static int retranslate(const char* dir, const char* out_dir, bool verbose) {
     static FailureCount failures[512];
-    u32 failure_kinds = 0, programs = 0, translated = 0;
+    u32 failure_kinds = 0, programs = 0, translated = 0, older_infos = 0;
     char pattern[MAX_PATH];
     snprintf(pattern, sizeof(pattern), "%s\\*.info", dir);
     WIN32_FIND_DATAA fd;
@@ -409,18 +416,25 @@ static int retranslate(const char* dir, const char* out_dir, bool verbose) {
         u8* info_bytes = read_file(path, &info_size);
         snprintf(path, sizeof(path), "%s\\%s.bin", dir, key);
         u8* code = read_file(path, &size);
-        if (!info_bytes || !code || info_size != sizeof(ShaderInfo)) {
-            if (info_bytes && info_size != sizeof(ShaderInfo))
-                fprintf(stderr, "%s: dumped by another build (info of %u bytes)\n", key, info_size);
+        // Fields are only ever appended to ShaderInfo: older builds' dumps are shorter, and what they
+        // lack is zero.
+        if (!info_bytes || !code || info_size < offsetof(ShaderInfo, flat_remap) ||
+            info_size > sizeof(ShaderInfo)) {
+            if (info_bytes && info_size > sizeof(ShaderInfo))
+                fprintf(stderr, "%s: dumped by a newer build (info of %u bytes)\n", key, info_size);
             free(info_bytes);
             free(code);
             continue;
         }
+        if (info_size < sizeof(ShaderInfo))
+            older_infos++;
         ShaderInfo info;
-        memcpy(&info, info_bytes, sizeof(info));
+        memset(&info, 0, sizeof(info));
+        memcpy(&info, info_bytes, info_size);
         free(info_bytes);
         programs++;
-        const char* stage = info.stage == SHADER_VERTEX ? "vs" : info.stage == SHADER_PIXEL ? "ps" : "cs";
+        static const char* const k_stage_names[4] = {"vs", "ps", "cs", "ms"};
+        const char* stage = info.stage < 4 ? k_stage_names[info.stage] : "unknown";
         if (shader_translate(code, size, info, g_target, &out)) {
             translated++;
             snprintf(path, sizeof(path), "%s\\%s_%s.hlsl", out_dir, key, stage);
@@ -466,6 +480,8 @@ static int retranslate(const char* dir, const char* out_dir, bool verbose) {
         fclose(sampler_list);
     out.hlsl.release();
     printf("%u programs, %u translated\n", programs, translated);
+    if (older_infos)
+        printf("%u programs dumped by an older build (what their info lacks is zero)\n", older_infos);
     for (;;) {
         u32 best = ~0u;
         for (u32 k = 0; k < failure_kinds; k++)
@@ -476,6 +492,195 @@ static int retranslate(const char* dir, const char* out_dir, bool verbose) {
         printf("%6u  %-90s %s\n", failures[best].count, failures[best].reason, failures[best].example);
         failures[best].count = 0;
     }
+    return 0;
+}
+
+// --- pipelines ---------------------------------------------------------------------------------------
+
+// Distinct values (as text) with how many pipelines have each, for the pipelines report.
+struct Tally {
+    const char* title;
+    u32 used;
+    u32 dropped; // values past the table's capacity
+    struct Entry {
+        char text[128];
+        char example[40];
+        u32 count;
+    } entries[256];
+};
+
+static void tally(Tally* t, const char* example, const char* format, ...) {
+    char text[128];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    u32 i = 0;
+    while (i < t->used && strcmp(t->entries[i].text, text) != 0)
+        i++;
+    if (i == t->used) {
+        if (t->used == ARRAY_COUNT(t->entries)) {
+            t->dropped++;
+            return;
+        }
+        Tally::Entry& e = t->entries[t->used++];
+        snprintf(e.text, sizeof(e.text), "%s", text);
+        snprintf(e.example, sizeof(e.example), "%s", example);
+        e.count = 0;
+    }
+    t->entries[i].count++;
+}
+
+// Most common first; empties the tally.
+static void print_tally(Tally* t) {
+    if (!t->used)
+        return;
+    printf("\n%s:\n", t->title);
+    for (;;) {
+        u32 best = ~0u;
+        for (u32 i = 0; i < t->used; i++)
+            if (t->entries[i].count && (best == ~0u || t->entries[i].count > t->entries[best].count))
+                best = i;
+        if (best == ~0u)
+            break;
+        printf("%8u  %-90s %s\n", t->entries[best].count, t->entries[best].text, t->entries[best].example);
+        t->entries[best].count = 0;
+    }
+    if (t->dropped)
+        printf("%8u  (more distinct values than listed)\n", t->dropped);
+}
+
+static bool file_exists(const char* path) {
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Which hardware stages of a dumped pipeline have code (a bit per stage: PS, VS, GS, ES, HS, LS, FS).
+// `base` is the pipeline's name: pNNNNN for _g_packet.bin dumps (vertex and pixel shaders only), pNNN_mSS
+// for _packet.bin dumps.
+static u32 dumped_stages(const char* dir, const char* base, bool g_dump) {
+    char path[MAX_PATH];
+    u32 mask = 0;
+    if (g_dump) {
+        static const char* const k_names[2] = {"ps", "vs"};
+        for (u32 i = 0; i < 2; i++) {
+            snprintf(path, sizeof(path), "%s\\%s_%s_code.bin", dir, base, k_names[i]);
+            if (file_exists(path))
+                mask |= 1u << i;
+        }
+        return mask;
+    }
+    for (u32 i = 0; i < 7; i++) {
+        snprintf(path, sizeof(path), "%s\\%s_stage%u_code.bin", dir, base, i);
+        if (file_exists(path))
+            mask |= 1u << i;
+    }
+    return mask;
+}
+
+static u32 packet_u32(const u8* packet, u32 size, u32 offset) {
+    u32 v = 0;
+    if (offset + 4 <= size)
+        memcpy(&v, packet + offset, 4);
+    return v;
+}
+
+static int pipelines(const char* dir) {
+    static Tally failures, configs, stages, swaps, vertex_out, mesh_shapes, mesh_lds, mesh_unknown,
+        geometry_other;
+    failures.title = "not parsed";
+    configs.title = "configurations (PACKET_CONFIG bits 1:0)";
+    stages.title = "stages with code";
+    swaps.title = "vertex pipelines whose +60 and +80 user SGPR counts differ";
+    vertex_out.title = "PA_CL_VS_OUT_CNTL by kind of pipeline";
+    mesh_shapes.title =
+        "mesh pipelines: threads, vertices, primitives, user SGPRs (GS, PS), PA_CL_VS_OUT_CNTL, "
+        "topology type";
+    mesh_lds.title = "mesh pipelines: LDS bytes";
+    mesh_unknown.title = "mesh pipelines: VGT_GS_ONCHIP_CNTL and packet dwords +116 +120 +168";
+    geometry_other.title = "geometry-stage pipelines that aren't mesh pipelines (stages, input elements)";
+    char pattern[MAX_PATH];
+    snprintf(pattern, sizeof(pattern), "%s\\*_packet.bin", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE find = FindFirstFileA(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "no files match %s\n", pattern);
+        return 1;
+    }
+    u32 total = 0, parsed = 0, mesh = 0, vs_changed = 0, ps_changed = 0, with_vs = 0, with_ps = 0;
+    do {
+        // pNNNNN_g_packet.bin or pNNN_mSS_packet.bin; compute pipelines (_c_packet.bin) are skipped.
+        char base[64];
+        usize n = strlen(fd.cFileName) - strlen("_packet.bin");
+        if (n < 2 || n >= sizeof(base))
+            continue;
+        memcpy(base, fd.cFileName, n);
+        base[n] = 0;
+        if (strcmp(base + n - 2, "_c") == 0)
+            continue;
+        bool g_dump = strcmp(base + n - 2, "_g") == 0;
+        if (g_dump)
+            base[n - 2] = 0;
+        char path[MAX_PATH];
+        u32 packet_size = 0, meta_size = 0;
+        snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
+        u8* packet = read_file(path, &packet_size);
+        snprintf(path, sizeof(path), g_dump ? "%s\\%s_g_meta.bin" : "%s\\%s_meta.bin", dir, base);
+        u8* meta = read_file(path, &meta_size);
+        total++;
+        ConsoleGraphicsShaders g = {};
+        if (!packet || !meta || !console_parse_graphics(packet, packet_size, meta, meta_size, &g)) {
+            tally(&failures, base, "%s", !packet || !meta ? "packet or metadata missing" : g.error);
+            free(packet);
+            free(meta);
+            continue;
+        }
+        parsed++;
+        u32 mask = dumped_stages(dir, base, g_dump);
+        bool has_ps = mask & 1, has_vs = (mask >> 1) & 1, has_gs = (mask >> 2) & 1;
+        tally(&configs, base, "config %u", g.config);
+        tally(&stages, base, "%s%s%s%s", has_ps ? "PS " : "", has_vs ? "VS " : "", has_gs ? "GS " : "",
+              mask & ~7u ? "others" : "");
+        // Vertex pipelines were read with +60 as the pixel shader's user SGPR count and +80 as the vertex
+        // shader's before: only those where the two differ change.
+        u32 at60 = (packet_u32(packet, packet_size, PACKET_VS_RSRC2) >> 1) & 31;
+        u32 at80 = (packet_u32(packet, packet_size, PACKET_PS_RSRC2) >> 1) & 31;
+        with_vs += has_vs && !g.geometry;
+        with_ps += has_ps && !g.geometry;
+        if (at60 != at80 && !g.geometry) {
+            vs_changed += has_vs;
+            ps_changed += has_ps;
+            tally(&swaps, base, "+60 %2u +80 %2u, %s%s%s", at60, at80, has_vs ? "VS " : "",
+                  has_ps ? "PS " : "", has_gs ? "GS" : "");
+        }
+        bool is_mesh = console_mesh_pipeline(g, has_gs, (mask & ~5u) != 0);
+        tally(&vertex_out, base, "%-10s 0x%08x",
+              is_mesh      ? "mesh"
+              : g.geometry ? "geometry"
+                           : "vertex",
+              g.vs_out_cntl);
+        if (is_mesh) {
+            mesh++;
+            tally(&mesh_shapes, base, "%3u %3u %3u  gs %2u ps %2u  0x%08x  topology %u", g.mesh_threads,
+                  g.mesh_max_vertices, g.mesh_max_primitives, g.gs_user_sgprs, g.ps_user_sgprs, g.vs_out_cntl,
+                  g.primitive_topology_type);
+            tally(&mesh_lds, base, "%6u", g.mesh_lds_bytes);
+            tally(&mesh_unknown, base, "0x%08x  0x%08x 0x%08x 0x%08x", g.gs_onchip, g.gs_unknown[0],
+                  g.gs_unknown[1], g.gs_unknown[2]);
+        } else if (g.geometry) {
+            tally(&geometry_other, base, "stages 0x%02x, %u input elements", mask, g.element_count);
+        }
+        free(packet);
+        free(meta);
+    } while (FindNextFileA(find, &fd));
+    FindClose(find);
+    printf("%u graphics pipelines, %u parsed, %u mesh pipelines\n", total, parsed, mesh);
+    printf("vertex pipelines' user SGPR counts that changed register (+60 and +80 differ): %u of %u vertex "
+           "shaders, %u of %u pixel shaders\n",
+           vs_changed, with_vs, ps_changed, with_ps);
+    Tally* all[] = {&failures,    &configs,  &stages,       &swaps,         &vertex_out,
+                    &mesh_shapes, &mesh_lds, &mesh_unknown, &geometry_other};
+    for (u32 i = 0; i < ARRAY_COUNT(all); i++)
+        print_tally(all[i]);
     return 0;
 }
 
@@ -497,8 +702,11 @@ int main(int argc, char** argv) {
         return stats(argv[2], argc >= 4 ? argv[3] : nullptr);
     if (argc >= 4 && strcmp(argv[1], "retranslate") == 0)
         return retranslate(argv[2], argv[3], argc >= 5 && strcmp(argv[4], "-v") == 0);
+    if (argc >= 3 && strcmp(argv[1], "pipelines") == 0)
+        return pipelines(argv[2]);
     fprintf(stderr,
             "usage: shader_tool [--wave <min> <max>] disasm <code.bin> | stats <dir> [filter] | "
-            "translate <dir> <pipeline> <vs|ps> | translate-all <dir> <out> | retranslate <dir> <out>\n");
+            "translate <dir> <pipeline> <vs|ps> | translate-all <dir> <out> | retranslate <dir> <out> | "
+            "pipelines <dir>\n");
     return 1;
 }

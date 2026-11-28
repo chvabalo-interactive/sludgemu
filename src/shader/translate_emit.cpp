@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "shader/console_pipeline.h"
 #include "shader/translate_internal.h"
 
 // --- helpers -----------------------------------------------------------------------------------------
@@ -519,6 +520,116 @@ static bool emit_interpolation(Translator& t, const RdnaInst& in) {
 
 // --- exports -----------------------------------------------------------------------------------------
 
+// Clip and cull distances, by PA_CL_VS_OUT_CNTL: position exports after pos0 hold, in this order and
+// each only if enabled, the misc vector (point size, edge flag, layer, viewport), distances 0-3 and
+// distances 4-7. A distance clips if its clip bit is set, else culls if its cull bit is, else nothing
+// uses it.
+#define VS_OUT_MISC_VECTOR (1u << 21)
+#define VS_OUT_DISTANCES_0 (1u << 22)
+#define VS_OUT_DISTANCES_4 (1u << 23)
+
+enum PositionSlot : u8 {
+    POSITION_SLOT_NONE,
+    POSITION_SLOT_MISC,
+    POSITION_SLOT_DISTANCES_0,
+    POSITION_SLOT_DISTANCES_4,
+};
+
+// What position export `pos` (1..4) holds.
+static PositionSlot position_slot(u32 vs_out_cntl, u32 pos) {
+    static const u32 k_vectors[3] = {VS_OUT_MISC_VECTOR, VS_OUT_DISTANCES_0, VS_OUT_DISTANCES_4};
+    static const PositionSlot k_slots[3] = {POSITION_SLOT_MISC, POSITION_SLOT_DISTANCES_0,
+                                            POSITION_SLOT_DISTANCES_4};
+    u32 next = 1;
+    for (u32 i = 0; i < 3; i++) {
+        if (!(vs_out_cntl & k_vectors[i]))
+            continue;
+        if (pos == next)
+            return k_slots[i];
+        next++;
+    }
+    return POSITION_SLOT_NONE;
+}
+
+static u32 clip_distance_mask(u32 vs_out_cntl) {
+    return vs_out_cntl & 0xFF;
+}
+
+static u32 cull_distance_mask(u32 vs_out_cntl) {
+    return (vs_out_cntl >> 8) & 0xFF & ~clip_distance_mask(vs_out_cntl);
+}
+
+// The desktop arrays of one kind of distance (clip or cull). The eight hardware distances are shared by
+// both kinds, so cull distances that follow clip distances (the usual order) don't start at 0: each array
+// starts at its kind's first enabled distance, else it would begin with a hole per distance of the other
+// kind, and legal mixes would pass the desktop's limit of eight in total. Holes between enabled distances
+// of one kind keep their place (written as 0).
+struct DistanceArray {
+    u32 mask;  // the hardware distances of this kind
+    u32 first; // the hardware distance at component 0
+    u32 count; // components declared: through the highest enabled distance
+};
+
+static DistanceArray distance_array(u32 mask) {
+    DistanceArray a = {mask, 0, 0};
+    if (!mask)
+        return a;
+    while (!((mask >> a.first) & 1))
+        a.first++;
+    while (mask >> (a.first + a.count))
+        a.count++;
+    return a;
+}
+
+// Declares `n` distances as <name>0 (and <name>1 past 4) with `semantic`.
+static void declare_distances(Text& h, const char* name, const char* semantic, u32 n) {
+    static const char* const k_types[5] = {"float", "float", "float2", "float3", "float4"};
+    h.put("    %s %s0 : %s0;\n", k_types[n > 4 ? 4 : n], name, semantic);
+    if (n > 4)
+        h.put("    %s %s1 : %s1;\n", k_types[n - 4], name, semantic);
+}
+
+// Writes hardware distance `d` (`value`) to the array's component if the array has one for it.
+static bool export_distance(Translator& t, const DistanceArray& a, const char* name, u32 d,
+                            const char* value) {
+    if (d < a.first || d >= a.first + a.count)
+        return false;
+    u32 n = d - a.first;
+    emit(t, "output.%s%u.%c = %s;", name, n / 4, "xyzw"[n % 4], (a.mask >> d) & 1 ? value : "0.0f");
+    return true;
+}
+
+// A position export after pos0 (`pos` 1..4) of a vertex shader: its components go to the clip and cull
+// distances they are. Every declared component in the export's range is written, unused ones as 0 (which
+// neither clips nor culls): outputs that aren't written are undefined where nothing zeroes them.
+static bool export_distances(Translator& t, u32 pos, const char* const c[4]) {
+    u32 cntl = t.info->vs_out_cntl;
+    PositionSlot slot = position_slot(cntl, pos);
+    if (slot == POSITION_SLOT_MISC) {
+        translator_fail(t, "per-vertex misc vector (layer/viewport/point size)");
+        return false;
+    }
+    if (slot == POSITION_SLOT_NONE) {
+        translator_fail(t, "export to pos%u, where PA_CL_VS_OUT_CNTL 0x%08x places nothing", pos, cntl);
+        return false;
+    }
+    u32 base = slot == POSITION_SLOT_DISTANCES_0 ? 0 : 4;
+    DistanceArray clip = distance_array(clip_distance_mask(cntl));
+    DistanceArray cull = distance_array(cull_distance_mask(cntl));
+    if (clip.count + cull.count > 8) { // the desktop limit for both together
+        translator_fail(t, "%u clip and %u cull distances declared (PA_CL_VS_OUT_CNTL 0x%08x)", clip.count,
+                        cull.count, cntl);
+        return false;
+    }
+    for (u32 i = 0; i < 4; i++) {
+        if (export_distance(t, clip, "clip", base + i, c[i]))
+            t.clip_written = true;
+        if (export_distance(t, cull, "cull", base + i, c[i]))
+            t.cull_written = true;
+    }
+    return true;
+}
+
 static bool emit_export(Translator& t, const RdnaInst& in) {
     const RdnaExport& e = in.exp;
     u32 target = e.target;
@@ -537,11 +648,9 @@ static bool emit_export(Translator& t, const RdnaInst& in) {
         if (target == EXP_POS0) {
             t.position_exported = 1;
             emit(t, "output.position = float4(%s, %s, %s, %s);", c[0], c[1], c[2], c[3]);
-        } else if (target == EXP_POS0 + 1) {
-            t.vs_clip_mask |= e.enable & 0xF;
-            for (u32 i = 0; i < 4; i++)
-                if (e.enable & (1u << i))
-                    emit(t, "output.clip.%c = %s;", "xyzw"[i], c[i]);
+        } else if (target > EXP_POS0 && target < EXP_POS0 + 5) {
+            if (!export_distances(t, target - EXP_POS0, c))
+                return false;
         } else if (target >= EXP_PARAM0) {
             u32 n = target - EXP_PARAM0;
             if (n >= 32) {
@@ -557,9 +666,6 @@ static bool emit_export(Translator& t, const RdnaInst& in) {
                     emit(t, "output.p%u = output.p%u;", d, n);
                 }
             }
-        } else if (target > EXP_POS0 && target < EXP_POS0 + 5) {
-            translator_fail(t, "vertex export to pos%u (clip distances, point size)", target - EXP_POS0);
-            return false;
         } else {
             translator_fail(t, "vertex export to target %u", target);
             return false;
@@ -1127,8 +1233,12 @@ static void write_declarations(Translator& t, Text& h) {
                       element_hlsl_type(t.vs_fetch_components[i], t.fetch_typed[i], t.fetch_class[i]), i, i);
         h.put("    uint vertex_id : SV_VertexID;\n    uint instance_id : SV_InstanceID;\n};\n");
         h.put("struct Output {\n    float4 position : SV_Position;\n");
-        if (t.vs_clip_mask)
-            h.put("    float4 clip : SV_ClipDistance0;\n");
+        if (t.clip_written)
+            declare_distances(h, "clip", "SV_ClipDistance",
+                              distance_array(clip_distance_mask(info.vs_out_cntl)).count);
+        if (t.cull_written)
+            declare_distances(h, "cull", "SV_CullDistance",
+                              distance_array(cull_distance_mask(info.vs_out_cntl)).count);
         for (u32 i = 0; i < 32; i++)
             if (t.out->vs_param_mask & (1u << i))
                 h.put("    float4 p%u : P%u;\n", i, i);
@@ -1151,11 +1261,13 @@ static void write_declarations(Translator& t, Text& h) {
         write_compute_head(t, h);
     }
 
-    // Registers: user SGPRs from the root constants, system values, the rest zero.
+    // Registers: user SGPRs from the root constants, system values, the rest zero. The graphics system
+    // values in s0..s7 have no desktop counterpart and are 0 (their root constants are never written).
+    u32 first_user = info.stage == SHADER_COMPUTE ? 0 : CONSOLE_FIRST_ROOT_SGPR_GRAPHICS;
     for (u32 r = 0; r < 128; r++) {
         if (!t.sgpr_used[r] && r != SRC_EXEC_LO && r != SRC_EXEC_HI)
             continue;
-        if (r < info.user_sgprs)
+        if (r >= first_user && r < info.user_sgprs)
             h.put("    uint s%u = g_user[%u].%c;\n", r, r / 4, "xyzw"[r % 4]);
         else
             h.put("    uint s%u = 0u;\n", r);

@@ -99,6 +99,11 @@ static void WINAPI list_dispatch_x(ConsoleCommandList* self, UINT x, UINT y, UIN
     list_dispatch(self, x, y, z);
 }
 
+// Mesh shaders aren't translated yet: mesh draws are skipped.
+static void WINAPI list_dispatch_mesh(ConsoleCommandList*, UINT, UINT, UINT) {
+    LOG_W_ONCE("d3d12", "DispatchMesh is not translated yet; skipped");
+}
+
 static void WINAPI list_execute_indirect(ConsoleCommandList*, void*, UINT, void*, UINT64, void*, UINT64) {
     LOG_W_ONCE("d3d12", "ExecuteIndirect is not translated yet; skipped");
 }
@@ -525,6 +530,7 @@ const ConsoleEntry k_list_work_entries[] = {
     CONSOLE_ENTRY(108, list_atomic_copy_buffer_uint64),
     CONSOLE_ENTRY(111, list_resolve_subresource_region),
     CONSOLE_ENTRY(113, list_write_buffer_immediate),
+    CONSOLE_ENTRY(129, list_dispatch_mesh),
     CONSOLE_ENTRY(137, list_write_32bit_bottom_of_pipe_2x),
     CONSOLE_ENTRY(138, list_write_64bit_bottom_of_pipe_2x),
 };

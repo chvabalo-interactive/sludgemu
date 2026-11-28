@@ -696,6 +696,7 @@ struct ConsolePipelineState {
 
     ConsoleRootSignature* root_signature; // referenced, or nullptr
     bool compute;
+    bool mesh;                  // graphics: a mesh pipeline (programs: mesh, pixel); drawn by DispatchMesh
     bool translated;            // programs were requested (otherwise draws with it are skipped)
     ShaderProgram* programs[2]; // graphics: vertex, pixel (may be null); compute: compute
     PipelineFixedState fixed;
