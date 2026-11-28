@@ -976,7 +976,7 @@ void gpu_page_tables_submit(ID3D12CommandQueue* queue) {
         return;
     u64 last = flush();
     if (last)
-        queue->Wait(g_pt.fence, last);
+        gpu_queue_wait_on(queue, g_pt.fence, last);
 }
 
 void gpu_page_tables_release() {

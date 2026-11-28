@@ -794,6 +794,16 @@ void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics) {
         LOG_W("d3d12", "%s with pipeline %p skipped: %s", what, (void*)pso, reason);
 }
 
+void console_pipeline_marker(const ConsolePipelineState* pso, ID3D12GraphicsCommandList* list) {
+    const ShaderProgram* a = pso->programs[0];
+    const ShaderProgram* b = pso->programs[1];
+    wchar_t text[64];
+    int n = swprintf(text, 64, L"programs %016llx %016llx", a ? (unsigned long long)a->key : 0ull,
+                     b ? (unsigned long long)b->key : 0ull);
+    if (n > 0)
+        list->SetMarker(0, text, (UINT)(n + 1) * sizeof(wchar_t)); // 0: a UTF-16 string
+}
+
 static ID3D12PipelineState* create_graphics(const ConsolePipelineState* pso, const PipelineOutputs& o,
                                             ID3D12RootSignature* signature) {
     const PipelineFixedState& f = pso->fixed;

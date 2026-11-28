@@ -59,6 +59,8 @@ static bool prepare(ConsoleCommandList* self, bool graphics) {
         s.bound = desktop;
     }
     list_flush_user_data(self, graphics);
+    if (gpu_options().removal_reports)
+        console_pipeline_marker(s.pipeline, self->desktop);
     return true;
 }
 

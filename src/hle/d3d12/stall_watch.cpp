@@ -3,7 +3,8 @@
 // Titles give up on a GPU that stops making progress (watchdogs that fire after tens of seconds),
 // and by then nothing in the log says what the GPU was waiting for. A low-priority thread watches
 // the queues once a second: when one has work it doesn't finish for STALL_SECONDS, it logs where
-// every queue is, which title counters GPU work waits on, and every thread's backtrace.
+// every queue is, the fence wait holding each one and what would signal it, and every thread's
+// backtrace.
 
 #include "common/log.h"
 #include "gpu/gpu.h"
@@ -20,34 +21,13 @@ struct SlotWatch {
 static SlotWatch g_watch[GPU_MAX_QUEUES];
 static bool g_reported = false; // for the current stall
 
-static const char* queue_type_name(D3D12_COMMAND_LIST_TYPE type) {
-    switch (type) {
-    case D3D12_COMMAND_LIST_TYPE_DIRECT: return "direct";
-    case D3D12_COMMAND_LIST_TYPE_COMPUTE: return "compute";
-    case D3D12_COMMAND_LIST_TYPE_COPY: return "copy";
-    default: return "other";
-    }
-}
-
 static void report(u32 stuck_slot) {
     LOG_W("d3d12", "GPU stall: queue slot %u finished nothing for %u s; where the queues are:", stuck_slot,
           g_watch[stuck_slot].stuck);
-    for (u32 s = 0; s < GPU_MAX_QUEUES; s++) {
-        GpuQueueProgress p;
-        if (!gpu_queue_progress(s, &p))
-            continue;
-        if (p.wait_value)
-            LOG_W("d3d12",
-                  "  slot %u (%s): numbered %llu, executed %llu, completed %llu; last wait for %llu (fence "
-                  "at %llu) holds back %llu on",
-                  s, queue_type_name(p.type), p.numbered, p.executed, p.completed, p.wait_value, p.wait_reached,
-                  p.wait_before);
-        else
-            LOG_W("d3d12", "  slot %u (%s): numbered %llu, executed %llu, completed %llu", s,
-                  queue_type_name(p.type), p.numbered, p.executed, p.completed);
-    }
-    console_counter_report();
+    gpu_queue_report_stall(console_fence_name);
+    console_queues_report_backlogs(console_fence_name);
     crash_dump_all_threads("GPU stall");
+    gpu_remove_device("GPU stall");
 }
 
 static DWORD WINAPI stall_watch_thread(void*) {

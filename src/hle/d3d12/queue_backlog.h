@@ -11,14 +11,16 @@
 // Console queues never block the thread that submits to them, and titles rely on it: GPU work may wait
 // for work the same thread submits afterwards. Desktop D3D12 can't run a command list again before its
 // last run finished, so a console list submitted again while it still runs is held back here, and so is
-// everything submitted to the queue after it, to keep the queue's order. The held-back work reaches the
-// desktop queue, in order, as soon as the run it waits for finished: on the next call into the queue or
-// from a thread pool wait, whichever comes first.
+// everything submitted to the queue after it, to keep the queue's order. So is a fence wait nothing
+// queued ends yet (gpu_fence_wait_covered): only the CPU or work submitted later can, and the desktop
+// queue must not hold such waits. The held-back work reaches the desktop queue, in order, as soon as
+// what it waits for is there: on the next call into the queue or from a thread pool wait, whichever
+// comes first.
 
 enum BacklogKind : u8 {
     BACKLOG_EXECUTE, // lists (or none: just counted), then the queue's submission count
     BACKLOG_SIGNAL,  // desktop fence signal
-    BACKLOG_WAIT,    // desktop fence wait
+    BACKLOG_WAIT,    // desktop fence wait (held while not covered)
     BACKLOG_PRESENT, // a console present
 };
 
@@ -45,10 +47,10 @@ struct QueueBacklog {
     u32 first;
     u32 count;
     u32 capacity;
-    HANDLE event;   // set once the run the first op waits for finished (made on first use)
-    HANDLE wait;    // thread pool wait on `event`
-    u32 armed_slot; // what `event` was last set to follow (GPU_NO_QUEUE: nothing)
-    u64 armed_after;
+    HANDLE event;             // set once the run the first op waits for finished (made on first use)
+    HANDLE wait;              // thread pool wait on `event`
+    ID3D12Fence* armed_fence; // what `event` was last set to follow (nullptr: nothing)
+    u64 armed_value;
 };
 
 // A new op at the end, zeroed; nullptr without memory.

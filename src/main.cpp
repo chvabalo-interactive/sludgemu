@@ -6,6 +6,8 @@
 //   --log-level=LEVEL  trace | debug | info | warn | error   (default: info)
 //   --break-on-stub    break into the debugger when an unimplemented import is called
 //   --gpu-debug        enable the D3D12 debug layer (and device removal reports)
+//   --gpu-dred         device removal reports only (DRED): where the GPU stopped, without the debug
+//                      layer's cost; a GPU stall removes the device to report it
 //   --gpu-serialize    wait for the GPU after every title submission (timing diagnostics)
 //   --gpu-warp         render with the software rasterizer (WARP) instead of the GPU
 //   --frame-stats      log presents per second and the longest frame interval, every second
@@ -39,6 +41,7 @@ struct Options {
     bool console;
     bool break_on_stub;
     bool gpu_debug;
+    bool gpu_dred;
     bool gpu_serialize;
     bool gpu_warp;
     bool frame_stats;
@@ -82,6 +85,8 @@ static bool parse_options(int argc, wchar_t** argv, Options* opt) {
             }
         } else if (wcscmp(a, L"--gpu-debug") == 0) {
             opt->gpu_debug = true;
+        } else if (wcscmp(a, L"--gpu-dred") == 0) {
+            opt->gpu_dred = true;
 
         } else if (wcscmp(a, L"--gpu-serialize") == 0) {
             opt->gpu_serialize = true;
@@ -186,6 +191,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     hle_init();
     GpuOptions gpu_options = {};
     gpu_options.debug_layer = opt.gpu_debug;
+    gpu_options.removal_reports = opt.gpu_debug || opt.gpu_dred;
     gpu_options.warp = opt.gpu_warp;
     gpu_options.serialize = opt.gpu_serialize;
     gpu_options.frame_stats = opt.frame_stats;

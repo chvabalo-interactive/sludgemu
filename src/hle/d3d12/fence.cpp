@@ -4,6 +4,7 @@
 // to signal and wait from the GPU. Each fence gets an 8-byte slot in blocks of title memory; the
 // slot's address finds the fence again when a command list names it.
 
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "common/log.h"
@@ -254,19 +255,19 @@ static void on_counter_store(u64 base, u64) {
 }
 
 // The value in memory tells a store we missed (memory past the fence) from one not made yet.
-void console_counter_report() {
+void console_fence_name(ID3D12Fence* fence, char* out, u32 size) {
     AcquireSRWLockShared(&g_fence_lock);
     for (u32 i = 0; i < COUNTER_CAPACITY; i++) {
         const CounterFence& c = g_counters[i];
-        if (!c.address)
-            continue;
-        u64 reached = c.fence->GetCompletedValue();
-        if (c.waited > reached)
-            LOG_W("d3d12", "  counter 0x%llx: GPU work waits for %llu, its fence is at %llu, memory reads %llu%s",
-                  c.address, c.waited, reached, *(volatile u64*)c.address,
-                  c.trapped ? "" : " (stores not trapped)");
+        if (c.address && c.fence == fence) {
+            snprintf(out, size, "counter 0x%llx (memory reads %llu%s)", c.address, *(volatile u64*)c.address,
+                     c.trapped ? "" : ", stores not trapped");
+            ReleaseSRWLockShared(&g_fence_lock);
+            return;
+        }
     }
     ReleaseSRWLockShared(&g_fence_lock);
+    snprintf(out, size, "fence %p (no title counter)", (void*)fence);
 }
 
 void console_fence_init() {

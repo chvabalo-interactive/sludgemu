@@ -422,7 +422,7 @@ void target_tiles_submit(ID3D12CommandQueue* queue) {
     }
     u64 last = g_targets.last;
     if (last && gpu_queue_completed(g_targets.slot) < last)
-        queue->Wait(g_targets.fence, last);
+        gpu_queue_wait_on(queue, g_targets.fence, last);
 }
 
 void target_tiles_usage(TargetTileUsage* out) {

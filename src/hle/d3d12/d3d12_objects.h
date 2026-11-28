@@ -84,10 +84,12 @@ HRESULT console_fence_signal_cpu(ConsoleFence* fence, u64 value);
 ID3D12Fence* console_sync_fence(u64 address);
 // A queue reaches GPU work waiting for the counter at `address` to reach `value` (see fence.cpp).
 void console_counter_wait(u64 address, u64 value);
-// Logs the counters GPU work waits on beyond what their fences reached (stall reports).
-void console_counter_report();
+// Describes a desktop fence for stall reports: the title counter it follows, if any.
+void console_fence_name(ID3D12Fence* fence, char* out, u32 size);
 // Starts the thread that reports GPU stalls (stall_watch.cpp).
 void console_stall_watch_start();
+// Logs the work each console queue holds back and what the first of it waits for (stall reports).
+void console_queues_report_backlogs(GpuFenceNamer name);
 
 // The allocation callback lets titles supply console command buffer memory. Recording goes to
 // desktop command lists instead, so it is kept but never called.
@@ -343,7 +345,7 @@ struct ConsoleResource {
     // Render target, depth and UAV textures: the desktop texture is reserved, its tiles shared with
     // textures over the same title memory (hle/d3d12/target_tiles.h).
     struct TargetTexture* target;
-    GpuSlots slots;          // the desktop texture is small, placed in these slots of the tile pool
+    GpuSlots slots; // the desktop texture is small, placed in these slots of the tile pool
     // The console mip the desktop texture's first mip is (textures of placed memory only): titles
     // streaming textures view only the mips they have loaded, and the desktop texture holds just those.
     u32 first_mip;
@@ -750,6 +752,8 @@ ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const P
                                               ID3D12RootSignature** signature, bool* building);
 // Logs, once per pipeline, why draws with it are skipped.
 void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics);
+// Names the pipeline's programs in a marker on `list`, which device removal reports show.
+void console_pipeline_marker(const ConsolePipelineState* pso, ID3D12GraphicsCommandList* list);
 
 // Page pools (page_pool.cpp): title memory registered as a source of GPU page mapping copies.
 HRESULT console_register_page_pool(u64 address, u32 page_count, u32 flags, HANDLE* handle);
