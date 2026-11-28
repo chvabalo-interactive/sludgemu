@@ -546,6 +546,10 @@ bool gpu_translate_current(u64 address, u64 size, GpuAddress* out) {
     }
     if (tiled)
         return gpu_translate(address, size, GPU_READ, out);
+    // A window would back frames nothing has written (and pin them for the GPU) only to read zeros: the
+    // caller reads title memory itself, taking zeros for them (see mem_any_pending).
+    if (mem_any_pending((const void*)address, size))
+        return false;
     return gpu_translate_contiguous(address, size, out);
 }
 
@@ -972,7 +976,7 @@ void gpu_page_tables_submit(ID3D12CommandQueue* queue) {
         return;
     u64 last = flush();
     if (last)
-        queue->Wait(g_pt.fence, last);
+        gpu_queue_wait_on(queue, g_pt.fence, last);
 }
 
 void gpu_page_tables_release() {

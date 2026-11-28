@@ -1,6 +1,6 @@
 # Console shader decoding and translation: platform independent, shared by sludgemu, the unit tests
 # and the shader tool.
-add_library(sludge_shader STATIC
+set(SLUDGE_SHADER_SOURCES
     shader/rdna.h
     shader/rdna_ops.inc
     shader/rdna_decode.cpp
@@ -11,6 +11,8 @@ add_library(sludge_shader STATIC
     shader/translate_internal.h
     shader/translate.cpp
     shader/translate_emit.cpp
+    shader/translate_flow.cpp
+    shader/translate_lanes.cpp
     shader/translate_alu.cpp
     shader/translate_memory.cpp
     shader/console_pipeline.h
@@ -18,6 +20,7 @@ add_library(sludge_shader STATIC
     shader/console_container.h
     shader/console_container.cpp
 )
+add_library(sludge_shader STATIC ${SLUDGE_SHADER_SOURCES})
 target_include_directories(sludge_shader PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(sludge_shader PRIVATE sludge_options libdeflate::libdeflate_static)
 target_compile_options(sludge_shader PRIVATE /Zc:threadSafeInit-) # linked into sludgemu.exe (see below)
@@ -86,8 +89,14 @@ add_executable(sludgemu WIN32
     hle/d3d12/d3d12_objects.h
     hle/d3d12/command_queue.cpp
     hle/d3d12/fence.cpp
+    hle/d3d12/stall_watch.cpp
     hle/d3d12/resource.cpp
+    hle/d3d12/resource_cpu.cpp
+    hle/d3d12/heap.cpp
+    hle/d3d12/device_x.cpp
     hle/d3d12/descriptor_heap.cpp
+    hle/d3d12/descriptor_shadow.h
+    hle/d3d12/descriptor_shadow.cpp
     hle/d3d12/query_heap.cpp
     hle/d3d12/pipeline_state.cpp
     hle/d3d12/command_signature.cpp
@@ -96,14 +105,21 @@ add_executable(sludgemu WIN32
     hle/d3d12/page_pool.cpp
     hle/d3d12/texture_sync.h
     hle/d3d12/texture_sync.cpp
+    hle/d3d12/target_tiles.h
+    hle/d3d12/target_tiles.cpp
     hle/d3d12/views.h
     hle/d3d12/views.cpp
     hle/d3d12/command_allocator.cpp
     hle/d3d12/command_list.h
     hle/d3d12/command_list.cpp
     hle/d3d12/command_list_work.cpp
+    hle/d3d12/command_list_x.cpp
+    hle/d3d12/command_args.h
+    hle/d3d12/command_args.cpp
     hle/d3d12/barriers.h
     hle/d3d12/barriers.cpp
+    hle/d3d12/queue_backlog.h
+    hle/d3d12/queue_backlog.cpp
     hle/d3d12/frame_pacing.h
     hle/d3d12/frame_pacing.cpp
     hle/d3d12/bvh_builder.cpp
@@ -118,18 +134,32 @@ add_executable(sludgemu WIN32
     gpu/gpu.cpp
     gpu/gpu_ring.h
     gpu/gpu_ring.cpp
+    gpu/ring_space.h
+    gpu/ring_space.cpp
+    gpu/reuse_order.h
+    gpu/reuse_order.cpp
+    gpu/list_pool.h
+    gpu/list_pool.cpp
     gpu/texture_untile.h
     gpu/texture_untile.cpp
     gpu/gpu_window.h
     gpu/gpu_window.cpp
     gpu/tile_pool.h
     gpu/tile_pool.cpp
+    gpu/shared_tiles.h
+    gpu/shared_tiles.cpp
     gpu/page_tables.h
     gpu/page_tables.cpp
     gpu/shader_programs.h
     gpu/shader_programs.cpp
+    gpu/shader_cache.h
+    gpu/shader_cache.cpp
+    gpu/shader_schedule.h
+    gpu/shader_schedule.cpp
     gpu/formats.h
     gpu/formats.cpp
+    gpu/image_formats.h
+    gpu/image_formats.cpp
     gpu/console_layout.h
     gpu/console_layout.cpp
     hle/xg/xg_xs.cpp
@@ -166,6 +196,20 @@ sludge_shader(sludgemu gpu/shaders/present.hlsl vs_main vs_6_0 present_vs)
 sludge_shader(sludgemu gpu/shaders/present.hlsl ps_main ps_6_0 present_ps)
 sludge_shader(sludgemu gpu/shaders/untile.hlsl cs_main cs_6_0 untile_cs)
 target_include_directories(sludgemu PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# The shader cache generation: a hash of every source that can change what a translated program comes
+# out as (or how the cache stores it). Derived from the sources rather than bumped by hand, so that no
+# edit can leave stale translations in use: an unneeded rebuild of the cache is the worst case.
+set(SLUDGE_TRANSLATOR_SOURCES ${SLUDGE_SHADER_SOURCES}
+    gpu/shader_programs.h gpu/shader_programs.cpp gpu/shader_cache.h gpu/shader_cache.cpp)
+list(TRANSFORM SLUDGE_TRANSLATOR_SOURCES PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
+set(translator_hash ${CMAKE_CURRENT_BINARY_DIR}/generated/shader_translator_hash.h)
+add_custom_command(OUTPUT ${translator_hash}
+    COMMAND ${CMAKE_COMMAND} -DNAME=SHADER_TRANSLATOR_HASH -DOUT=${translator_hash}
+        "-DSOURCES=${SLUDGE_TRANSLATOR_SOURCES}" -P ${PROJECT_SOURCE_DIR}/cmake/source_hash.cmake
+    DEPENDS ${SLUDGE_TRANSLATOR_SOURCES} ${PROJECT_SOURCE_DIR}/cmake/source_hash.cmake
+    COMMENT "Hashing the shader translator sources")
+target_sources(sludgemu PRIVATE ${translator_hash})
 target_link_libraries(sludgemu PRIVATE sludge_shader agility sludge_options shell32 user32 synchronization delayimp
     dstorage libdeflate::libdeflate_static opus addrlib d3d12 dxgi dxc)
 
@@ -179,7 +223,8 @@ add_custom_command(TARGET sludgemu POST_BUILD
 
 # sludgemu.exe's implicit TLS slot (index 0) belongs to the title exe (see loader/tls_reserve.h),
 # so nothing else may use implicit TLS: no thread_local in our code, and no thread-safe static
-# initialization (the CRT implements it with a thread_local epoch counter).
+# initialization (the CRT implements it with a thread_local epoch counter). /Zc:threadSafeInit- is
+# clang-cl's spelling of -fno-threadsafe-statics.
 target_compile_options(sludgemu PRIVATE /Zc:threadSafeInit-)
 
 # Keep our own image far away from where titles want to live (0x140000000 and up), so the title

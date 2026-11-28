@@ -101,7 +101,7 @@ static bool create_heap_locked(u32 slot) {
     if (!mem_commit_available(GPU_TILE_HEAP_TILES * GPU_TILE_SIZE)) {
         static volatile long logged = 0;
         if (log_once_flag(&logged))
-            LOG_E("gpu", "the system is nearly out of commit; textures go without memory for some tiles");
+            LOG_E("gpu", "the system is out of commit; textures go without memory for some tiles");
         return false;
     }
     D3D12_HEAP_DESC desc = {};

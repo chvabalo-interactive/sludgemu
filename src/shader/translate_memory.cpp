@@ -20,38 +20,211 @@ static const char* soffset(Translator& t, const RdnaInst& in, u32 i) {
 static const char* const k_load_fn[5] = {"", "Load", "Load2", "Load3", "Load4"};
 static const char* const k_store_fn[5] = {"", "Store", "Store2", "Store3", "Store4"};
 
-// The kind of descriptor at a known place in a table, from the table's ranges.
-static bool range_kind(const Translator& t, u32 parameter, u32 descriptor, TableRangeKind* kind) {
-    if (parameter >= t.info->parameter_count)
-        return false;
-    const UserDataParameter& p = t.info->parameters[parameter];
-    if (p.kind != USER_DATA_RESOURCE_TABLE)
-        return false;
-    u32 kinds = 0;
-    for (u32 i = 0; i < p.range_count; i++) {
-        const TableRange& r = p.ranges[i];
-        kinds |= 1u << r.kind;
-        if (descriptor != NO_DESCRIPTOR && descriptor >= r.offset &&
-            (r.count == ~0u || descriptor < r.offset + r.count)) {
-            *kind = r.kind;
-            return true;
-        }
+// Where the descriptor in registers [reg, reg + dwords) comes from. Translated code keeps only the heap
+// address of a descriptor loaded from the heap (in its first register), so a descriptor works as one
+// only if every dword was loaded from the same slot and left alone, except the dwords in `may_change`
+// (by bit), which the access at hand reads as values or not at all.
+enum DescriptorOrigin {
+    ORIGIN_HEAP,            // loaded from one slot of the heap `heap`, unchanged
+    ORIGIN_CONSTANT,        // every dword known at translation time
+    ORIGIN_PARTLY_CONSTANT, // some dwords known, others not
+    ORIGIN_MODIFIED,        // loaded from the heap, then changed
+    ORIGIN_MIXED,           // loaded from the heap on some paths only
+    ORIGIN_OTHER_HEAP,      // loaded from the other heap
+    ORIGIN_ASSEMBLED,       // dwords from different slots or tables
+    ORIGIN_UNKNOWN,         // nothing the translator can place
+};
+
+static DescriptorOrigin descriptor_origin(const Translator& t, u32 reg, u32 dwords, u32 heap,
+                                          u32 may_change = 0) {
+    u32 constants = 0, loaded = 0, value;
+    for (u32 i = 0; i < dwords; i++) {
+        constants += sgpr_constant(t.tags, reg + i, &value) ? 1 : 0;
+        loaded += heap_loaded(sgpr_tag(t, reg + i)) ? 1 : 0;
     }
-    // Unknown place: decided if the whole table holds one kind.
-    for (u32 k = 0; k < 3; k++)
-        if (kinds == (1u << k)) {
-            *kind = (TableRangeKind)k;
-            return true;
-        }
-    return false;
+    if (constants == dwords)
+        return ORIGIN_CONSTANT;
+    Tag first = sgpr_tag(t, reg);
+    if (!heap_loaded(first)) {
+        // A value in place of the first dword, next to loaded ones: the base address was changed.
+        return constants ? ORIGIN_PARTLY_CONSTANT : loaded ? ORIGIN_MODIFIED : ORIGIN_UNKNOWN;
+    }
+    if ((tag_payload(first) & 1) != heap)
+        return ORIGIN_OTHER_HEAP;
+    u16 slot = t.tags.descriptor[reg & 127];
+    DescriptorOrigin origin = ORIGIN_HEAP;
+    for (u32 i = 0; i < dwords; i++) {
+        if ((may_change >> i) & 1)
+            continue; // whatever it holds
+        Tag tag = sgpr_tag(t, reg + i);
+        u16 d = t.tags.descriptor[(reg + i) & 127];
+        if (sgpr_constant(t.tags, reg + i, &value))
+            return ORIGIN_PARTLY_CONSTANT;
+        // Arithmetic on a loaded dword gives a plain value (see carried).
+        if (!heap_loaded(tag))
+            return ORIGIN_MODIFIED;
+        // The same table; the same slot where known.
+        if ((tag & ~HEAP_MODIFIED) != (first & ~HEAP_MODIFIED) ||
+            (slot != NO_DESCRIPTOR && d != NO_DESCRIPTOR && d != slot))
+            return ORIGIN_ASSEMBLED;
+        if (tag_payload(tag) & HEAP_MODIFIED)
+            origin = ORIGIN_MIXED;
+    }
+    return origin;
 }
 
-// The descriptor kind for a heap register, or `fallback` when the root signature does not tell.
-static TableRangeKind heap_kind(const Translator& t, u32 reg, TableRangeKind fallback) {
-    Tag tag = sgpr_tag(t, reg);
-    TableRangeKind kind = fallback;
-    range_kind(t, tag_payload(tag) >> 1, t.tags.descriptor[reg & 127], &kind);
-    return kind;
+// Buffer descriptor dwords that may hold anything for an access through a desktop view of the slot's
+// buffer. Compilers rewrite structured buffer descriptors into raw ones (record count times stride,
+// stride cleared, raw bounds checking), which is what desktop views are anyway. Not the base address
+// (dword 0), which names the slot. The record count (dword 2) bounds the console's accesses only,
+// desktop bounds are the view's size. Untyped accesses read the stride (dword 1, with the base's high
+// bits) as a value where an index needs it, and make no use of the format and swizzle (dword 3); typed
+// accesses go through the desktop view's format, and indexed ones through its elements, which the
+// descriptor must then still describe.
+static u32 buffer_fields_unused(bool typed, bool indexed) {
+    return 1u << 2 | (typed && indexed ? 0u : 1u << 1) | (typed ? 0u : 1u << 3);
+}
+
+static const char* origin_text(DescriptorOrigin origin) {
+    switch (origin) {
+    case ORIGIN_HEAP:
+        return "from the heap";
+    case ORIGIN_CONSTANT:
+        return "made of constants";
+    case ORIGIN_PARTLY_CONSTANT:
+        return "partly made of constants";
+    case ORIGIN_MODIFIED:
+        return "changed after loading";
+    case ORIGIN_MIXED:
+        return "loaded on some paths only";
+    case ORIGIN_OTHER_HEAP:
+        return "from the other heap";
+    case ORIGIN_ASSEMBLED:
+        return "put together from different places";
+    default:
+        return "of unknown origin";
+    }
+}
+
+// --- view kinds --------------------------------------------------------------------------------------
+
+// How an access views a descriptor from the heap on desktop: read-only (shader resource views and
+// constant buffers), read-write (unordered access views), or by the kind the shadow records for the
+// slot, which translated code branches on (uniformly: descriptors are in scalar registers).
+enum ViewAccess {
+    VIEW_READ_ONLY,
+    VIEW_READ_WRITE,
+    VIEW_BY_SHADOW,
+};
+
+// What the program does through the descriptor at `index` of the heap tag's table (SLOT_* flags).
+static u8 slot_use(const Translator& t, Tag tag, u16 index) {
+    if (index == NO_DESCRIPTOR || !heap_loaded(tag) || (tag_payload(tag) & 1) != HEAP_RESOURCES)
+        return 0;
+    for (u32 i = 0; i < t.slot_use_count; i++)
+        if (t.slot_uses[i].parameter == heap_parameter(tag) && t.slot_uses[i].index == index)
+            return t.slot_uses[i].flags;
+    return 0;
+}
+
+// What the program does through the descriptor in `reg` elsewhere, if it is at a known place.
+static u8 slot_flags(const Translator& t, const TagState& s, u32 reg) {
+    return slot_use(t, s.sgpr[reg & 127], s.descriptor[reg & 127]);
+}
+
+// The view for an access through the descriptor in `reg` that writes, samples or only reads: writing
+// takes an unordered access view and sampling a shader resource view (which a program doing both
+// through one slot can't have on desktop); reads follow what the program does through the slot
+// elsewhere, or else what the slot holds.
+static bool view_access(Translator& t, const RdnaInst& in, u32 reg, bool writes, bool samples,
+                        ViewAccess* out) {
+    u8 flags = slot_flags(t, t.tags, reg);
+    if ((writes || (flags & SLOT_WRITTEN)) && (samples || (flags & SLOT_SAMPLED))) {
+        translator_fail(t, "%s at 0x%x through a descriptor the program both writes and samples through",
+                        rdna_op_name(in.op), in.offset);
+        return false;
+    }
+    if (writes || (flags & SLOT_WRITTEN))
+        *out = VIEW_READ_WRITE;
+    else if (samples || (flags & SLOT_SAMPLED))
+        *out = VIEW_READ_ONLY;
+    else
+        *out = VIEW_BY_SHADOW;
+    return true;
+}
+
+// The kind the shadow records for the slot of the loaded descriptor in `reg`: a uniform value.
+static const char* shadow_kind(Translator& t, u32 reg) {
+    t.needs_descriptor_info = true;
+    return fmt(t, "g_descriptor_info.Load(shadow_at(%s & ~%uu) + %uu)", sgpr(t, reg),
+               SHADER_SHADOW_DESCRIPTOR_BYTES - 1, SHADER_SHADOW_KIND_OFFSET);
+}
+
+// Emitting an access for each view it may take: once for a known one; for VIEW_BY_SHADOW a branch on
+// the slot's kind, read-write first. Usage: for (ViewPass v = view_begin(...); view_next(t, v);) {...}
+struct ViewPass {
+    ViewAccess access;
+    u32 reg;
+    u32 pass;
+    bool read_write; // the view of the current pass
+};
+
+static ViewPass view_begin(ViewAccess access, u32 reg) {
+    return {access, reg, 0, false};
+}
+
+static bool view_next(Translator& t, ViewPass& v) {
+    u32 passes = v.access == VIEW_BY_SHADOW ? 2 : 1;
+    if (v.access == VIEW_BY_SHADOW && v.pass > 0)
+        t.depth--;
+    if (v.pass == passes) {
+        if (v.access == VIEW_BY_SHADOW)
+            emit(t, "}");
+        return false;
+    }
+    if (v.access == VIEW_BY_SHADOW) {
+        if (v.pass == 0)
+            emit(t, "if (%s == %uu) {", shadow_kind(t, v.reg), SHADOW_VIEW_UAV);
+        else
+            emit(t, "} else {");
+        t.depth++;
+    }
+    v.read_write = v.access == VIEW_READ_WRITE || (v.access == VIEW_BY_SHADOW && v.pass == 0);
+    v.pass++;
+    return !t.failed;
+}
+
+// What an instruction does through its resource descriptor (SLOT_* flags), for find_slot_uses.
+static u8 access_flags(const RdnaInst& in);
+
+void find_slot_uses(Translator& t) {
+    t.slot_use_count = 0;
+    const Program& p = t.program;
+    for (u32 b = 0; b < p.block_count; b++) {
+        if (!t.block_reached[b])
+            continue;
+        TagState s = t.block_entry[b];
+        for (u32 i = p.blocks[b].first; i < p.blocks[b].end; i++) {
+            const RdnaInst& in = p.insts[i];
+            u8 flags = access_flags(in);
+            u32 reg = in.src[1].reg & 127;
+            Tag tag = s.sgpr[reg];
+            u16 index = s.descriptor[reg];
+            if (flags && heap_loaded(tag) && (tag_payload(tag) & 1) == HEAP_RESOURCES &&
+                index != NO_DESCRIPTOR) {
+                u32 k = 0;
+                while (k < t.slot_use_count &&
+                       !(t.slot_uses[k].parameter == heap_parameter(tag) && t.slot_uses[k].index == index))
+                    k++;
+                if (k == t.slot_use_count && k < SHADER_MAX_SLOT_USES)
+                    t.slot_uses[t.slot_use_count++] = {(u8)heap_parameter(tag), 0, index};
+                // Beyond the table's capacity a slot's other accesses decide alone.
+                if (k < t.slot_use_count)
+                    t.slot_uses[k].flags |= flags;
+            }
+            tags_transfer(t, s, in, i);
+        }
+    }
 }
 
 // Constant data in the code (a buffer descriptor based on s_getpc_b64 plus an offset) becomes a static
@@ -114,11 +287,16 @@ static bool emit_scalar_memory(Translator& t, const RdnaInst& in) {
     bool buffer = in.op >= OP_S_BUFFER_LOAD_DWORD && in.op <= OP_S_BUFFER_LOAD_DWORDX16;
     Tag lo = sgpr_tag(t, base), hi = sgpr_tag(t, base + 1);
 
+    if (!buffer && heap_loaded(lo)) {
+        // Through the address in a descriptor (a buffer's base, say): the memory there isn't placed.
+        translator_fail(t, "%s at 0x%x through a descriptor's address", rdna_op_name(in.op), in.offset);
+        return false;
+    }
     if (!buffer && tag_kind(lo) == TAG_HEAP) {
         // How far into its table the program reads: console tables are plain memory, and programs may
         // read past the ranges their root signature declares.
-        u32 parameter = tag_payload(lo) >> 1;
-        if (parameter < SHADER_MAX_ROOT_PARAMETERS) {
+        u32 parameter = heap_parameter(lo);
+        if (parameter != HEAP_NO_TABLE && parameter < SHADER_MAX_ROOT_PARAMETERS) {
             u32 slot = (tag_payload(lo) & 1) == HEAP_SAMPLERS ? 16 : 32;
             u32 at = t.tags.descriptor[base & 127];
             bool constant = in.src[1].kind == OPND_SPECIAL && in.src[1].reg == SRC_NULL;
@@ -162,14 +340,25 @@ static bool emit_scalar_memory(Translator& t, const RdnaInst& in) {
         return true;
     }
     if (buffer && tag_kind(lo) == TAG_HEAP && (tag_payload(lo) & 1) == HEAP_RESOURCES) {
-        TableRangeKind kind = heap_kind(t, base, RANGE_CBV);
+        DescriptorOrigin origin =
+            descriptor_origin(t, base, 4, HEAP_RESOURCES, buffer_fields_unused(false, false));
+        if (origin != ORIGIN_HEAP) {
+            translator_fail(t, "%s at 0x%x through a buffer descriptor %s", rdna_op_name(in.op), in.offset,
+                            origin_text(origin));
+            return false;
+        }
+        ViewAccess access;
+        if (!view_access(t, in, base, false, false, &access))
+            return false;
         emit(t, "{ uint a_ = %s;", fmt(t, "(0x%xu + %s)", (u32)in.mem.offset, soffset(t, in, 1)));
         t.depth++;
         // Constant buffers too are raw buffer views on desktop.
-        emit(t, "%s b_ = ResourceDescriptorHeap[%s >> 5];",
-             kind == RANGE_UAV ? "RWByteAddressBuffer" : "ByteAddressBuffer", sgpr(t, base));
-        for (u32 i = 0; i < dwords; i++)
-            write_sgpr(t, in.dst[0], i, fmt(t, "b_.Load(a_ + %uu)", 4 * i));
+        for (ViewPass v = view_begin(access, base); view_next(t, v);) {
+            emit(t, "%s b_ = ResourceDescriptorHeap[%s >> 5];",
+                 v.read_write ? "RWByteAddressBuffer" : "ByteAddressBuffer", sgpr(t, base));
+            for (u32 i = 0; i < dwords; i++)
+                write_sgpr(t, in.dst[0], i, fmt(t, "b_.Load(a_ + %uu)", 4 * i));
+        }
         t.depth--;
         emit(t, "}");
         return true;
@@ -186,8 +375,10 @@ static bool emit_scalar_memory(Translator& t, const RdnaInst& in) {
             return true;
         }
     }
-    translator_fail(t, "%s at 0x%x from an address the translator cannot place", rdna_op_name(in.op),
-                    in.offset);
+    char why[96];
+    describe_tag_loss(t, false, base, why, sizeof(why));
+    translator_fail(t, "%s at 0x%x from an address the translator cannot place%s", rdna_op_name(in.op),
+                    in.offset, why);
     return false;
 }
 
@@ -219,6 +410,10 @@ static bool is_format_access(RdnaOp op) {
 
 static bool is_buffer_atomic(RdnaOp op) {
     return op >= OP_BUFFER_ATOMIC_SWAP && op <= OP_BUFFER_ATOMIC_DEC;
+}
+
+static bool is_image_atomic(RdnaOp op) {
+    return op >= OP_IMAGE_ATOMIC_SWAP && op <= OP_IMAGE_ATOMIC_DEC;
 }
 
 enum MtbufNum : u8 {
@@ -294,21 +489,21 @@ static bool emit_buffer_atomic(Translator& t, const RdnaInst& in, const char* bu
     if (in.op == OP_BUFFER_ATOMIC_CMPSWAP) {
         const char* d1 = vgpr(t, in.dst[0].reg + 1);
         if (rtn)
-            emit(t, "uint o_ = 0u; if (EXEC) %s.InterlockedCompareExchange(%s, %s, %s, o_);", buf, addr, d1,
-                 d0);
+            emit(t, "uint o_ = 0u; if (%s) %s.InterlockedCompareExchange(%s, %s, %s, o_);", exec_cond(t), buf,
+                 addr, d1, d0);
         else
-            emit(t, "if (EXEC) %s.InterlockedCompareStore(%s, %s, %s);", buf, addr, d1, d0);
+            emit(t, "if (%s) %s.InterlockedCompareStore(%s, %s, %s);", exec_cond(t), buf, addr, d1, d0);
     } else if (in.op == OP_BUFFER_ATOMIC_INC || in.op == OP_BUFFER_ATOMIC_DEC) {
         const char* next = in.op == OP_BUFFER_ATOMIC_INC
                                ? fmt(t, "(cur_ >= %s ? 0u : cur_ + 1u)", d0)
                                : fmt(t, "((cur_ == 0u || cur_ > %s) ? %s : cur_ - 1u)", d0, d0);
         emit(t,
-             "uint o_ = 0u; if (EXEC) { uint cur_ = %s.Load(%s), prev_ = 0u; [allow_uav_condition] do { "
+             "uint o_ = 0u; if (%s) { uint cur_ = %s.Load(%s), prev_ = 0u; [allow_uav_condition] do { "
              "uint nxt_ = %s; %s.InterlockedCompareExchange(%s, cur_, nxt_, prev_); if (prev_ == cur_) { o_ "
              "= cur_; break; } cur_ = prev_; } while (true); }",
-             buf, addr, next, buf, addr);
+             exec_cond(t), buf, addr, next, buf, addr);
     } else if (in.op == OP_BUFFER_ATOMIC_SWAP) {
-        emit(t, "uint o_ = 0u; if (EXEC) %s.InterlockedExchange(%s, %s, o_);", buf, addr, d0);
+        emit(t, "uint o_ = 0u; if (%s) %s.InterlockedExchange(%s, %s, o_);", exec_cond(t), buf, addr, d0);
     } else {
         const char* fn = nullptr;
         const char* val = d0;
@@ -348,10 +543,10 @@ static bool emit_buffer_atomic(Translator& t, const RdnaInst& in, const char* bu
             return false;
         }
         if (rtn)
-            emit(t, "%s o_ = %s; if (EXEC) %s.%s(%s, %s, o_);", is_signed ? "int" : "uint",
-                 is_signed ? "0" : "0u", buf, fn, addr, val);
+            emit(t, "%s o_ = %s; if (%s) %s.%s(%s, %s, o_);", is_signed ? "int" : "uint",
+                 is_signed ? "0" : "0u", exec_cond(t), buf, fn, addr, val);
         else
-            emit(t, "if (EXEC) %s.%s(%s, %s);", buf, fn, addr, val);
+            emit(t, "if (%s) %s.%s(%s, %s);", exec_cond(t), buf, fn, addr, val);
     }
     if (rtn)
         write_vgpr(t, in, in.dst[0].reg, is_signed ? "(uint)o_" : "o_");
@@ -441,7 +636,7 @@ static bool emit_mtbuf_access(Translator& t, const RdnaInst& in, const char* buf
             emit(t, "%s |= (%s << %uu);", dst_w, enc, sh);
             bit_at += w;
         }
-        emit(t, "if (EXEC) %s.%s(%s, w_);", buf, k_store_fn[dwords], addr);
+        emit(t, "if (%s) %s.%s(%s, w_);", exec_cond(t), buf, k_store_fn[dwords], addr);
         return true;
     }
     emit(t, "uint%s w_ = %s.%s(%s);", dwords == 1 ? "" : fmt(t, "%u", dwords), buf, k_load_fn[dwords], addr);
@@ -742,6 +937,71 @@ bool emit_fetch_subroutine(Translator& t, const RdnaInst& in) {
     return true;
 }
 
+// One access through the desktop view of a heap buffer descriptor (read-write or read-only) as `b_`:
+// formatted through a typed view (`comps` components at index `element`), or raw at the byte address
+// `address` computes into a_.
+static bool emit_heap_buffer_access(Translator& t, const RdnaInst& in, bool read_write,
+                                    const char* heap_index, const char* element, const char* address,
+                                    u32 dwords, u32 comps) {
+    bool store = is_store(in.op);
+    bool d16 = is_d16_format(in.op);
+    if (comps) {
+        emit(t, "%s<float4> b_ = ResourceDescriptorHeap[%s];", read_write ? "RWBuffer" : "Buffer",
+             heap_index);
+        if (store) {
+            const char* c[4];
+            for (u32 i = 0; i < 4; i++) {
+                if (i < comps) {
+                    if (d16) {
+                        const char* r = vgpr(t, in.dst[0].reg + i / 2);
+                        c[i] = (i & 1) ? fmt(t, "f16tof32(%s >> 16)", r) : fmt(t, "f16tof32(%s)", r);
+                    } else {
+                        c[i] = fmt(t, "asfloat(%s)", vgpr(t, in.dst[0].reg + i));
+                    }
+                } else {
+                    c[i] = "0.0f";
+                }
+            }
+            emit(t, "if (%s) b_[%s] = float4(%s, %s, %s, %s);", exec_cond(t), element, c[0], c[1], c[2],
+                 c[3]);
+            return true;
+        }
+        emit(t, "float4 r_ = b_[%s];", element);
+        static const char k_comp[4] = {'x', 'y', 'z', 'w'};
+        if (d16) {
+            for (u32 i = 0; i < comps; i += 2) {
+                const char* packed = (i + 1 < comps) ? fmt(t, "(f32tof16(r_.%c) | (f32tof16(r_.%c) << 16))",
+                                                           k_comp[i], k_comp[i + 1])
+                                                     : fmt(t, "f32tof16(r_.%c)", k_comp[i]);
+                write_vgpr(t, in, in.dst[0].reg + i / 2, packed);
+            }
+        } else {
+            for (u32 i = 0; i < comps; i++)
+                write_vgpr(t, in, in.dst[0].reg + i, fmt(t, "asuint(r_.%c)", k_comp[i]));
+        }
+        return true;
+    }
+    emit(t, "%s b_ = ResourceDescriptorHeap[%s];", read_write ? "RWByteAddressBuffer" : "ByteAddressBuffer",
+         heap_index);
+    emit(t, "%s", address);
+    if (is_buffer_atomic(in.op))
+        return emit_buffer_atomic(t, in, "b_", "a_");
+    if (in.enc == ENC_MTBUF)
+        return emit_mtbuf_access(t, in, "b_", "a_", store);
+    if (store) {
+        char list[96] = {};
+        usize n = 0;
+        for (u32 i = 0; i < dwords; i++)
+            n += (usize)snprintf(list + n, sizeof(list) - n, "%s%s", i ? ", " : "",
+                                 vgpr(t, in.dst[0].reg + i));
+        emit(t, "if (%s) b_.%s(a_, %s%s%s);", exec_cond(t), k_store_fn[dwords],
+             dwords > 1 ? fmt(t, "uint%u(", dwords) : "", list, dwords > 1 ? ")" : "");
+        return true;
+    }
+    write_loaded(t, in, dwords, fmt(t, "b_.%s(a_)", k_load_fn[dwords]));
+    return true;
+}
+
 static bool emit_buffer(Translator& t, const RdnaInst& in) {
     if (in.op == OP_BUFFER_GL0_INV || in.op == OP_BUFFER_GL1_INV)
         return true;
@@ -769,14 +1029,15 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
                                                                  : 1);
     bool sub_dword = (in.op >= OP_BUFFER_LOAD_UBYTE && in.op <= OP_BUFFER_LOAD_SSHORT) ||
                      (in.op >= OP_BUFFER_STORE_BYTE && in.op <= OP_BUFFER_STORE_SHORT_D16_HI) ||
-                     in.op >= OP_BUFFER_LOAD_UBYTE_D16 && in.op <= OP_BUFFER_LOAD_SHORT_D16_HI;
+                     (in.op >= OP_BUFFER_LOAD_UBYTE_D16 && in.op <= OP_BUFFER_LOAD_SHORT_D16_HI);
     if (sub_dword || (in.op >= OP_BUFFER_ATOMIC_FCMPSWAP && in.op <= OP_BUFFER_ATOMIC_FMAX)) {
         translator_fail(t, "unsupported %s", rdna_op_name(in.op));
         return false;
     }
     u32 vaddr = in.src[0].reg;
-    const char* index = in.mem.idxen ? vgpr(t, vaddr) : "0u";
-    const char* voffset = in.mem.offen ? vgpr(t, vaddr + (in.mem.idxen ? 1 : 0)) : "0u";
+    u32 voffset_reg = vaddr + (in.mem.idxen ? 1 : 0);
+    const char* index = in.mem.idxen ? vgpr_data(t, vaddr) : "0u";
+    const char* voffset = in.mem.offen ? vgpr_data(t, voffset_reg) : "0u";
     const char* offset = fmt(t, "(%s + 0x%xu + %s)", voffset, (u32)in.mem.offset, soffset(t, in, 2));
 
     if (tag_kind(hi) == TAG_ROOT_HI) {
@@ -814,13 +1075,11 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
                 char list[96] = {};
                 usize n = 0;
                 for (u32 i = 0; i < dwords; i++)
-                    n += (usize)snprintf(list + n, sizeof(list) - n, "%sv%u", i ? ", " : "",
-                                         in.dst[0].reg + i);
-                for (u32 i = 0; i < dwords; i++)
-                    use_vgpr(t, in.dst[0].reg + i);
+                    n += (usize)snprintf(list + n, sizeof(list) - n, "%s%s", i ? ", " : "",
+                                         vgpr(t, in.dst[0].reg + i));
                 data = fmt(t, "uint%u(%s)", dwords, list);
             }
-            emit(t, "if (EXEC) g_root%u.%s(a_, %s);", parameter, k_store_fn[dwords], data);
+            emit(t, "if (%s) g_root%u.%s(a_, %s);", exec_cond(t), parameter, k_store_fn[dwords], data);
         } else {
             write_loaded(t, in, dwords, fmt(t, "g_root%u.%s(a_)", parameter, k_load_fn[dwords]));
         }
@@ -829,11 +1088,23 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
         return true;
     }
     if (tag_kind(lo) == TAG_HEAP && (tag_payload(lo) & 1) == HEAP_RESOURCES) {
-        TableRangeKind kind = heap_kind(t, rsrc, (store || atomic) ? RANGE_UAV : RANGE_SRV);
-        const char* heap_index = fmt(t, "(%s >> 5)", sgpr(t, rsrc));
-        emit(t, "{");
-        t.depth++;
-        if (format && in.enc != ENC_MTBUF) {
+        bool typed = format && in.enc != ENC_MTBUF; // through a typed desktop view
+        DescriptorOrigin origin =
+            descriptor_origin(t, rsrc, 4, HEAP_RESOURCES, buffer_fields_unused(typed, in.mem.idxen));
+        if (origin != ORIGIN_HEAP) {
+            translator_fail(t, "%s at 0x%x through a buffer descriptor %s", rdna_op_name(in.op), in.offset,
+                            origin_text(origin));
+            return false;
+        }
+        ViewAccess access;
+        if (!view_access(t, in, rsrc, store || atomic, false, &access))
+            return false;
+        // Kept out of the scratch ring: a branch on the view kind emits the access twice.
+        char heap_index[64], element[160], address[320] = {};
+        snprintf(heap_index, sizeof(heap_index), "(%s >> 5)", sgpr(t, rsrc));
+        snprintf(element, sizeof(element), "%s", index);
+        u32 comps = 0;
+        if (typed) {
             const RdnaOperand& so = in.src[2];
             bool no_soffset = (so.kind == OPND_SPECIAL && so.reg == SRC_NULL) ||
                               (so.kind == OPND_INLINE && so.reg == SRC_ZERO);
@@ -841,7 +1112,7 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
                 translator_fail(t, "%s with an offset or format at 0x%x", rdna_op_name(in.op), in.offset);
                 return false;
             }
-            u32 comps =
+            comps =
                 store
                     ? dwords
                     : (u32)(d16 ? in.op - OP_BUFFER_LOAD_FORMAT_D16_X : in.op - OP_BUFFER_LOAD_FORMAT_X) + 1;
@@ -849,75 +1120,22 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
                 translator_fail(t, "%s at 0x%x: bad component count", rdna_op_name(in.op), in.offset);
                 return false;
             }
-            emit(t, "%s<float4> b_ = ResourceDescriptorHeap[%s];",
-                 kind == RANGE_UAV || store ? "RWBuffer" : "Buffer", heap_index);
-            if (store) {
-                const char* c[4];
-                for (u32 i = 0; i < 4; i++) {
-                    if (i < comps) {
-                        if (d16) {
-                            const char* r = vgpr(t, in.dst[0].reg + i / 2);
-                            c[i] = (i & 1) ? fmt(t, "f16tof32(%s >> 16)", r) : fmt(t, "f16tof32(%s)", r);
-                        } else {
-                            c[i] = fmt(t, "asfloat(%s)", vgpr(t, in.dst[0].reg + i));
-                        }
-                    } else {
-                        c[i] = "0.0f";
-                    }
-                }
-                emit(t, "if (EXEC) b_[%s] = float4(%s, %s, %s, %s);", index, c[0], c[1], c[2], c[3]);
-            } else {
-                emit(t, "float4 r_ = b_[%s];", index);
-                static const char k_comp[4] = {'x', 'y', 'z', 'w'};
-                if (d16) {
-                    for (u32 i = 0; i < comps; i += 2) {
-                        const char* packed = (i + 1 < comps)
-                                                 ? fmt(t, "(f32tof16(r_.%c) | (f32tof16(r_.%c) << 16))",
-                                                       k_comp[i], k_comp[i + 1])
-                                                 : fmt(t, "f32tof16(r_.%c)", k_comp[i]);
-                        write_vgpr(t, in, in.dst[0].reg + i / 2, packed);
-                    }
-                } else {
-                    for (u32 i = 0; i < comps; i++)
-                        write_vgpr(t, in, in.dst[0].reg + i, fmt(t, "asuint(r_.%c)", k_comp[i]));
-                }
-            }
-        } else {
-            if (kind == RANGE_CBV && (store || atomic)) {
-                translator_fail(t, "store or atomic to a constant buffer at 0x%x", in.offset);
-                return false;
-            }
-            const char* stride = "0u";
-            if (in.mem.idxen) {
-                t.needs_descriptor_info = true;
-                stride = fmt(t, "g_descriptor_info.Load(%s * 16u)", heap_index);
-            }
-            // Stores and atomics go through UAVs whatever the root signature says (dynamically indexed
-            // tables).
-            emit(t, "%s b_ = ResourceDescriptorHeap[%s];",
-                 kind == RANGE_UAV || store || atomic ? "RWByteAddressBuffer" : "ByteAddressBuffer",
-                 heap_index);
-            emit(t, "uint a_ = %s * %s + %s;", index, stride, offset);
-            if (atomic) {
-                if (!emit_buffer_atomic(t, in, "b_", "a_"))
-                    return false;
-            } else if (in.enc == ENC_MTBUF) {
-                if (!emit_mtbuf_access(t, in, "b_", "a_", store))
-                    return false;
-            } else if (store) {
-                char list[96] = {};
-                usize n = 0;
-                for (u32 i = 0; i < dwords; i++) {
-                    n += (usize)snprintf(list + n, sizeof(list) - n, "%sv%u", i ? ", " : "",
-                                         in.dst[0].reg + i);
-                    use_vgpr(t, in.dst[0].reg + i);
-                }
-                emit(t, "if (EXEC) b_.%s(a_, %s%s%s);", k_store_fn[dwords],
-                     dwords > 1 ? fmt(t, "uint%u(", dwords) : "", list, dwords > 1 ? ")" : "");
-            } else {
-                write_loaded(t, in, dwords, fmt(t, "b_.%s(a_)", k_load_fn[dwords]));
-            }
         }
+        if (!typed) {
+            // Indexed: the console's stride, from the descriptor's second dword as the program has it
+            // (the shadow's copy of the slot's while it is unchanged).
+            const char* stride = "0u";
+            if (in.mem.idxen)
+                stride = fmt(t, "((%s >> 16) & 0x3fffu)", sgpr_data(t, rsrc + 1));
+            if (snprintf(address, sizeof(address), "uint a_ = %s * %s + %s;", index, stride, offset) >=
+                (int)sizeof(address))
+                translator_fail(t, "expression too long");
+        }
+        emit(t, "{");
+        t.depth++;
+        for (ViewPass v = view_begin(access, rsrc); view_next(t, v);)
+            if (!emit_heap_buffer_access(t, in, v.read_write, heap_index, element, address, dwords, comps))
+                return false;
         t.depth--;
         emit(t, "}");
         return true;
@@ -936,61 +1154,88 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
             return true;
         }
     }
-    translator_fail(t, "%s at 0x%x through a descriptor the translator cannot place", rdna_op_name(in.op),
-                    in.offset);
+    DescriptorOrigin origin = descriptor_origin(t, rsrc, 4, HEAP_RESOURCES);
+    if (origin == ORIGIN_MODIFIED || origin == ORIGIN_MIXED)
+        translator_fail(t, "%s at 0x%x through a buffer descriptor %s", rdna_op_name(in.op), in.offset,
+                        origin_text(origin));
+    else {
+        char why[96];
+        describe_tag_loss(t, false, rsrc, why, sizeof(why));
+        translator_fail(t, "%s at 0x%x through a descriptor the translator cannot place%s",
+                        rdna_op_name(in.op), in.offset, why);
+    }
     return false;
 }
 
 // --- images ------------------------------------------------------------------------------------------
 
-// Samplers built from constants: the descriptor's fields in D3D12 terms. False (with the reason) for
-// what a desktop static sampler can't express.
-static bool decode_sampler(const u32 w[4], InlineSampler* out, const char** why) {
+// Samplers built from constants: the descriptor's fields in D3D12 terms, for a sampling instruction
+// that compares (an _c one) or not: the descriptor's comparison function applies only to those. False
+// (with the reason) for what a desktop static sampler can't express.
+static bool decode_sampler(const u32 w[4], bool compare, InlineSampler* out, const char** why) {
     static const u8 k_address[8] = {1, 2, 3, 5, 4, 5, 4, 5}; // wrap, mirror, clamp, mirror once, border
     memset(out, 0, sizeof(*out));
     for (u32 a = 0; a < 3; a++)
         out->address[a] = k_address[(w[0] >> (3 * a)) & 7];
     u32 aniso_ratio = (w[0] >> 9) & 7;
-    u32 compare = (w[0] >> 12) & 7;
+    u32 compare_func = (w[0] >> 12) & 7;
     out->unnormalized = (w[0] >> 15) & 1;
-    u32 reduction = (w[0] >> 29) & 3;
+    u32 filter_mode = (w[0] >> 29) & 3; // blend, min, max
     out->min_lod = (f32)(w[1] & 0xFFF) / 256.0f;
     out->max_lod = (f32)((w[1] >> 12) & 0xFFF) / 256.0f;
     out->mip_bias = (f32)((s32)(w[2] << 18) >> 18) / 256.0f;
+    // Filters: point, bilinear, then anisotropic over point or bilinear; mip none, point, linear, and
+    // point with an anisotropic adjustment.
     u32 mag = (w[2] >> 20) & 3, min = (w[2] >> 22) & 3, mip = (w[2] >> 26) & 3;
     out->border_color = (u8)((w[3] >> 30) & 3);
     if (out->border_color == 3) {
         *why = "a border color from the border color table";
         return false;
     }
-    if (reduction == 3) {
+    if (filter_mode == 3) {
         *why = "an unknown reduction mode";
         return false;
     }
-    if (mag >= 2 || min >= 2)
-        out->filter = 0x55; // anisotropic
+    if (compare && filter_mode) {
+        *why = "a comparison with a min/max reduction";
+        return false;
+    }
+    // D3D12's reduction field takes one of standard, comparison, minimum, maximum.
+    u32 reduction = compare ? 1 : filter_mode == 1 ? 2 : filter_mode == 2 ? 3 : 0;
+    bool aniso = mag >= 2 || min >= 2;
+    if (aniso)
+        out->filter = mip == 2 ? 0x55 : 0x54; // anisotropic, with linear or point mips
     else
         out->filter = (min == 1 ? 0x10 : 0) | (mag == 1 ? 0x4 : 0) | (mip == 2 ? 0x1 : 0);
-    if (compare)
-        out->filter |= 0x80;
-    if (reduction)
-        out->filter |= reduction == 1 ? 0x100 : 0x180; // minimum, maximum
-    out->comparison = (u8)(compare + 1);
+    out->filter |= reduction << 7;
+    out->comparison = (u8)(compare ? compare_func + 1 : 1); // D3D12's functions are the console's + 1
     out->max_anisotropy = (u8)(1u << (aniso_ratio > 4 ? 4 : aniso_ratio));
     if (out->max_lod >= 15.99f)
         out->max_lod = 3.402823466e+38f; // saturated: no limit
+    if (mip == 0) {
+        // No mipmapping: always the view's first level, whatever the LOD.
+        out->min_lod = 0.0f;
+        out->max_lod = 0.0f;
+    }
+    if (out->unnormalized) {
+        // What desktop samplers with unnormalized coordinates allow.
+        bool clamped =
+            (out->address[0] == 3 || out->address[0] == 4) && (out->address[1] == 3 || out->address[1] == 4);
+        if (!clamped || aniso || min != mag || compare || out->max_lod != 0.0f || out->min_lod != 0.0f) {
+            *why = "unnormalized coordinates with wrapping, mips, anisotropy, comparison or unequal filters";
+            return false;
+        }
+        // With the level held at 0 the mip filter and the bias change nothing: point mips and no bias,
+        // the form the desktop rules for unnormalized samplers (Vulkan's) are written for.
+        out->filter &= ~1u;
+        out->mip_bias = 0.0f;
+    }
     return true;
 }
 
-// The program's inline sampler for a descriptor, added on first use; -1 (failed) if impossible.
-static s32 inline_sampler(Translator& t, const RdnaInst& in, const u32 words[4], bool compare) {
-    InlineSampler s;
-    const char* why = nullptr;
-    if (!decode_sampler(words, &s, &why)) {
-        translator_fail(t, "%s at 0x%x with a constant sampler using %s", rdna_op_name(in.op), in.offset,
-                        why);
-        return -1;
-    }
+// The program's inline sampler for a descriptor, added on first use; -1 (failed) if impossible. A
+// descriptor used both with and without comparison makes two samplers (their filters differ).
+static s32 add_inline_sampler(Translator& t, const InlineSampler& s, bool compare) {
     TranslatedShader& out = *t.out;
     u32 i = 0;
     while (i < out.sampler_count && memcmp(&out.samplers[i], &s, sizeof(s)) != 0)
@@ -1003,11 +1248,43 @@ static s32 inline_sampler(Translator& t, const RdnaInst& in, const u32 words[4],
         out.samplers[out.sampler_count++] = s;
         if (compare)
             t.sampler_compare |= 1u << i;
-    } else if (((t.sampler_compare >> i) & 1) != (compare ? 1u : 0u)) {
-        translator_fail(t, "constant sampler %u used with and without comparison", i);
-        return -1;
     }
     return (s32)i;
+}
+
+static s32 inline_sampler(Translator& t, const RdnaInst& in, const u32 words[4], bool compare) {
+    InlineSampler s;
+    const char* why = nullptr;
+    if (!decode_sampler(words, compare, &s, &why)) {
+        translator_fail(t, "%s at 0x%x with a constant sampler using %s", rdna_op_name(in.op), in.offset,
+                        why);
+        return -1;
+    }
+    return add_inline_sampler(t, s, compare);
+}
+
+// The sampler of a sampling instruction as `smp_`: a static sampler for a descriptor made of constants,
+// the heap's sampler for one loaded from a sampler table.
+static bool emit_sampler(Translator& t, const RdnaInst& in, bool compare) {
+    u32 samp = in.src[2].reg;
+    const char* type = compare ? "SamplerComparisonState" : "SamplerState";
+    DescriptorOrigin origin = descriptor_origin(t, samp, 4, HEAP_SAMPLERS);
+    if (origin == ORIGIN_CONSTANT) {
+        u32 words[4];
+        for (u32 i = 0; i < 4; i++)
+            sgpr_constant(t.tags, samp + i, &words[i]);
+        s32 index = inline_sampler(t, in, words, compare);
+        if (index < 0)
+            return false;
+        emit(t, "%s smp_ = g_sampler%d;", type, index);
+        return true;
+    }
+    if (origin == ORIGIN_HEAP) {
+        emit(t, "%s smp_ = SamplerDescriptorHeap[%s >> 4];", type, sgpr(t, samp));
+        return true;
+    }
+    translator_fail(t, "%s at 0x%x with a sampler %s", rdna_op_name(in.op), in.offset, origin_text(origin));
+    return false;
 }
 
 struct ImageForm {
@@ -1049,11 +1326,22 @@ static ImageForm image_form(RdnaOp op) {
     return f;
 }
 
-static const char* const k_texture_types[8] = {"Texture1D",   "Texture2D",       "Texture3D",
-                                               "TextureCube", "Texture1DArray",  "Texture2DArray",
-                                               "Texture2DMS", "Texture2DMSArray"};
+// Every cube view is a cube array on desktop (the runtime makes TEXTURECUBE views TEXTURECUBEARRAY):
+// console shaders read either kind through one cube instruction. Cube gradients are face-space 2D.
+static const char* const k_texture_types[8] = {"Texture1D",        "Texture2D",       "Texture3D",
+                                               "TextureCubeArray", "Texture1DArray",  "Texture2DArray",
+                                               "Texture2DMS",      "Texture2DMSArray"};
+// Read-write views by dimension: a cube's is an array of its faces; multisampled images have none.
+static const char* const k_rw_texture_types[8] = {"RWTexture1D",
+                                                  "RWTexture2D",
+                                                  "RWTexture3D",
+                                                  "RWTexture2DArray",
+                                                  "RWTexture1DArray",
+                                                  "RWTexture2DArray",
+                                                  "",
+                                                  ""};
 static const u8 k_dim_coords[8] = {1, 2, 3, 3, 2, 3, 2, 3};
-static const u8 k_dim_grads[8] = {1, 2, 3, 3, 1, 2, 2, 2};
+static const u8 k_dim_grads[8] = {1, 2, 3, 2, 1, 2, 2, 2};
 
 // Image address registers. With 16-bit addresses, components after the first `unpacked` share
 // registers two by two (low half first); the unpacked ones keep a whole register each, and the bias
@@ -1068,16 +1356,16 @@ struct ImageAddress {
 // Component `i` as uint bits.
 static const char* address_bits(Translator& t, const ImageAddress& a, s32 i) {
     if (!a.a16 || (u32)i < a.unpacked)
-        return vgpr(t, a.regs[i]);
+        return vgpr_data(t, a.regs[i]);
     u32 j = (u32)i - a.unpacked;
-    const char* reg = vgpr(t, a.regs[a.unpacked + j / 2]);
+    const char* reg = vgpr_data(t, a.regs[a.unpacked + j / 2]);
     return j & 1 ? fmt(t, "(%s >> 16)", reg) : fmt(t, "(%s & 0xffffu)", reg);
 }
 
 // Component `i` as a float.
 static const char* address_value(Translator& t, const ImageAddress& a, s32 i) {
     if (a.a16 && i == a.half_at)
-        return fmt(t, "f16tof32(%s)", vgpr(t, a.regs[i]));
+        return fmt(t, "f16tof32(%s)", vgpr_data(t, a.regs[i]));
     if (!a.a16 || (u32)i < a.unpacked)
         return fmt(t, "asfloat(%s)", address_bits(t, a, i));
     return fmt(t, "f16tof32(%s)", address_bits(t, a, i));
@@ -1096,6 +1384,278 @@ static const char* address_vector(Translator& t, const ImageAddress& a, bool flo
     return fmt(t, "%s%u(%s)", floats ? "float" : "uint", n, list);
 }
 
+// An image size query (image_get_resinfo) into w_, h_, d_ and l_: read-only views have mips to ask
+// about, read-write views are of one mip.
+static bool emit_image_size(Translator& t, const RdnaInst& in, bool read_write) {
+    const char* mip = vgpr_data(t, in.src[0].reg);
+    switch (in.mem.dim) {
+    case DIM_1D:
+        if (read_write)
+            emit(t, "tex_.GetDimensions(w_);");
+        else
+            emit(t, "tex_.GetDimensions(%s, w_, l_);", mip);
+        return true;
+    case DIM_2D:
+        if (read_write)
+            emit(t, "tex_.GetDimensions(w_, h_);");
+        else
+            emit(t, "tex_.GetDimensions(%s, w_, h_, l_);", mip);
+        return true;
+    case DIM_CUBE:
+        if (read_write) {
+            emit(t, "tex_.GetDimensions(w_, h_, d_); d_ = 1u;"); // a cube's read-write view is an array
+        } else {
+            // Desktop counts cubes; the hardware counts faces, one per slice as for 2D arrays.
+            emit(t, "tex_.GetDimensions(%s, w_, h_, d_, l_);", mip);
+            emit(t, "d_ *= 6u;");
+        }
+        return true;
+    case DIM_3D:
+    case DIM_2D_ARRAY:
+        if (read_write)
+            emit(t, "tex_.GetDimensions(w_, h_, d_);");
+        else
+            emit(t, "tex_.GetDimensions(%s, w_, h_, d_, l_);", mip);
+        return true;
+    case DIM_1D_ARRAY:
+        if (read_write)
+            emit(t, "tex_.GetDimensions(w_, h_);");
+        else
+            emit(t, "tex_.GetDimensions(%s, w_, h_, l_);", mip);
+        return true;
+    default:
+        translator_fail(t, "resource info of dimension %u", in.mem.dim);
+        return false;
+    }
+}
+
+// Implicit LOD needs derivatives. Compute groups whose shape desktop can't take them in (1D groups not a
+// multiple of 4 threads, other groups with odd X or Y) have lone lanes in their quads on console too:
+// zero derivatives, so the LOD is the bias alone.
+static bool implicit_lod_usable(const Translator& t) {
+    if (t.info->stage != SHADER_COMPUTE)
+        return true;
+    const u16* n = t.info->threads;
+    bool one_d = n[1] == 1 && n[2] == 1;
+    return one_d ? n[0] % 4 == 0 : n[0] % 2 == 0 && n[1] % 2 == 0;
+}
+
+bool image_reads_neighbours(const Translator& t, RdnaOp op) {
+    if (op == OP_IMAGE_GET_LOD)
+        return implicit_lod_usable(t);
+    ImageForm f = image_form(op);
+    return (f.sample || f.gather) && !f.lod && !f.lod_zero && !f.grad && implicit_lod_usable(t);
+}
+
+// A finite float as an HLSL literal.
+static const char* float_literal(Translator& t, f32 value) {
+    char digits[32];
+    snprintf(digits, sizeof(digits), "%.9g", value);
+    bool point = strpbrk(digits, ".e") != nullptr;
+    return fmt(t, "%s%sf", digits, point ? "" : ".0");
+}
+
+// A gather that picks a mip (an explicit LOD, an implicit one, a bias or a clamp), as `tex_` is declared.
+// Desktop gathers read the view's most detailed mip only, and no shader model has one that takes a LOD:
+// four point samples at the centres of the 2x2 texels the console gathers from that mip, which keep the
+// sampler's address modes and border. Returns the result's expression, or nullptr (failed).
+static const char* emit_gather_at_mip(Translator& t, const RdnaInst& in, const ImageForm& form,
+                                      const ImageAddress& addr, u32 coord_at, s32 lod_at, s32 bias_at,
+                                      s32 clamp_at, const s32 texel_offset[3]) {
+    const RdnaMemory& m = in.mem;
+    if (form.compare) {
+        translator_fail(t, "%s at 0x%x: a comparing gather from a mip it picks", rdna_op_name(in.op),
+                        in.offset);
+        return nullptr;
+    }
+    if (m.dim != DIM_2D && m.dim != DIM_2D_ARRAY) {
+        translator_fail(t, "%s at 0x%x of dimension %u", rdna_op_name(in.op), in.offset, m.dim);
+        return nullptr;
+    }
+    bool array = m.dim == DIM_2D_ARRAY;
+    // A sampler made of constants applies its bias and LOD clamps here, to pick the mip whose size the
+    // taps are placed by; the taps go through a copy without them (and without filtering), so that they
+    // read exactly that mip's texels. A heap sampler is used as it is: exact unless it biases or clamps
+    // the LOD itself, which translated code can't see.
+    u32 samp = in.src[2].reg;
+    DescriptorOrigin origin = descriptor_origin(t, samp, 4, HEAP_SAMPLERS);
+    InlineSampler constant = {};
+    if (origin == ORIGIN_CONSTANT) {
+        u32 words[4];
+        for (u32 i = 0; i < 4; i++)
+            sgpr_constant(t.tags, samp + i, &words[i]);
+        const char* why = nullptr;
+        if (!decode_sampler(words, false, &constant, &why)) {
+            translator_fail(t, "%s at 0x%x with a constant sampler using %s", rdna_op_name(in.op), in.offset,
+                            why);
+            return nullptr;
+        }
+        InlineSampler tap = constant;
+        tap.filter = 0; // point min, mag and mip filters, no min/max reduction
+        tap.max_anisotropy = 1;
+        tap.mip_bias = 0.0f;
+        tap.min_lod = 0.0f;
+        tap.max_lod = 3.402823466e+38f;
+        tap.unnormalized = false; // taps are placed in normalized coordinates
+        s32 index = add_inline_sampler(t, tap, false);
+        if (index < 0)
+            return nullptr;
+        emit(t, "SamplerState smp_ = g_sampler%d;", index);
+    } else if (origin == ORIGIN_HEAP) {
+        emit(t, "SamplerState smp_ = SamplerDescriptorHeap[%s >> 4]; // its LOD bias and clamps aren't seen",
+             sgpr(t, samp));
+    } else {
+        translator_fail(t, "%s at 0x%x with a sampler %s", rdna_op_name(in.op), in.offset,
+                        origin_text(origin));
+        return nullptr;
+    }
+    const char* uv = address_vector(t, addr, true, coord_at, 2);
+    const char* level;
+    if (form.lod) {
+        level = address_value(t, addr, lod_at);
+    } else {
+        level =
+            implicit_lod_usable(t) ? fmt(t, "tex_.CalculateLevelOfDetailUnclamped(smp_, %s)", uv) : "0.0f";
+        if (form.bias)
+            level = fmt(t, "%s + %s", level, address_value(t, addr, bias_at));
+    }
+    if (origin == ORIGIN_CONSTANT)
+        level = fmt(t, "clamp(%s + %s, %s, %s)", level, float_literal(t, constant.mip_bias),
+                    float_literal(t, constant.min_lod), float_literal(t, constant.max_lod));
+    if (form.clamp)
+        level = fmt(t, "max(%s, %s)", level, address_value(t, addr, clamp_at));
+    const char* elements = array ? "e_, " : "";
+    emit(t, "float l_ = %s;", level);
+    emit(t, "uint w_, h_, e_, n_; tex_.GetDimensions(0u, w_, h_, %sn_);", elements);
+    emit(t, "uint m_ = (uint)clamp(floor(l_ + 0.5f), 0.0f, (float)(max(n_, 1u) - 1u));");
+    emit(t, "tex_.GetDimensions(m_, w_, h_, %sn_);", elements);
+    emit(t, "float2 sz_ = float2(w_, h_);");
+    // The top-left texel of the footprint (texel coordinates of its centre); unnormalized coordinates
+    // are in texels already, and keep to mip 0 (see decode_sampler).
+    emit(t, "float2 b_ = floor(%s - 0.5f) + float2(%.1ff, %.1ff);",
+         constant.unnormalized ? uv : fmt(t, "%s * sz_", uv), texel_offset[0] + 0.5f, texel_offset[1] + 0.5f);
+    const char* slice = array ? fmt(t, ", %s", address_value(t, addr, coord_at + 2)) : "";
+    // Gather order: (0, 1), (1, 1), (1, 0), (0, 0) from the top-left texel.
+    static const u32 k_corner[4][2] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
+    for (u32 i = 0; i < 4; i++)
+        emit(t, "float4 t%u_ = tex_.SampleLevel(smp_, %s((b_ + float2(%u, %u)) / sz_%s), (float)m_);", i,
+             array ? "float3" : "", k_corner[i][0], k_corner[i][1], slice);
+    char c = "xyzw"[m.dmask & 2 ? 1 : m.dmask & 4 ? 2 : m.dmask & 8 ? 3 : 0];
+    return fmt(t, "float4(t0_.%c, t1_.%c, t2_.%c, t3_.%c)", c, c, c, c);
+}
+
+// An image atomic through a read-write view of 32- or 64-bit integer texels (`coords` uint components
+// of `addr` from `coord_at`). The data registers hold one value, or for a compare-swap the value and
+// then what the texel is compared with; dmask has a bit per dword of it. With glc the texel's old value
+// comes back in the first registers.
+static bool emit_image_atomic(Translator& t, const RdnaInst& in, const ImageAddress& addr, u32 coord_at,
+                              u32 coords, const char* resource) {
+    const RdnaMemory& m = in.mem;
+    bool cmpswap = in.op == OP_IMAGE_ATOMIC_CMPSWAP;
+    u32 data_dwords = m.dmask == 0x1 ? 1 : m.dmask == 0x3 ? 2 : m.dmask == 0xF ? 4 : 0;
+    u32 dwords = cmpswap ? data_dwords / 2 : data_dwords; // per value
+    if ((dwords != 1 && dwords != 2) || m.d16 || !k_rw_texture_types[m.dim][0]) {
+        translator_fail(t, "%s at 0x%x with dmask 0x%x%s, dimension %u", rdna_op_name(in.op), in.offset,
+                        m.dmask, m.d16 ? " (16-bit)" : "", m.dim);
+        return false;
+    }
+    bool wide = dwords == 2;
+    bool is_signed = in.op == OP_IMAGE_ATOMIC_SMIN || in.op == OP_IMAGE_ATOMIC_SMAX;
+    bool inc_dec = in.op == OP_IMAGE_ATOMIC_INC || in.op == OP_IMAGE_ATOMIC_DEC;
+    if (wide && inc_dec) {
+        translator_fail(t, "64-bit %s at 0x%x", rdna_op_name(in.op), in.offset);
+        return false;
+    }
+    // Typed atomics take their signedness from the view's element type.
+    const char* type = wide ? (is_signed ? "int64_t" : "uint64_t") : (is_signed ? "int" : "uint");
+    u32 data = in.dst[0].reg;
+    const char* value =
+        wide ? fmt(t, "((uint64_t)%s << 32 | %s)", vgpr(t, data + 1), vgpr(t, data)) : vgpr(t, data);
+    if (is_signed)
+        value = fmt(t, "(%s)%s", type, value);
+    if (wide)
+        t.out->uses_int64_atomics = true;
+    bool returns = m.glc;
+    emit(t, "{ %s<%s> tex_ = ResourceDescriptorHeap[%s];", k_rw_texture_types[m.dim], type, resource);
+    t.depth++;
+    emit(t, "uint%s at_ = %s;", coords > 1 ? fmt(t, "%u", coords) : "",
+         address_vector(t, addr, false, coord_at, coords));
+    emit(t, "%s o_ = 0;", type);
+    if (cmpswap) {
+        const char* compare = wide ? fmt(t, "((uint64_t)%s << 32 | %s)", vgpr(t, data + 3), vgpr(t, data + 2))
+                                   : vgpr(t, data + 1);
+        if (returns)
+            emit(t, "if (%s) InterlockedCompareExchange(tex_[at_], %s, %s, o_);", exec_cond(t), compare,
+                 value);
+        else
+            emit(t, "if (%s) InterlockedCompareStore(tex_[at_], %s, %s);", exec_cond(t), compare, value);
+    } else if (inc_dec) {
+        // No typed atomic does these: a compare-exchange loop, which needs no typed load to start from
+        // (the first exchange returns the texel unless it already holds the guess).
+        const char* next = in.op == OP_IMAGE_ATOMIC_INC
+                               ? fmt(t, "c_ >= %s ? 0u : c_ + 1u", value)
+                               : fmt(t, "(c_ == 0u || c_ > %s) ? %s : c_ - 1u", value, value);
+        emit(t,
+             "if (%s) { uint c_ = 0u, p_; [allow_uav_condition] for (;;) { "
+             "InterlockedCompareExchange(tex_[at_], c_, %s, p_); if (p_ == c_) break; c_ = p_; } o_ = c_; }",
+             exec_cond(t), next);
+    } else {
+        const char* fn = nullptr;
+        switch (in.op) {
+        case OP_IMAGE_ATOMIC_SWAP:
+            fn = "InterlockedExchange";
+            break;
+        case OP_IMAGE_ATOMIC_ADD:
+            fn = "InterlockedAdd";
+            break;
+        case OP_IMAGE_ATOMIC_SUB:
+            fn = "InterlockedAdd";
+            value = fmt(t, "(%s)0 - %s", type, value);
+            break;
+        case OP_IMAGE_ATOMIC_SMIN:
+        case OP_IMAGE_ATOMIC_UMIN:
+            fn = "InterlockedMin";
+            break;
+        case OP_IMAGE_ATOMIC_SMAX:
+        case OP_IMAGE_ATOMIC_UMAX:
+            fn = "InterlockedMax";
+            break;
+        case OP_IMAGE_ATOMIC_AND:
+            fn = "InterlockedAnd";
+            break;
+        case OP_IMAGE_ATOMIC_OR:
+            fn = "InterlockedOr";
+            break;
+        case OP_IMAGE_ATOMIC_XOR:
+            fn = "InterlockedXor";
+            break;
+        default:
+            translator_fail(t, "unsupported %s", rdna_op_name(in.op));
+            return false;
+        }
+        // The exchange always returns the old value.
+        if (returns || in.op == OP_IMAGE_ATOMIC_SWAP)
+            emit(t, "if (%s) %s(tex_[at_], %s, o_);", exec_cond(t), fn, value);
+        else
+            emit(t, "if (%s) %s(tex_[at_], %s);", exec_cond(t), fn, value);
+    }
+    if (returns) {
+        write_vgpr(t, in, data, "(uint)o_");
+        if (wide)
+            write_vgpr(t, in, data + 1, "(uint)((uint64_t)o_ >> 32)");
+    }
+    t.depth--;
+    emit(t, "}");
+    return true;
+}
+
+// Cube coordinates (s, t, face from `first` on) as the desktop direction and cube index in c_ (see
+// cube_coord in the preamble).
+static void emit_cube_coord(Translator& t, const ImageAddress& a, u32 first) {
+    emit(t, "float4 c_ = cube_coord(%s, %s, %s);", address_value(t, a, (s32)first),
+         address_value(t, a, (s32)first + 1), address_value(t, a, (s32)first + 2));
+}
+
 static bool emit_image(Translator& t, const RdnaInst& in) {
     const RdnaMemory& m = in.mem;
     ImageForm form = image_form(in.op);
@@ -1107,15 +1667,31 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         translator_fail(t, "%s with residency feedback at 0x%x", rdna_op_name(in.op), in.offset);
         return false;
     }
-    if (m.dim == DIM_CUBE && (form.sample || form.gather)) {
-        translator_fail(t, "cube sampling at 0x%x", in.offset);
+    // Desktop cube sampling takes no texel offsets (no title uses them).
+    if (m.dim == DIM_CUBE && form.offset) {
+        translator_fail(t, "%s at 0x%x: cube sampling with texel offsets", rdna_op_name(in.op), in.offset);
         return false;
     }
     u32 rsrc = in.src[1].reg;
     Tag tag = sgpr_tag(t, rsrc);
     if (tag_kind(tag) != TAG_HEAP || (tag_payload(tag) & 1) != HEAP_RESOURCES) {
-        translator_fail(t, "%s at 0x%x with a resource not from a descriptor table", rdna_op_name(in.op),
-                        in.offset);
+        DescriptorOrigin origin =
+            descriptor_origin(t, rsrc, in.src[1].count ? in.src[1].count : 8, HEAP_RESOURCES);
+        char why[96];
+        describe_tag_loss(t, false, rsrc, why, sizeof(why));
+        if (origin == ORIGIN_MODIFIED)
+            translator_fail(t, "%s at 0x%x with an image descriptor %s%s", rdna_op_name(in.op), in.offset,
+                            origin_text(origin), why);
+        else
+            translator_fail(t, "%s at 0x%x with a resource not from a descriptor table%s",
+                            rdna_op_name(in.op), in.offset, why);
+        return false;
+    }
+    DescriptorOrigin origin =
+        descriptor_origin(t, rsrc, in.src[1].count ? in.src[1].count : 8, HEAP_RESOURCES);
+    if (origin != ORIGIN_HEAP) {
+        translator_fail(t, "%s at 0x%x with an image descriptor %s", rdna_op_name(in.op), in.offset,
+                        origin_text(origin));
         return false;
     }
     // Address components in order: texel offsets, bias, comparison reference, gradients, then
@@ -1167,16 +1743,27 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
         translator_fail(t, "%s at 0x%x: address layout mismatch", rdna_op_name(in.op), in.offset);
         return false;
     }
+    // Cube arrays can be sampled with the 2D array dimension, the layer being cube index * 8 + face. A
+    // Texture2DArray reading a cube array view would be wrong twice over; only a v_cubeid face with an
+    // index folded in says so for certain (a bare face may be a layer of a real 2D array).
+    if (m.dim == DIM_2D_ARRAY && !m.a16 && (form.sample || form.gather || in.op == OP_IMAGE_GET_LOD)) {
+        Tag layer = t.tags.vgpr[addr.regs[coord_at + 2] & 255];
+        if (tag_kind(layer) == TAG_CUBE_FACE && tag_payload(layer) == 1) {
+            translator_fail(t, "%s at 0x%x: cube array sampling through the 2D array dimension",
+                            rdna_op_name(in.op), in.offset);
+            return false;
+        }
+    }
     // Texel offsets: 6-bit signed fields at bits 0, 8 and 16 of a register whose value is known. Kept
     // out of the scratch ring (", offsets" or empty), since many expressions are formatted after it.
     char offset_arg[48] = {};
+    s32 o[3] = {0, 0, 0};
     if (form.offset) {
         u32 value;
         if (!vgpr_constant(t.tags, addr.regs[offset_at], &value)) {
             translator_fail(t, "%s at 0x%x with non-constant texel offsets", rdna_op_name(in.op), in.offset);
             return false;
         }
-        s32 o[3];
         for (u32 i = 0; i < 3; i++)
             o[i] = (s32)(((value >> (8 * i)) & 0x3Fu) << 26) >> 26;
         // Desktop sampling takes offsets in [-8, 7] only; gathers take the whole console range.
@@ -1195,252 +1782,306 @@ static bool emit_image(Translator& t, const RdnaInst& in) {
             snprintf(offset_arg, sizeof(offset_arg), ", int3(%d, %d, %d)", o[0], o[1], o[2]);
     }
 
-    TableRangeKind kind = heap_kind(t, rsrc, form.store ? RANGE_UAV : RANGE_SRV);
     // Sampling reads through shader resource views only; stores need unordered access views.
     bool sampled = form.sample || form.gather || in.op == OP_IMAGE_GET_LOD;
-    bool uav = form.store || (kind == RANGE_UAV && !sampled);
-    const char* resource = fmt(t, "%s >> 5", sgpr(t, rsrc));
+    ViewAccess access;
+    if (!view_access(t, in, rsrc, form.store || is_image_atomic(in.op), sampled, &access))
+        return false;
+    if (access == VIEW_BY_SHADOW && !k_rw_texture_types[m.dim][0])
+        access = VIEW_READ_ONLY; // no read-write views of multisampled images
+    if (m.dim == DIM_CUBE && form.load && access != VIEW_READ_WRITE) {
+        // Cube views (see k_texture_types) take no texel loads on desktop, so neither can a slot whose
+        // view the shadow decides.
+        translator_fail(t, "%s at 0x%x: image load from a cube view%s", rdna_op_name(in.op), in.offset,
+                        access == VIEW_BY_SHADOW ? " (or a view of a kind the program doesn't say)" : "");
+        return false;
+    }
+    // Loads and size queries work through either kind of view: with the shadow's kind deciding, both are
+    // emitted, and the results are written after.
+    bool by_shadow = access == VIEW_BY_SHADOW;
+    bool resinfo = in.op == OP_IMAGE_GET_RESINFO;
+    char resource[64];
+    snprintf(resource, sizeof(resource), "%s >> 5", sgpr(t, rsrc));
+    if (is_image_atomic(in.op)) // always through a read-write view (see view_access)
+        return emit_image_atomic(t, in, addr, coord_at, coords, resource);
     emit(t, "{");
     t.depth++;
-    if (uav) {
-        static const char* const k_rw[8] = {"RWTexture1D",
-                                            "RWTexture2D",
-                                            "RWTexture3D",
-                                            "RWTexture2DArray",
-                                            "RWTexture1DArray",
-                                            "RWTexture2DArray",
-                                            "",
-                                            ""};
-        if (!k_rw[m.dim][0]) {
-            translator_fail(t, "storage image of dimension %u", m.dim);
-            return false;
-        }
-        emit(t, "%s<float4> tex_ = ResourceDescriptorHeap[%s];", k_rw[m.dim], resource);
-    } else {
-        emit(t, "%s<float4> tex_ = ResourceDescriptorHeap[%s];", k_texture_types[m.dim], resource);
-    }
-    const char* value = nullptr;
-    if (form.sample || form.gather) {
-        u32 samp = in.src[2].reg;
-        Tag stag = sgpr_tag(t, samp);
-        u32 words[4];
-        bool literal = true;
-        for (u32 i = 0; i < 4; i++)
-            literal &= sgpr_constant(t.tags, samp + i, &words[i]);
-        if (literal) {
-            s32 index = inline_sampler(t, in, words, form.compare);
-            if (index < 0)
+    if (by_shadow)
+        emit(t, resinfo ? "uint w_ = 0u, h_ = 0u, d_ = 1u, l_ = 1u;" : "float4 r_;");
+    for (ViewPass v = view_begin(access, rsrc); view_next(t, v);) {
+        bool uav = v.read_write;
+        if (uav) {
+            if (!k_rw_texture_types[m.dim][0]) {
+                translator_fail(t, "storage image of dimension %u", m.dim);
                 return false;
-            emit(t, "%s smp_ = g_sampler%d;", form.compare ? "SamplerComparisonState" : "SamplerState",
-                 index);
-        } else if (tag_kind(stag) == TAG_HEAP && (tag_payload(stag) & 1) == HEAP_SAMPLERS) {
-            emit(t, "%s smp_ = SamplerDescriptorHeap[%s >> 4];",
-                 form.compare ? "SamplerComparisonState" : "SamplerState", sgpr(t, samp));
+            }
+            emit(t, "%s<float4> tex_ = ResourceDescriptorHeap[%s];", k_rw_texture_types[m.dim], resource);
         } else {
-            translator_fail(t, "%s at 0x%x with a sampler not from a sampler table", rdna_op_name(in.op),
-                            in.offset);
-            return false;
+            emit(t, "%s<float4> tex_ = ResourceDescriptorHeap[%s];", k_texture_types[m.dim], resource);
         }
-        const char* uv = address_vector(t, addr, true, coord_at, coords);
-        // Implicit LOD needs derivatives. Compute groups whose shape desktop can't take them in (1D
-        // groups not a multiple of 4 threads, other groups with odd X or Y) have lone lanes in their
-        // quads on console too: zero derivatives, so the LOD is the bias alone.
-        bool implicit_lod_ok = true;
-        if (t.info->stage == SHADER_COMPUTE) {
-            const u16* n = t.info->threads;
-            bool one_d = n[1] == 1 && n[2] == 1;
-            implicit_lod_ok = one_d ? n[0] % 4 == 0 : n[0] % 2 == 0 && n[1] % 2 == 0;
-        }
-        if (form.gather) {
-            static const char* const k_gather[4] = {"GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha"};
-            u32 c = m.dmask & 2 ? 1 : m.dmask & 4 ? 2 : m.dmask & 8 ? 3 : 0;
-            if (form.compare)
-                value = fmt(t, "tex_.GatherCmpRed(smp_, %s, %s%s)", uv, address_value(t, addr, compare_at),
+        const char* value = nullptr;
+        if (form.gather && !form.lod_zero) {
+            value = emit_gather_at_mip(t, in, form, addr, coord_at, lod_at, bias_at, clamp_at, o);
+            if (!value)
+                return false;
+        } else if (form.sample || form.gather) {
+            if (!emit_sampler(t, in, form.compare))
+                return false;
+            const char* uv;
+            if (m.dim == DIM_CUBE) {
+                emit_cube_coord(t, addr, coord_at);
+                uv = "c_";
+            } else {
+                uv = address_vector(t, addr, true, coord_at, coords);
+            }
+            // The clamp forms take an offset argument before the clamp, except on cubes (which have none).
+            const char* clamp_offset = m.dim == DIM_CUBE ? "" : form.offset ? offset_arg : ", 0";
+            bool implicit_lod_ok = implicit_lod_usable(t);
+            if (form.gather) {
+                static const char* const k_gather[4] = {"GatherRed", "GatherGreen", "GatherBlue",
+                                                        "GatherAlpha"};
+                u32 c = m.dmask & 2 ? 1 : m.dmask & 4 ? 2 : m.dmask & 8 ? 3 : 0;
+                if (form.compare)
+                    value = fmt(t, "tex_.GatherCmpRed(smp_, %s, %s%s)", uv,
+                                address_value(t, addr, compare_at), offset_arg);
+                else
+                    value = fmt(t, "tex_.%s(smp_, %s%s)", k_gather[c], uv, offset_arg);
+                if (form.lod || form.bias || form.grad || form.clamp) {
+                    translator_fail(t, "%s variant at 0x%x", rdna_op_name(in.op), in.offset);
+                    return false;
+                }
+            } else if (form.compare) {
+                const char* ref = address_value(t, addr, compare_at);
+                // Comparisons with an explicit LOD, bias or gradients need shader model 6.7/6.8 on desktop:
+                // those variants fail below. Without usable derivatives the plain one samples level 0.
+                bool plain = !form.lod && !form.bias && !form.grad && !form.clamp;
+                if (form.lod_zero || (plain && !implicit_lod_ok))
+                    value = fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s%s).xxxx", uv, ref, offset_arg);
+                else if (plain)
+                    value = fmt(t, "tex_.SampleCmp(smp_, %s, %s%s).xxxx", uv, ref, offset_arg);
+            } else if (form.lod_zero || (!form.lod && !form.grad && !implicit_lod_ok)) {
+                // Without usable derivatives the LOD is the bias alone (see implicit_lod_ok), at least the
+                // clamp.
+                const char* level = form.bias && !form.lod_zero ? address_value(t, addr, bias_at) : "0.0f";
+                if (form.clamp && !form.lod_zero)
+                    level = fmt(t, "max(%s, %s)", level, address_value(t, addr, clamp_at));
+                value = fmt(t, "tex_.SampleLevel(smp_, %s, %s%s)", uv, level, offset_arg);
+            } else if (form.lod) {
+                value = fmt(t, "tex_.SampleLevel(smp_, %s, %s%s)", uv, address_value(t, addr, lod_at),
                             offset_arg);
-            else
-                value = fmt(t, "tex_.%s(smp_, %s%s)", k_gather[c], uv, offset_arg);
-            if (form.lod || form.bias || form.grad || form.clamp) {
+            } else if (form.bias) {
+                const char* bias = address_value(t, addr, bias_at);
+                value = form.clamp ? fmt(t, "tex_.SampleBias(smp_, %s, %s%s, %s)", uv, bias, clamp_offset,
+                                         address_value(t, addr, clamp_at))
+                                   : fmt(t, "tex_.SampleBias(smp_, %s, %s%s)", uv, bias, offset_arg);
+            } else if (form.grad) {
+                const char* ddx;
+                const char* ddy;
+                if (m.dim == DIM_CUBE) {
+                    // Face-space gradients (ds, dt per screen axis) lie in the face's plane of the direction.
+                    const char* face = address_value(t, addr, (s32)coord_at + 2);
+                    emit(t, "float3 dx_ = cube_grad(%s, %s, %s);", face, address_value(t, addr, grad_at),
+                         address_value(t, addr, grad_at + 1));
+                    emit(t, "float3 dy_ = cube_grad(%s, %s, %s);", face, address_value(t, addr, grad_at + 2),
+                         address_value(t, addr, grad_at + 3));
+                    ddx = "dx_";
+                    ddy = "dy_";
+                } else {
+                    ddx = address_vector(t, addr, true, (u32)grad_at, grads);
+                    ddy = address_vector(t, addr, true, (u32)grad_at + grads, grads);
+                }
+                value = form.clamp ? fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s%s, %s)", uv, ddx, ddy,
+                                         clamp_offset, address_value(t, addr, clamp_at))
+                                   : fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s%s)", uv, ddx, ddy, offset_arg);
+            } else {
+                value = form.clamp ? fmt(t, "tex_.Sample(smp_, %s%s, %s)", uv, clamp_offset,
+                                         address_value(t, addr, clamp_at))
+                                   : fmt(t, "tex_.Sample(smp_, %s%s)", uv, offset_arg);
+            }
+            if (!value) {
                 translator_fail(t, "%s variant at 0x%x", rdna_op_name(in.op), in.offset);
                 return false;
             }
-        } else if (form.compare) {
-            const char* ref = address_value(t, addr, compare_at);
-            // Comparisons with an explicit LOD, bias or gradients need shader model 6.7/6.8 on desktop:
-            // those variants fail below. Without usable derivatives the plain one samples level 0.
-            bool plain = !form.lod && !form.bias && !form.grad && !form.clamp;
-            if (form.lod_zero || (plain && !implicit_lod_ok))
-                value = fmt(t, "tex_.SampleCmpLevelZero(smp_, %s, %s%s).xxxx", uv, ref, offset_arg);
-            else if (plain)
-                value = fmt(t, "tex_.SampleCmp(smp_, %s, %s%s).xxxx", uv, ref, offset_arg);
-        } else if (form.lod_zero || (!form.lod && !form.grad && !implicit_lod_ok)) {
-            // Without usable derivatives the LOD is the bias alone (see implicit_lod_ok), at least the clamp.
-            const char* level = form.bias && !form.lod_zero ? address_value(t, addr, bias_at) : "0.0f";
-            if (form.clamp && !form.lod_zero)
-                level = fmt(t, "max(%s, %s)", level, address_value(t, addr, clamp_at));
-            value = fmt(t, "tex_.SampleLevel(smp_, %s, %s%s)", uv, level, offset_arg);
-        } else if (form.lod) {
-            value =
-                fmt(t, "tex_.SampleLevel(smp_, %s, %s%s)", uv, address_value(t, addr, lod_at), offset_arg);
-        } else if (form.bias && !form.clamp) {
-            value =
-                fmt(t, "tex_.SampleBias(smp_, %s, %s%s)", uv, address_value(t, addr, bias_at), offset_arg);
-        } else if (form.grad && !form.clamp) {
-            const char* ddx = address_vector(t, addr, true, (u32)grad_at, grads);
-            const char* ddy = address_vector(t, addr, true, (u32)grad_at + grads, grads);
-            value = fmt(t, "tex_.SampleGrad(smp_, %s, %s, %s%s)", uv, ddx, ddy, offset_arg);
-        } else if (!form.bias && !form.grad) {
-            // The clamp form takes an offset argument either way.
-            value = form.clamp ? fmt(t, "tex_.Sample(smp_, %s, %s, %s)", uv,
-                                     form.offset ? offset_arg + 2 : "0", address_value(t, addr, clamp_at))
-                               : fmt(t, "tex_.Sample(smp_, %s%s)", uv, offset_arg);
-        }
-        if (!value) {
-            translator_fail(t, "%s variant at 0x%x", rdna_op_name(in.op), in.offset);
-            return false;
-        }
-    } else if (form.load) {
-        const char* xy = address_vector(t, addr, false, coord_at, coords);
-        if (in.op == OP_IMAGE_MSAA_LOAD)
-            value = fmt(t, "tex_.Load(%s, %s)", xy, address_bits(t, addr, lod_at));
-        else if (uav)
-            value = fmt(t, "tex_[%s]", xy);
-        else
-            value = fmt(t, "tex_.Load(uint%u(%s, %s))", coords + 1, xy,
-                        form.mip ? address_bits(t, addr, lod_at) : "0u");
-    } else if (form.store) {
-        const char* xy = address_vector(t, addr, false, coord_at, coords);
-        const char* c[4] = {"0.0f", "0.0f", "0.0f", "0.0f"};
-        u32 source = 0;
-        for (u32 i = 0; i < 4; i++) {
-            if (!(m.dmask & (1u << i)))
-                continue;
-            // 16-bit data: two components to a register, low half first.
-            const char* reg = vgpr(t, in.dst[0].reg + (m.d16 ? source / 2 : source));
-            if (!m.d16)
-                c[i] = fmt(t, "asfloat(%s)", reg);
+        } else if (form.load) {
+            const char* xy = address_vector(t, addr, false, coord_at, coords);
+            if (in.op == OP_IMAGE_MSAA_LOAD)
+                value = fmt(t, "tex_.Load(%s, %s)", xy, address_bits(t, addr, lod_at));
+            else if (uav)
+                value = fmt(t, "tex_[%s]", xy);
             else
-                c[i] = fmt(t, source & 1 ? "f16tof32(%s >> 16)" : "f16tof32(%s & 0xffffu)", reg);
-            source++;
-        }
-        emit(t, "if (EXEC) tex_[%s] = float4(%s, %s, %s, %s);", xy, c[0], c[1], c[2], c[3]);
-        t.depth--;
-        emit(t, "}");
-        return true;
-    } else if (in.op == OP_IMAGE_GET_RESINFO) {
-        emit(t, "uint w_ = 0u, h_ = 0u, d_ = 1u, l_ = 1u;");
-        const char* mip = vgpr(t, in.src[0].reg);
-        switch (m.dim) {
-        case DIM_1D:
-            emit(t, "tex_.GetDimensions(%s, w_, l_);", mip);
-            break;
-        case DIM_2D:
-        case DIM_CUBE:
-            emit(t, "tex_.GetDimensions(%s, w_, h_, l_);", mip);
-            break;
-        case DIM_3D:
-        case DIM_2D_ARRAY:
-            emit(t, "tex_.GetDimensions(%s, w_, h_, d_, l_);", mip);
-            break;
-        case DIM_1D_ARRAY:
-            emit(t, "tex_.GetDimensions(%s, w_, h_, l_);", mip);
-            break;
-        default:
-            translator_fail(t, "resource info of dimension %u", m.dim);
+                value = fmt(t, "tex_.Load(uint%u(%s, %s))", coords + 1, xy,
+                            form.mip ? address_bits(t, addr, lod_at) : "0u");
+        } else if (form.store) {
+            const char* xy = address_vector(t, addr, false, coord_at, coords);
+            const char* c[4] = {"0.0f", "0.0f", "0.0f", "0.0f"};
+            u32 source = 0;
+            for (u32 i = 0; i < 4; i++) {
+                if (!(m.dmask & (1u << i)))
+                    continue;
+                // 16-bit data: two components to a register, low half first.
+                const char* reg = vgpr(t, in.dst[0].reg + (m.d16 ? source / 2 : source));
+                if (!m.d16)
+                    c[i] = fmt(t, "asfloat(%s)", reg);
+                else
+                    c[i] = fmt(t, source & 1 ? "f16tof32(%s >> 16)" : "f16tof32(%s & 0xffffu)", reg);
+                source++;
+            }
+            emit(t, "if (%s) tex_[%s] = float4(%s, %s, %s, %s);", exec_cond(t), xy, c[0], c[1], c[2], c[3]);
+            continue;
+        } else if (resinfo) {
+            if (!by_shadow)
+                emit(t, "uint w_ = 0u, h_ = 0u, d_ = 1u, l_ = 1u;");
+            if (!emit_image_size(t, in, uav))
+                return false;
+            continue;
+        } else if (in.op == OP_IMAGE_GET_LOD) {
+            if (!emit_sampler(t, in, false))
+                return false;
+            const char* uv;
+            if (m.dim == DIM_CUBE) {
+                emit_cube_coord(t, addr, coord_at);
+                uv = "c_.xyz";
+            } else {
+                uv = address_vector(t, addr, true, coord_at, coords);
+            }
+            value = fmt(t,
+                        "float4(tex_.CalculateLevelOfDetail(smp_, %s), "
+                        "tex_.CalculateLevelOfDetailUnclamped(smp_, %s), "
+                        "0.0f, 0.0f)",
+                        uv, uv);
+        } else {
+            translator_fail(t, "unsupported %s", rdna_op_name(in.op));
             return false;
         }
-        value = "uint4(w_, h_, d_, l_)";
-        u32 dst = in.dst[0].reg;
+        emit(t, by_shadow ? "r_ = %s;" : "float4 r_ = %s;", value);
+    }
+    if (t.failed)
+        return false;
+    u32 dst = in.dst[0].reg;
+    if (resinfo) {
         for (u32 i = 0; i < 4; i++)
             if (m.dmask & (1u << i))
-                write_vgpr(t, in, dst++, fmt(t, "%s.%c", value, "xyzw"[i]));
-        t.depth--;
-        emit(t, "}");
-        return true;
-    } else if (in.op == OP_IMAGE_GET_LOD) {
-        u32 samp = in.src[2].reg;
-        emit(t, "SamplerState smp_ = SamplerDescriptorHeap[%s >> 4];", sgpr(t, samp));
-        const char* uv = address_vector(t, addr, true, coord_at, coords);
-        value = fmt(
-            t,
-            "float4(tex_.CalculateLevelOfDetail(smp_, %s), tex_.CalculateLevelOfDetailUnclamped(smp_, %s), "
-            "0.0f, 0.0f)",
-            uv, uv);
-    } else {
-        translator_fail(t, "unsupported %s", rdna_op_name(in.op));
-        return false;
-    }
-    emit(t, "float4 r_ = %s;", value);
-    u32 dst = in.dst[0].reg;
-    u32 mask = form.gather ? 0xF : m.dmask;
-    const char* results[4];
-    u32 n = 0;
-    for (u32 i = 0; i < 4; i++)
-        if (mask & (1u << i))
-            results[n++] = fmt(t, "r_.%c", "xyzw"[i]);
-    if (!m.d16) {
-        for (u32 i = 0; i < n; i++)
-            write_vgpr(t, in, dst + i, fmt(t, "asuint(%s)", results[i]));
-    } else {
-        // 16-bit data: two components to a register, low half first.
-        for (u32 i = 0; i < n; i += 2)
-            write_vgpr(t, in, dst + i / 2,
-                       i + 1 < n ? fmt(t, "(f32tof16(%s) | (f32tof16(%s) << 16))", results[i], results[i + 1])
-                                 : fmt(t, "f32tof16(%s)", results[i]));
+                write_vgpr(t, in, dst++, fmt(t, "uint4(w_, h_, d_, l_).%c", "xyzw"[i]));
+    } else if (!form.store) {
+        u32 mask = form.gather ? 0xF : m.dmask;
+        const char* results[4];
+        u32 n = 0;
+        for (u32 i = 0; i < 4; i++)
+            if (mask & (1u << i))
+                results[n++] = fmt(t, "r_.%c", "xyzw"[i]);
+        if (!m.d16) {
+            for (u32 i = 0; i < n; i++)
+                write_vgpr(t, in, dst + i, fmt(t, "asuint(%s)", results[i]));
+        } else {
+            // 16-bit data: two components to a register, low half first.
+            for (u32 i = 0; i < n; i += 2)
+                write_vgpr(t, in, dst + i / 2,
+                           i + 1 < n
+                               ? fmt(t, "(f32tof16(%s) | (f32tof16(%s) << 16))", results[i], results[i + 1])
+                               : fmt(t, "f32tof16(%s)", results[i]));
+        }
     }
     t.depth--;
     emit(t, "}");
     return true;
 }
 
+static u8 access_flags(const RdnaInst& in) {
+    if (in.enc == ENC_MUBUF || in.enc == ENC_MTBUF)
+        return is_store(in.op) || is_buffer_atomic(in.op) ? SLOT_WRITTEN : 0;
+    if (in.enc != ENC_MIMG)
+        return 0;
+    ImageForm form = image_form(in.op);
+    if (form.store || is_image_atomic(in.op))
+        return SLOT_WRITTEN;
+    return form.sample || form.gather || in.op == OP_IMAGE_GET_LOD ? SLOT_SAMPLED : 0;
+}
+
 // --- LDS ---------------------------------------------------------------------------------------------
+
+// ds_bpermute_b32 with exact lanes: each lane reads data0 of the lane its address names (in bytes);
+// lanes outside EXEC read as zero. The reads happen in every lane, before any lane writes (the
+// destination may be the data). With two lanes per thread both halves are done here: a lane may name
+// either half, so each reads both halves' value of the named desktop lane.
+static bool emit_bpermute(Translator& t, const RdnaInst& in, u32 offset) {
+    u32 addr = in.src[0].reg, data = in.src[1].reg, dst = in.dst[0].reg;
+    if (t.lanes == 1) {
+        emit(t,
+             "{ uint i_ = ((%s + %uu) >> 2) & 31u; uint r_ = WaveReadLaneAt(%s, i_); bool e_ = "
+             "WaveReadLaneAt(EXEC ? 1u : 0u, i_) != 0u;",
+             vgpr(t, addr), offset, vgpr(t, data));
+        t.depth++;
+        write_vgpr(t, in, dst, "(e_ ? r_ : 0u)");
+        t.depth--;
+        emit(t, "}");
+        return true;
+    }
+    emit(t, "{");
+    t.depth++;
+    for (u32 h = 0; h < 2; h++) {
+        emit(t, "uint i%u_ = ((%s + %uu) >> 2) & 63u;", h, vgpr_half(t, addr, h), offset);
+        emit(t,
+             "uint r%u_ = WaveReadLaneAt((i%u_ & 32u) != 0u ? %s : %s, i%u_ & 31u); bool e%u_ = "
+             "WaveReadLaneAt((i%u_ & 32u) != 0u ? s127 : s126, i%u_ & 31u) != 0u;",
+             h, h, vgpr_half(t, data, 1), vgpr_half(t, data, 0), h, h, h, h);
+    }
+    emit(t, "if (EXEC0) %s = e0_ ? r0_ : 0u; if (EXEC1) %s = e1_ ? r1_ : 0u;", vgpr_half(t, dst, 0),
+         vgpr_half(t, dst, 1));
+    t.depth--;
+    emit(t, "}");
+    return true;
+}
 
 static bool emit_lds(Translator& t, const RdnaInst& in) {
     if (in.mem.gds) {
         translator_fail(t, "GDS access at 0x%x", in.offset);
         return false;
     }
-    t.uses_lds = true;
+    // ds_bpermute_b32 goes through the LDS hardware but not the group's LDS memory: programs that only
+    // permute allocate none, and declaring the default 64 KiB for them would fail translation.
+    if (in.op != OP_DS_BPERMUTE_B32)
+        t.uses_lds = true;
     const char* addr = vgpr(t, in.src[0].reg);
     u32 off0 = (u32)in.mem.offset, off1 = in.mem.offset1;
     u32 offset = off0 | (off1 << 8);
     const char* d0 = vgpr(t, in.src[1].reg);
     switch (in.op) {
     case OP_DS_WRITE_B32:
-        emit(t, "if (EXEC) g_lds[(%s + %uu) >> 2] = %s;", addr, offset, d0);
+        emit(t, "if (%s) g_lds[(%s + %uu) >> 2] = %s;", exec_cond(t), addr, offset, d0);
         return true;
     case OP_DS_WRITE_B64:
-        emit(t, "if (EXEC) { g_lds[(%s + %uu) >> 2] = %s; g_lds[(%s + %uu) >> 2] = %s; }", addr, offset, d0,
-             addr, offset + 4, vgpr(t, in.src[1].reg + 1));
+        emit(t, "if (%s) { g_lds[(%s + %uu) >> 2] = %s; g_lds[(%s + %uu) >> 2] = %s; }", exec_cond(t), addr,
+             offset, d0, addr, offset + 4, vgpr(t, in.src[1].reg + 1));
         return true;
     case OP_DS_WRITE_B96:
         emit(t,
-             "if (EXEC) { uint a_ = (%s + %uu) >> 2; g_lds[a_] = %s; g_lds[a_ + 1u] = %s; g_lds[a_ + 2u] = "
+             "if (%s) { uint a_ = (%s + %uu) >> 2; g_lds[a_] = %s; g_lds[a_ + 1u] = %s; g_lds[a_ + 2u] = "
              "%s; }",
-             addr, offset, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[1].reg + 2));
+             exec_cond(t), addr, offset, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[1].reg + 2));
         return true;
     case OP_DS_WRITE_B128:
         emit(t,
-             "if (EXEC) { uint a_ = (%s + %uu) >> 2; g_lds[a_] = %s; g_lds[a_ + 1u] = %s; g_lds[a_ + 2u] = "
+             "if (%s) { uint a_ = (%s + %uu) >> 2; g_lds[a_] = %s; g_lds[a_ + 1u] = %s; g_lds[a_ + 2u] = "
              "%s; "
              "g_lds[a_ + 3u] = %s; }",
-             addr, offset, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[1].reg + 2),
+             exec_cond(t), addr, offset, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[1].reg + 2),
              vgpr(t, in.src[1].reg + 3));
         return true;
     case OP_DS_WRITE2_B32:
     case OP_DS_WRITE2ST64_B32: {
         u32 unit = in.op == OP_DS_WRITE2ST64_B32 ? 256 : 4;
-        emit(t, "if (EXEC) { g_lds[(%s + %uu) >> 2] = %s; g_lds[(%s + %uu) >> 2] = %s; }", addr, off0 * unit,
-             d0, addr, off1 * unit, vgpr(t, in.src[2].reg));
+        emit(t, "if (%s) { g_lds[(%s + %uu) >> 2] = %s; g_lds[(%s + %uu) >> 2] = %s; }", exec_cond(t), addr,
+             off0 * unit, d0, addr, off1 * unit, vgpr(t, in.src[2].reg));
         return true;
     }
     case OP_DS_WRITE2_B64:
     case OP_DS_WRITE2ST64_B64: {
         u32 unit = in.op == OP_DS_WRITE2ST64_B64 ? 512 : 8;
         emit(t,
-             "if (EXEC) { uint a0_ = (%s + %uu) >> 2, a1_ = (%s + %uu) >> 2; g_lds[a0_] = %s; g_lds[a0_ + "
+             "if (%s) { uint a0_ = (%s + %uu) >> 2, a1_ = (%s + %uu) >> 2; g_lds[a0_] = %s; g_lds[a0_ + "
              "1u] = %s; g_lds[a1_] = %s; g_lds[a1_ + 1u] = %s; }",
-             addr, off0 * unit, addr, off1 * unit, d0, vgpr(t, in.src[1].reg + 1), vgpr(t, in.src[2].reg),
-             vgpr(t, in.src[2].reg + 1));
+             exec_cond(t), addr, off0 * unit, addr, off1 * unit, d0, vgpr(t, in.src[1].reg + 1),
+             vgpr(t, in.src[2].reg), vgpr(t, in.src[2].reg + 1));
         return true;
     }
     case OP_DS_WRITE_B8:
@@ -1454,13 +2095,13 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         // leave one lane's value, and no other wave sees the bytes cleared halfway. Every round lets one
         // of the conflicting lanes through.
         emit(t,
-             "if (EXEC) { uint ba_ = %s + %uu; uint i_ = ba_ >> 2; uint sh_ = (ba_ & %uu) * 8u; uint m_ = "
+             "if (%s) { uint ba_ = %s + %uu; uint i_ = ba_ >> 2; uint sh_ = (ba_ & %uu) * 8u; uint m_ = "
              "0x%xu << "
              "sh_; uint v_ = ((%s%s) & 0x%xu) << sh_; uint o_ = g_lds[i_]; [allow_uav_condition] for (;;) { "
              "uint p_; "
              "InterlockedCompareExchange(g_lds[i_], o_, (o_ & ~m_) | v_, p_); if (p_ == o_) break; o_ = p_; "
              "} }",
-             addr, offset, is_16 ? 2u : 3u, mask, d0, hi ? " >> 16" : "", mask);
+             exec_cond(t), addr, offset, is_16 ? 2u : 3u, mask, d0, hi ? " >> 16" : "", mask);
         return true;
     }
     case OP_DS_READ_B32:
@@ -1551,6 +2192,24 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         use_sgpr(t, SRC_M0);
         // The active lanes are counted before one of them does the add for the wave.
         const char* delta = in.op == OP_DS_APPEND ? "n_" : "(uint)(-(int)n_)";
+        if (t.lanes == 2) {
+            // Both halves: one add for the console wave's active lanes, by its first one; every lane gets
+            // the counter's old value (programs add their own position, with v_mbcnt).
+            emit(t, "{ uint b0_ = mask_bits(s126), b1_ = mask_bits(s127); uint n_ = countbits(b0_) + "
+                    "countbits(b1_); "
+                    "uint f_ = b0_ != 0u ? firstbitlow(b0_) : firstbitlow(b1_); uint o_ = 0u;");
+            t.depth++;
+            emit(t,
+                 "if (n_ != 0u && WaveGetLaneIndex() == (f_ & 31u)) InterlockedAdd(g_lds[((s124 & 0xffffu) + "
+                 "%uu) >> 2], %s, o_);",
+                 offset, delta);
+            emit(t, "o_ = WaveReadLaneAt(o_, f_ & 31u);");
+            emit(t, "if (EXEC0) %s = o_; if (EXEC1) %s = o_;", vgpr_half(t, in.dst[0].reg, 0),
+                 vgpr_half(t, in.dst[0].reg, 1));
+            t.depth--;
+            emit(t, "}");
+            return true;
+        }
         emit(t,
              "{ uint o_ = 0u; if (EXEC) { uint n_ = wave_count(s126); uint lane_ = wave_first(s126); "
              "if (WaveGetLaneIndex() == lane_) InterlockedAdd(g_lds[((s124 & 0xffffu) + %uu) >> 2], %s, o_); "
@@ -1562,7 +2221,26 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         emit(t, "}");
         return true;
     }
+    case OP_DS_CMPST_B32:
+    case OP_DS_CMPST_RTN_B32: {
+        // Compare and store: DATA0 is the value compared with, DATA1 the one stored (the opposite of
+        // the buffer and global compare-swaps, whose data VGPRs hold the new value first).
+        const char* d1 = vgpr(t, in.src[2].reg);
+        if (in.op == OP_DS_CMPST_RTN_B32) {
+            emit(t, "{ uint o_ = 0u; if (%s) InterlockedCompareExchange(g_lds[(%s + %uu) >> 2], %s, %s, o_);",
+                 exec_cond(t), addr, offset, d0, d1);
+            t.depth++;
+            write_vgpr(t, in, in.dst[0].reg, "o_");
+            t.depth--;
+            emit(t, "}");
+        } else {
+            emit(t, "if (%s) InterlockedCompareStore(g_lds[(%s + %uu) >> 2], %s, %s);", exec_cond(t), addr,
+                 offset, d0, d1);
+        }
+        return true;
+    }
     case OP_DS_ADD_U32:
+    case OP_DS_SUB_U32:
     case OP_DS_MIN_U32:
     case OP_DS_MAX_U32:
     case OP_DS_MIN_I32:
@@ -1571,6 +2249,7 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
     case OP_DS_OR_B32:
     case OP_DS_XOR_B32:
     case OP_DS_ADD_RTN_U32:
+    case OP_DS_SUB_RTN_U32:
     case OP_DS_MIN_RTN_U32:
     case OP_DS_MAX_RTN_U32:
     case OP_DS_AND_RTN_B32:
@@ -1583,6 +2262,11 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         case OP_DS_ADD_U32:
         case OP_DS_ADD_RTN_U32:
             fn = "InterlockedAdd";
+            break;
+        case OP_DS_SUB_U32:
+        case OP_DS_SUB_RTN_U32:
+            fn = "InterlockedAdd"; // of the negated data, which wraps the same way
+            d0 = fmt(t, "(0u - %s)", d0);
             break;
         case OP_DS_MIN_U32:
         case OP_DS_MIN_RTN_U32:
@@ -1614,17 +2298,20 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
             return false;
         }
         if (rtn) {
-            emit(t, "{ uint o_ = 0u; if (EXEC) %s(g_lds[(%s + %uu) >> 2], %s, o_);", fn, addr, offset, d0);
+            emit(t, "{ uint o_ = 0u; if (%s) %s(g_lds[(%s + %uu) >> 2], %s, o_);", exec_cond(t), fn, addr,
+                 offset, d0);
             t.depth++;
             write_vgpr(t, in, in.dst[0].reg, "o_");
             t.depth--;
             emit(t, "}");
         } else {
-            emit(t, "if (EXEC) %s(g_lds[(%s + %uu) >> 2], %s);", fn, addr, offset, d0);
+            emit(t, "if (%s) %s(g_lds[(%s + %uu) >> 2], %s);", exec_cond(t), fn, addr, offset, d0);
         }
         return true;
     }
     case OP_DS_BPERMUTE_B32:
+        if (t.exact)
+            return emit_bpermute(t, in, offset);
         // Read data0 from the lane addressed (in bytes) by this lane's address.
         write_vgpr(
             t, in, in.dst[0].reg,
@@ -1638,40 +2325,122 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
 
 // --- global memory -----------------------------------------------------------------------------------
 
+// A global load from `buffer` at the byte address `address`. Results are written a register at a time, and
+// the address may be in those registers: with more than one, it is taken first.
+static void write_global_loaded(Translator& t, const RdnaInst& in, const char* buffer, const char* address) {
+    u32 dwords = in.dst[0].count;
+    if (dwords == 1) {
+        write_loaded(t, in, 1, fmt(t, "%s.Load(%s)", buffer, address));
+        return;
+    }
+    emit(t, "{ uint a_ = %s;", address);
+    t.depth++;
+    write_loaded(t, in, dwords, fmt(t, "%s.%s(a_)", buffer, k_load_fn[dwords]));
+    t.depth--;
+    emit(t, "}");
+}
+
+// Descriptor heap memory read as data (programs read fields of descriptors they pick per lane): from the
+// descriptor shadow, which holds each slot's descriptor. The address is a heap address (a table's or the
+// heap's base plus an index scaled by the slot size, which translated code holds as a desktop heap byte
+// offset) with a high dword of zero: console heaps are below 4 GiB.
+static bool emit_heap_global_load(Translator& t, const RdnaInst& in, const char* address) {
+    u32 dwords = in.dst[0].count;
+    u32 at = (u32)in.mem.offset % SHADER_SHADOW_DESCRIPTOR_BYTES;
+    if (!(in.op >= OP_GLOBAL_LOAD_DWORD && in.op <= OP_GLOBAL_LOAD_DWORDX3)) {
+        translator_fail(t, "%s at 0x%x to descriptor heap memory", rdna_op_name(in.op), in.offset);
+        return false;
+    }
+    // Programs address slots whole, so the offset tells the dwords' place in the slot. The shadow keeps
+    // a slot's dwords together, but its record ends with the kind, not the next slot's first dwords.
+    if (at + 4 * dwords > SHADER_SHADOW_DESCRIPTOR_BYTES) {
+        translator_fail(t, "%s at 0x%x reads across two descriptor slots", rdna_op_name(in.op), in.offset);
+        return false;
+    }
+    t.needs_descriptor_info = true;
+    const char* load_address = fmt(t, "%s + 0x%xu", address, (u32)in.mem.offset);
+    // Compute programs may run the load in lanes outside EXEC too (see write_vgpr), whose address
+    // registers hold anything, and the shadow, a root descriptor, has no bounds: they read the first
+    // record instead.
+    if (t.exact)
+        load_address = fmt(t, "%s ? %s : 0u", exec_cond(t), load_address);
+    write_global_loaded(t, in, "g_descriptor_info", fmt(t, "shadow_at(%s)", load_address));
+    return true;
+}
+
 static bool emit_global(Translator& t, const RdnaInst& in) {
     const RdnaOperand& saddr = in.src[2];
     u32 parameter = ~0u;
     const char* base = "0u";
+    u32 hi_value = ~0u;
     if (saddr.kind == OPND_SGPR) {
-        Tag hi = sgpr_tag(t, saddr.reg + 1);
+        Tag lo = sgpr_tag(t, saddr.reg), hi = sgpr_tag(t, saddr.reg + 1);
         if (tag_kind(hi) == TAG_ROOT_HI) {
             parameter = tag_payload(hi);
             base = fmt(t, "(%s + %s)", sgpr(t, saddr.reg), vgpr(t, in.src[0].reg));
+        } else if (tag_kind(lo) == TAG_HEAP && !heap_loaded(lo) && (tag_payload(lo) & 1) == HEAP_RESOURCES &&
+                   sgpr_constant(t.tags, saddr.reg + 1, &hi_value) && hi_value == 0) {
+            const char* offset = vgpr_data(t, in.src[0].reg);
+            return emit_heap_global_load(t, in, fmt(t, "%s + %s", sgpr(t, saddr.reg), offset));
         }
     } else {
-        Tag hi = t.tags.vgpr[(in.src[0].reg + 1) & 255];
+        Tag lo = t.tags.vgpr[in.src[0].reg & 255], hi = t.tags.vgpr[(in.src[0].reg + 1) & 255];
         if (tag_kind(hi) == TAG_ROOT_HI) {
             parameter = tag_payload(hi);
             base = vgpr(t, in.src[0].reg);
+        } else if (tag_kind(lo) == TAG_HEAP && !heap_loaded(lo) && (tag_payload(lo) & 1) == HEAP_RESOURCES &&
+                   vgpr_constant(t.tags, in.src[0].reg + 1, &hi_value) && hi_value == 0) {
+            return emit_heap_global_load(t, in, vgpr(t, in.src[0].reg));
         }
     }
     if (parameter == ~0u) {
-        translator_fail(t, "%s at 0x%x from an address the translator cannot place", rdna_op_name(in.op),
-                        in.offset);
+        char why[96];
+        if (saddr.kind == OPND_SGPR)
+            describe_tag_loss(t, false, saddr.reg, why, sizeof(why));
+        else
+            describe_tag_loss(t, true, in.src[0].reg, why, sizeof(why));
+        translator_fail(t, "%s at 0x%x from an address the translator cannot place%s", rdna_op_name(in.op),
+                        in.offset, why);
         return false;
     }
     t.root_used |= 1ull << parameter;
-    u32 dwords = in.dst[0].count;
     const char* a = fmt(t, "(%s + 0x%xu)", base, (u32)in.mem.offset);
     if (in.op >= OP_GLOBAL_LOAD_DWORD && in.op <= OP_GLOBAL_LOAD_DWORDX3) {
-        write_loaded(t, in, dwords, fmt(t, "g_root%u.%s(%s)", parameter, k_load_fn[dwords], a));
+        write_global_loaded(t, in, fmt(t, "g_root%u", parameter), a);
         return true;
     }
     translator_fail(t, "unsupported %s", rdna_op_name(in.op));
     return false;
 }
 
+// Stores and atomics write their data registers as translated code holds them: a loaded descriptor
+// dword's heap address would reach memory in place of the dword. None seen; fail where one would.
+static bool check_stored_registers(Translator& t, const RdnaInst& in, const RdnaOperand& o) {
+    if (o.kind != OPND_VGPR)
+        return true;
+    for (u32 i = 0; i < (o.count ? o.count : 1u); i++) {
+        if (heap_loaded(t.tags.vgpr[(o.reg + i) & 255])) {
+            translator_fail(t, "%s at 0x%x stores a descriptor dword", rdna_op_name(in.op), in.offset);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool stores_data(const RdnaInst& in) {
+    if (in.enc == ENC_MUBUF || in.enc == ENC_MTBUF)
+        return is_store(in.op) || is_buffer_atomic(in.op);
+    if (in.enc == ENC_MIMG)
+        return image_form(in.op).store || is_image_atomic(in.op);
+    return false;
+}
+
 bool emit_memory(Translator& t, const RdnaInst& in) {
+    if (stores_data(in) && !check_stored_registers(t, in, in.dst[0]))
+        return false;
+    if (in.enc == ENC_DS &&
+        !(check_stored_registers(t, in, in.src[1]) && check_stored_registers(t, in, in.src[2])))
+        return false;
     switch (in.enc) {
     case ENC_SMEM:
         return emit_scalar_memory(t, in);

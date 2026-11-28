@@ -58,9 +58,21 @@ Texture uploads (`hle/d3d12/texture_sync`) read whichever copy is current.
 
 Desktop textures lay texels out their own way, so they are resources of their own. Textures the GPU
 only reads are reserved textures whose tiles hold the desktop layout and are mapped where the title
-mapped memory; their contents come from title memory. Render target, depth and UAV textures are whole
-desktop textures for now; mapping their tiles onto the frames under them would let aliased memory be
-the same video memory, as on console.
+mapped memory; their contents come from title memory.
+
+Render target, depth and UAV textures (`hle/d3d12/target_tiles.h`) are reserved textures too, and
+their tiles belong to the title memory under them (`gpu/shared_tiles.h`): tile *i* of such a texture
+is the tile of the frame (or, outside physical memory, the page) *i* × 64 KiB into its memory. Titles
+place the transient targets of different passes on the same memory; textures of the same description
+there share every tile and so their texels, and a pass reusing another's memory takes no video memory
+of its own, as on console. Tiles past the memory's last whole page, and tiles of pages the title
+hasn't mapped, are the texture's own. A mapping change under such a texture remaps its tiles before
+the next title submission, on a queue of their own that submissions wait for. These tiles are separate
+from the page tables' tiles of the same frames: GPU writes to a render target don't reach buffers over
+its memory (they hold different layouts anyway).
+
+Texture uploads read frames nothing has written yet as zeros without backing them (`mem_any_pending`),
+so memory only the GPU writes, seen through views of placed memory, stays without system memory.
 
 ## Open points
 

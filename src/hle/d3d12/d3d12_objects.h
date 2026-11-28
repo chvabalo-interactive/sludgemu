@@ -6,8 +6,11 @@
 
 #include "gpu/gpu_ring.h"
 #include "gpu/gpu_window.h"
+#include "gpu/list_pool.h"
 #include "gpu/tile_pool.h"
 #include "hle/d3d12/console_object.h"
+#include "hle/d3d12/descriptor_shadow.h"
+#include "hle/d3d12/queue_backlog.h"
 
 // Console D3D12 object types and their creation functions (one source file per type).
 
@@ -36,33 +39,27 @@ struct ConsoleDevice {
     ID3D12Device13* desktop;
 };
 
-// Small desktop lists that write fence values to memory when the queue signals a fence, and that
-// upload texture contents before a submission: several, so recording one doesn't wait for the GPU
-// to finish the last.
-#define QUEUE_SIGNAL_WRITERS 4
-#define QUEUE_UPLOADERS      4
-
-struct QueueSignalWriter {
-    ID3D12CommandAllocator* allocator;
-    ID3D12GraphicsCommandList8* list;
-    u64 submission; // the queue submission that last ran it
-};
-
 struct ConsoleCommandQueue {
     ConsoleObjectHeader header;
     D3D12_COMMAND_LIST_TYPE type;
 
     ID3D12CommandQueue* desktop;
-    u32 slot; // submission tracking (gpu_queue_register)
-    SRWLOCK writer_lock;
-    u32 next_writer;
-    QueueSignalWriter writers[QUEUE_SIGNAL_WRITERS];
-    // Texture uploads (texture_sync.h), and detiled texture data on its way into textures; writer_lock
-    // guards them too.
-    u32 next_uploader;
-    QueueSignalWriter uploaders[QUEUE_UPLOADERS];
-    GpuRing scratch;
+    u32 slot;       // submission tracking (gpu_queue_register)
+    u32 generation; // of the slot (gpu_queue_generation)
+    // Guards everything below and keeps the queue's work in order: titles may submit to a queue from
+    // several threads, and held-back work reaches the desktop queue from a thread pool thread.
+    SRWLOCK lock;
+    // Our own lists: fence value writes run when the queue signals a fence, texture uploads
+    // (texture_sync.h) before a submission. Taken from pools that grow rather than wait for the GPU.
+    GpuListPool writers;
+    GpuListPool uploaders;
+    GpuRing scratch; // detiled texture data on its way into textures
     GpuRing staging; // an upload ring
+    QueueBacklog backlog;
+    // Debug events begun and not ended yet, and which of the innermost 64 reached the desktop queue (bit
+    // per depth): events begun while work is held back are left out, and so must their ends be.
+    u32 event_depth;
+    u64 events_sent;
 };
 
 // Console fences also have a GPU address holding their value, which command lists write to signal
@@ -78,6 +75,8 @@ struct ConsoleFence {
 
 // The fence whose value lives at `address`, or nullptr.
 ConsoleFence* console_fence_at(u64 address);
+// Sets a fence's value from the CPU, as its Signal entry does.
+HRESULT console_fence_signal_cpu(ConsoleFence* fence, u64 value);
 
 // The desktop fence that follows the 64-bit counter at title GPU address `address`: a console
 // fence's own, or one made on first use for memory the title writes and waits on from the GPU.
@@ -85,11 +84,24 @@ ConsoleFence* console_fence_at(u64 address);
 ID3D12Fence* console_sync_fence(u64 address);
 // A queue reaches GPU work waiting for the counter at `address` to reach `value` (see fence.cpp).
 void console_counter_wait(u64 address, u64 value);
+// Describes a desktop fence for stall reports: the title counter it follows, if any.
+void console_fence_name(ID3D12Fence* fence, char* out, u32 size);
+// Starts the thread that reports GPU stalls (stall_watch.cpp).
+void console_stall_watch_start();
+// Logs the work each console queue holds back and what the first of it waits for (stall reports).
+void console_queues_report_backlogs(GpuFenceNamer name);
 
 // The allocation callback lets titles supply console command buffer memory. Recording goes to
 // desktop command lists instead, so it is kept but never called.
 typedef void* (*ConsoleAllocatorCallback)(void* allocator, void* list, u32 xmem_type, usize size,
                                           u32 alignment, u32 flags, u64 context);
+
+// Memory handed out by AllocateFromCommandAllocatorX: GPU-visible chunks used front to back, rewound
+// when the allocator is reset (the title has waited for the GPU then, as for the command memory).
+struct AllocatorChunk {
+    u8* memory;
+    u32 size;
+};
 
 struct ConsoleCommandAllocator {
     ConsoleObjectHeader header;
@@ -98,7 +110,15 @@ struct ConsoleCommandAllocator {
     ID3D12CommandAllocator* desktop;
     ConsoleAllocatorCallback callback;
     u64 callback_context;
+    AllocatorChunk* chunks;
+    u32 chunk_count;
+    u32 current_chunk; // the chunk allocations come from
+    u32 chunk_used;    // bytes of it handed out
 };
+
+// `size` bytes at `alignment` (a power of two, at most 64 KiB) from the allocator's memory, valid until
+// it is reset; nullptr when out of memory.
+void* console_allocator_allocate(ConsoleCommandAllocator* allocator, u32 size, u32 alignment);
 
 // The command buffer write cursor of a console command list. Inlined title code writes packets only
 // while current < limit_draw / limit_api; we keep them null.
@@ -123,6 +143,11 @@ struct PipelineOutputs {
     u8 depth_format;
     u8 sample_count;
     u8 rect_list; // drawn as console rectangle lists (geometry shader expansion)
+    // OMSetSampleMaskX replaces the pipeline's sample mask with `sample_mask`. Set only where the two
+    // differ in the targets' samples, so the default (0) stays the pipeline's own mask.
+    u8 sample_mask_override;
+    u8 unused; // 0: keys are compared byte by byte
+    u16 sample_mask;
 };
 
 // Root arguments: tables as desktop heap indices, root descriptors as desktop GPU addresses. They
@@ -179,6 +204,27 @@ struct ListState {
     ID3D12Resource* predication;
     u64 predication_offset;
     D3D12_PREDICATION_OP predication_op;
+    // OMSetSampleMaskX: the mask draws use instead of the pipeline's, until the next SetPipelineState
+    // (which goes back to the pipeline's, as on console).
+    bool has_sample_mask_x;
+    u16 sample_mask_x;
+    // Variable rate shading: the base rate and combiners (1x1, passthrough when never set), the
+    // shading rate image (borrowed: the title keeps it alive while lists use it).
+    bool has_shading_rate;
+    D3D12_SHADING_RATE shading_rate;
+    D3D12_SHADING_RATE_COMBINER shading_rate_combiners[2];
+    ID3D12Resource* shading_rate_image;
+    bool has_view_instance_mask;
+    u32 view_instance_mask;
+    // Programmable sample positions: per_pixel * pixels of them; none set when per_pixel is 0.
+    u8 sample_positions_per_pixel;
+    u8 sample_position_pixels;
+    D3D12_SAMPLE_POSITION sample_positions[64];
+    u32 stream_output_mask; // stream output targets set
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW stream_output[D3D12_SO_BUFFER_SLOT_COUNT];
+    // Between BeginRenderPass and EndRenderPass: the resolves the pass ends with (see
+    // command_list.cpp, render passes).
+    bool in_render_pass;
 };
 
 // What happens on the queue between two parts of a split list.
@@ -211,14 +257,18 @@ struct ConsoleCommandList {
     ListSegment* segments; // segment_capacity desktop lists, reused across resets
     u32 segment_count;
     u32 segment_capacity;
-    // The queue submission that last ran it (submitted_slot GPU_NO_QUEUE: none): console lists may run
-    // again while still running, desktop lists can't.
+    // The queue submission that last ran this recording (submitted_slot GPU_NO_QUEUE: none, cleared by
+    // Reset): console lists may run again while still running, desktop lists can't.
     u32 submitted_slot;
+    u32 submitted_generation; // of the slot
     u64 submitted_number;
+    // A queue holds the desktop lists back (queue_backlog.h): a Reset records into new ones, since
+    // resetting these would lose the held-back recording.
+    bool held_back;
     ConsoleCommandAllocator* allocator; // the allocator of the current recording
     ID3D12Device13* device;
     bool recording;
-    u32 skipped_draws; // draws and dispatches without a desktop pipeline yet
+    u32 skipped_draws; // draws and dispatches skipped: their pipeline can't be made, or wasn't in time
     ListState state;
 
     // Descriptor tables the recording uses, mirrored again when the list is submitted: titles may
@@ -292,7 +342,10 @@ struct ConsoleResource {
     SRWLOCK lock;            // guards creating the desktop texture
     ID3D12Resource* texture; // textures only
     bool reserved;           // the desktop texture is reserved, its tiles mapped by texture_sync
-    GpuSlots slots;          // the desktop texture is small, placed in these slots of the tile pool
+    // Render target, depth and UAV textures: the desktop texture is reserved, its tiles shared with
+    // textures over the same title memory (hle/d3d12/target_tiles.h).
+    struct TargetTexture* target;
+    GpuSlots slots; // the desktop texture is small, placed in these slots of the tile pool
     // The console mip the desktop texture's first mip is (textures of placed memory only): titles
     // streaming textures view only the mips they have loaded, and the desktop texture holds just those.
     u32 first_mip;
@@ -307,9 +360,19 @@ struct ConsoleResource {
     // the mips they have loaded: the memory of those before (larger mips, last in console layouts) belongs
     // to other textures, so it takes no tiles (texture_sync).
     volatile u32 view_first_mip; // 0xFFFFFFFF until a view (0 for textures the title made itself)
+    u32 validation_flags;        // what the console debug layer checks for it: kept, nothing checks
 };
 
 void console_resource_init();
+
+// CPU access to a texture's memory in the console layout (resource_cpu.cpp): the WriteToSubresource and
+// ReadFromSubresource entries.
+HRESULT WINAPI console_resource_write_to_subresource(ConsoleResource* self, UINT subresource,
+                                                     const D3D12_BOX* box, const void* data, UINT row_pitch,
+                                                     UINT depth_pitch);
+HRESULT WINAPI console_resource_read_from_subresource(ConsoleResource* self, void* data, UINT row_pitch,
+                                                      UINT depth_pitch, UINT subresource,
+                                                      const D3D12_BOX* box);
 
 HRESULT console_create_placed_resource(ConsoleDevice* device, u64 gpu_address,
                                        const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT initial_layout,
@@ -326,6 +389,29 @@ HRESULT console_create_committed_resource(ConsoleDevice* device, const D3D12_HEA
                                           D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC1* desc,
                                           D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE* clear,
                                           REFIID iid, void** out);
+
+// The version-0 description of a resource (the console API hands out both).
+D3D12_RESOURCE_DESC console_desc0_from_desc1(const D3D12_RESOURCE_DESC1& desc);
+
+// A heap: title memory the runtime allocates for placed resources (heap.cpp).
+struct ConsoleHeap {
+    ConsoleObjectHeader header;
+
+    D3D12_HEAP_DESC desc; // size and alignment as allocated
+    void* memory;
+    u64 attributes; // of the allocation (xmem)
+};
+
+void console_heap_init();
+HRESULT console_create_heap(ConsoleDevice* device, const D3D12_HEAP_DESC* desc, REFIID iid, void** out);
+// A resource placed in a heap: a resource at the heap's address plus `offset`.
+HRESULT console_create_heap_resource(ConsoleDevice* device, ConsoleHeap* heap, u64 offset,
+                                     const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout,
+                                     const D3D12_CLEAR_VALUE* clear, REFIID iid, void** out);
+
+// A command list created closed, without an allocator: the title's first Reset gives it one.
+HRESULT console_create_closed_command_list(ConsoleDevice* device, D3D12_COMMAND_LIST_TYPE type, REFIID iid,
+                                           void** out);
 
 // Titles also describe textures by a description and an address alone, in views of placed memory
 // (the console runtime only writes the hardware descriptor). Such a texture gets a resource of ours,
@@ -363,6 +449,11 @@ bool console_translate_coherent(u64 address, u64 size, u64* desktop_address);
 // desktop slot i, and every descriptor write goes to both. Desktop D3D12 cannot read descriptors
 // back from shader-visible heaps, so those also keep a CPU-only copy that writes go to first and
 // copies read from.
+// Dwords 4-7 of an image descriptor (see ConsoleDescriptorHeap::image_words).
+struct ImageWords {
+    u32 dwords[4];
+};
+
 struct ConsoleDescriptorHeap {
     ConsoleObjectHeader header;
 
@@ -395,6 +486,16 @@ struct ConsoleDescriptorHeap {
     // Per slot, the resource without a title reference a view in it keeps (console_descriptor_keep);
     // allocated with the first one.
     ConsoleResource* volatile* keepers;
+    // Resource heaps: per slot, dwords 4-7 of the image descriptor of the view last made in it (the slot
+    // holds dwords 0-3 after its marker, see DESCRIPTOR_MARKER_IMAGE), which copies of the slot take
+    // into the descriptor shadow; allocated with the first image view.
+    ImageWords* volatile image_words;
+    // Shader-visible resource heaps: the descriptor shadow translated shaders read descriptor bits
+    // and view kinds from (see translate.h), a record per shader-visible slot, written with the slot.
+    // In system memory (an upload heap, persistently mapped): reads are few and cached.
+    ID3D12Resource* shadow;
+    u8* shadow_cpu;
+    u64 shadow_gpu;
 };
 
 // Where a console descriptor handle points.
@@ -410,18 +511,6 @@ struct DescriptorSlot {
 };
 
 void console_descriptor_heap_init();
-
-// Constant buffer views in the console's own descriptor format: the buffer address with a 16-byte
-// stride in the top bits of the first quadword, the size in 16-byte records with a fixed format word
-// on top of the second. Titles write these themselves (the console runtime inlines their creation),
-// and we write them too, so copies of descriptor memory carry the view itself.
-#define NATIVE_CBV_STRIDE_BITS  0x0010ull     // top 16 bits of the first quadword
-#define NATIVE_CBV_FORMAT_BITS  0x0002403Cull // top 32 bits of the second quadword
-#define NATIVE_CBV_ADDRESS_MASK 0x0000FFFFFFFFFFFFull
-
-// Console descriptor slots written by us start with this marker, then the slot's descriptor type
-// and its desktop CPU-only descriptor.
-#define DESCRIPTOR_MARKER_MAGIC 0x47444C53u // "SLDG"
 
 // Brings console slots [first, first + count), which the title may have written or copied itself,
 // to shader-visible desktop slots from `desktop_first`: the same index or a relocation.
@@ -448,6 +537,13 @@ void console_descriptor_keep(const DescriptorSlot& slot, ConsoleResource* resour
 
 // After copying `count` descriptors from `src` to `dest`: the copies keep what the sources keep.
 void console_descriptor_copy_keepers(const DescriptorSlot& dest, const DescriptorSlot& src, u32 count);
+
+// Before publishing an image view written to `slot` (a resource heap's): its descriptor's dwords 4-7.
+void console_descriptor_set_image_words(const DescriptorSlot& slot, const ImageWords& words);
+
+// Before publishing `count` descriptors copied from `src` to `dest`: the image descriptor dwords the
+// sources keep go with them.
+void console_descriptor_copy_image_words(const DescriptorSlot& dest, const DescriptorSlot& src, u32 count);
 
 struct ConsoleQueryHeap {
     ConsoleObjectHeader header;
@@ -482,9 +578,9 @@ HRESULT console_create_command_signature(ConsoleDevice* device, const D3D12_COMM
 // A root signature. Translated shaders read the console's user data (the root arguments as they lie
 // in user SGPRs) from root constants, and root descriptors from root SRVs/UAVs; the desktop
 // signature has that layout (see shader/translate.h).
-#define ROOT_USER_DATA_SPACE        100 // root constants (b0) and root descriptors (t<n>/u<n>, n = parameter)
-#define ROOT_STATIC_SAMPLER_SPACE   102
-#define ROOT_MAX_SIGNATURE_VARIANTS 16
+#define ROOT_USER_DATA_SPACE      100 // root constants (b0) and root descriptors (t<n>/u<n>, n = parameter)
+#define ROOT_STATIC_SAMPLER_SPACE 102
+#define ROOT_MAX_SAMPLER_SETS     3 // stages with inline samplers in one pipeline
 
 struct ConsoleRootSignature {
     ConsoleObjectHeader header;
@@ -498,14 +594,20 @@ struct ConsoleRootSignature {
     u8 user_dwords;                            // user data dwords in the desktop root constants
     u8 user_sgpr[ROOT_MAX_PARAMETERS];         // each parameter's first user SGPR
     s8 desktop_parameter[ROOT_MAX_PARAMETERS]; // root descriptors: their desktop root parameter
+    s8 shadow_parameter;                       // the descriptor shadow's root SRV, or -1 (no room)
 
-    // Desktop signatures that also carry pipelines' inline samplers, by their samplers' hash.
+    // Desktop signatures that also carry pipelines' inline samplers: one per distinct set of sampler
+    // sets, found by hash and told apart by the sets themselves (kept flattened, see
+    // console_root_signature_desktop). Grows as pipelines bring new sets.
     SRWLOCK variant_lock;
     u32 variant_count;
+    u32 variant_capacity;
     struct SignatureVariant {
         u64 key;
+        u8* sets;
+        u32 sets_size;
         ID3D12RootSignature* desktop;
-    } variants[ROOT_MAX_SIGNATURE_VARIANTS];
+    }* variants;
 };
 
 // Programs' inline samplers, for the stage that sees them.
@@ -582,14 +684,18 @@ enum PipelineVariantState : u32 {
 
 struct PipelineVariant {
     PipelineOutputs outputs;
-    volatile u32 state; // PipelineVariantState
+    volatile u32 state; // PipelineVariantState; builders wake waiters (WaitOnAddress) when it's final
+    u32 builder;        // the background job building it ahead (gpu_job_worker), or 0
     ID3D12PipelineState* desktop;
     ID3D12RootSignature* signature; // the desktop signature it was made with (owned by the signature)
+    // A wait for it reached its deadline: draws skip it until it's made.
+    volatile bool wait_ran_out;
 };
 
 // A pipeline state: the console's packet for it (public; title code copies it into command lists)
 // and its translation: shader programs, fixed-function state and desktop pipelines, made when a
-// draw first uses a set of output formats once the programs are built.
+// draw first uses a set of output formats (draws wait for them), or ahead of it where the formats
+// were drawn with before.
 struct ConsolePipelineState {
     ConsoleObjectHeader header;
     u32 packet[8];
@@ -600,14 +706,29 @@ struct ConsolePipelineState {
     ShaderProgram* programs[2]; // graphics: vertex, pixel (may be null); compute: compute
     PipelineFixedState fixed;
 
+    // Pipelines with the same programs and fixed-function state share it: what desktop pipelines
+    // drawn with are remembered by (0: not translated).
+    u64 identity;
+    // An equal pipeline (same identity and root signature) created earlier and still alive, whose
+    // desktop pipelines this one uses (referenced); or nullptr, and this one is listed for later ones.
+    ConsolePipelineState* twin;
+    ConsolePipelineState* next_listed; // in the list of pipelines later ones can be twins of
+    bool listed;
+
+    // Variants are only added (under the lock), each filled in before the count that publishes it:
+    // draws find theirs without locking.
     SRWLOCK lock;
-    u32 variant_count;
+    volatile long variant_count;
     PipelineVariant variants[PIPELINE_MAX_VARIANTS];
     volatile long skip_reported; // why its draws are skipped was logged
+    volatile long late_reported; // draws skipped while it is being made were logged
 };
 
 void console_pipeline_state_init();
 
+HRESULT console_create_graphics_pipeline_state(ConsoleDevice* device,
+                                               const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID iid,
+                                               void** out);
 HRESULT console_create_pipeline_state(ConsoleDevice* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
                                       REFIID iid, void** out);
 HRESULT console_create_compute_pipeline_state(ConsoleDevice* device,
@@ -621,12 +742,18 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice* device, bool compute,
                                            const ConsoleSerializedPipeline* serialized, REFIID iid,
                                            void** out);
 
-// The desktop pipeline for drawing (or dispatching) with `pso` to `outputs`, or nullptr while it is
-// being made or if it cannot be.
+// The desktop pipeline for drawing (or dispatching) with `pso` to `outputs`, waiting for its
+// translation and desktop pipeline if they aren't made yet, within the wait budget (see
+// gpu/shader_schedule.h); nullptr if they can't be made, or with `*building` set if they aren't made
+// by the end of the wait (logged once per pipeline): the draw is skipped, and what it needs is made
+// urgently. For the threads recording command lists: workers never wait for those, so the wait can't
+// deadlock.
 ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs,
-                                              ID3D12RootSignature** signature);
-// Logs, once per pipeline, why draws with it are skipped for good (not while its programs build).
+                                              ID3D12RootSignature** signature, bool* building);
+// Logs, once per pipeline, why draws with it are skipped.
 void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics);
+// Names the pipeline's programs in a marker on `list`, which device removal reports show.
+void console_pipeline_marker(const ConsolePipelineState* pso, ID3D12GraphicsCommandList* list);
 
 // Page pools (page_pool.cpp): title memory registered as a source of GPU page mapping copies.
 HRESULT console_register_page_pool(u64 address, u32 page_count, u32 flags, HANDLE* handle);

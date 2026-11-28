@@ -4,16 +4,42 @@
 //
 // - Every register becomes a 32-bit HLSL variable of the same name. Each desktop thread runs the
 //   console program for one console lane; scalar registers hold the same value in every thread.
-// - Lane masks (EXEC, VCC, compare results) hold, in each thread, all ones or zero in both halves:
-//   that lane's bit, broadcast. Bitwise mask operations then work unchanged, and the operations
-//   that look at the whole mask (branches on EXECZ/VCCZ, bit counts) use wave intrinsics.
+// - Lane masks (EXEC, compare results) hold, in each thread, all ones or zero: that lane's bit,
+//   broadcast. Bitwise mask operations then work unchanged, and the operations that look at the
+//   whole mask (branches on EXECZ/VCCZ, bit counts) use wave intrinsics.
 // - Scalar branches are uniform, so desktop waves stay converged; vector instructions only write
-//   lanes whose EXEC bit is set.
+//   lanes whose EXEC bit is set, except where nothing reads the other lanes before they are written
+//   again (see translate_lanes.cpp). The blocks between branches become structured HLSL control flow:
+//   if/else, loops and labelled exits rebuilt from the dominator tree (see translate_flow.cpp).
+//
+// Compute programs run with console waves mapped exactly onto desktop waves, so that cross-lane
+// operations and whole-mask queries see the console wave and nothing else:
+// - The desktop wave size is pinned to 32 ([WaveSize]). A wave32 program runs one console lane per
+//   desktop thread; a wave64 program runs two, console lanes L and L + 32 in desktop lane L: every
+//   vector register has a variable per half (v<n>_0, v<n>_1) and vector instructions are emitted once
+//   per half. Desktop groups are whole desktop waves, each one console wave (numbered at the start);
+//   the console thread IDs are computed from the console wave and lane.
+// - Mask dword h (exec_lo/exec_hi, vcc_lo/vcc_hi, ...) belongs to half h: in desktop lane L it holds
+//   bit L of that dword, broadcast. 32-bit mask operations then work dword by dword unchanged.
+// - Which registers hold masks is tracked statically (written by compares, carries, saveexec, moves
+//   and bitwise operations of masks; EXEC always). Other values are plain bits, the same in every
+//   thread: they are converted to the broadcast form where used as a mask (and when written to EXEC),
+//   and masks are converted to bits (with ballots) where used as data. A register that holds a mask
+//   on one path and data on another fails translation where a conversion would depend on it.
 // - User data (the console's user SGPRs) comes from a desktop root constant block holding the same
 //   values, except that descriptor tables hold byte offsets into the desktop descriptor heaps:
 //   console code computes descriptor addresses with its own arithmetic, and the address of a loaded
 //   descriptor, divided by the slot size, is its desktop heap index. Registers loaded from the heap
-//   hold the byte address of each dword instead of descriptor bits.
+//   hold the byte address of each dword instead of descriptor bits, so translation fails where a
+//   program changes a loaded descriptor or puts one together (except buffer descriptor fields a raw
+//   desktop view ignores). Where a program reads a descriptor's dwords as values, translated code
+//   reads them from the descriptor shadow (below) for that address.
+// - The descriptor shadow: a record per desktop heap slot holding the console descriptor as console
+//   heap memory would (image descriptors' eight dwords, buffer descriptors' four), followed by the kind
+//   of the desktop view in the slot. Root signature ranges don't say reliably what a slot
+//   holds (titles label them loosely, and console hardware never looks), so a program's own accesses
+//   decide: a slot written through is an unordered access view, one sampled through a shader resource
+//   view, and one only read takes the kind the shadow records.
 // - Root descriptors (buffer addresses in user data) become desktop root SRVs/UAVs read as raw
 //   buffers; registers holding their high address dword are tracked statically.
 // - Vertex fetches (loads through the vertex buffer table) become desktop input assembler inputs.
@@ -78,6 +104,9 @@ struct ShaderInfo {
     ShaderStage stage;
     u8 user_sgprs; // user SGPR count; system SGPRs follow
     u8 parameter_count;
+    // Compute shaders: the wave size the pipeline launches with (32 or 64), 0 if unknown. (Here so that
+    // it fills what used to be padding: dumps of older builds load with 0.)
+    u8 wave_size;
     UserDataParameter parameters[SHADER_MAX_ROOT_PARAMETERS];
     // Directly indexed heaps: the user SGPR holding the heap's base (the translated program's value
     // is 0, the start of the desktop heap), or NO_HEAP_SGPR.
@@ -129,16 +158,33 @@ struct InlineSampler {
 #define TABLE_REACH_UNKNOWN         0xFFFF
 #define SHADER_INLINE_SAMPLER_SPACE 103 // register s<i> holds inline sampler i
 
+// The descriptor shadow (see the model above): a raw buffer at register t0 of this space, a record per
+// desktop resource heap slot. Dwords 0-7: the console descriptor (an image descriptor whole; a buffer
+// descriptor in dwords 0-3, zeros after); dword 8: the desktop view's kind. The dword at console heap
+// byte address A (a slot's 32 bytes, then the next slot's) is at A + A / 32 * 4 in the shadow.
+#define SHADER_DESCRIPTOR_SHADOW_SPACE 101
+#define SHADER_SHADOW_DESCRIPTOR_BYTES 32
+#define SHADER_SHADOW_RECORD_BYTES     36
+#define SHADER_SHADOW_KIND_OFFSET      32
+
+enum ShadowViewKind : u32 {
+    SHADOW_VIEW_NONE = 0, // a null view or nothing written
+    SHADOW_VIEW_SRV = 1,
+    SHADOW_VIEW_UAV = 2,
+    SHADOW_VIEW_CBV = 3, // a constant buffer, viewed as a raw shader resource view
+};
+
 // The translation's result: HLSL source plus what the pipeline needs to know about it.
 struct TranslatedShader {
     Text hlsl;
     u32 vertex_element_mask; // vertex shaders: input layout elements the shader reads (by index)
     u32 vs_param_mask;       // vertex shaders: exported parameters
     u32 ps_attribute_mask;   // pixel shaders: attributes read
-    u32 ps_mixed_mask;       // pixel shaders: attributes read both flat and interpolated
+    u32 ps_mixed_mask;       // pixel shaders: attributes declared flat, interpolated in the shader
     u32 ps_target_mask;      // pixel shaders: render targets written
     bool ps_writes_depth;
     bool ps_discards;
+    bool uses_int64_atomics; // 64-bit atomics on typed views of the descriptor heap (an optional feature)
     // Vertex shaders: the desktop input format of each element read (raw fetches read dwords).
     u32 element_format[SHADER_MAX_VERTEX_ELEMENTS];
     u32 sampler_count;
@@ -146,9 +192,19 @@ struct TranslatedShader {
     // Per root parameter: descriptor tables' slots the program loads from (one past the last), which
     // can be more than the root signature declares; TABLE_REACH_UNKNOWN if not all at known places.
     u16 table_reach[SHADER_MAX_ROOT_PARAMETERS];
+    // The wave size the code itself proves (32 or 64; 0 if it doesn't tell). ShaderInfo::wave_size
+    // decides only where the code doesn't.
+    u8 code_wave_size;
     char error[160]; // why translation failed
 };
 
-// Translates `code` (RDNA 2 instructions, `size` bytes). Returns false with `out->error` set if the
-// program uses something the translator does not handle.
-bool shader_translate(const void* code, u32 size, const ShaderInfo& info, TranslatedShader* out);
+// What the desktop device runs: the wave sizes (lanes) it may launch compute waves with.
+struct ShaderTarget {
+    u8 wave_min;
+    u8 wave_max;
+};
+
+// Translates `code` (RDNA 2 instructions, `size` bytes) for `target`. Returns false with `out->error`
+// set if the program uses something the translator does not handle.
+bool shader_translate(const void* code, u32 size, const ShaderInfo& info, const ShaderTarget& target,
+                      TranslatedShader* out);

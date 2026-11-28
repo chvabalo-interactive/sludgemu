@@ -3,6 +3,22 @@
 #include "common/log.h"
 
 #define RING_MIN_SIZE MiB(16)
+// A ring this large means the GPU is far behind the submissions using it (or blocked on later work).
+#define RING_LARGE_SIZE MiB(256)
+
+// Bytes of all rings' buffers, current and retired (memory reports): upload heaps, default heaps.
+static volatile s64 g_ring_bytes[2];
+
+void gpu_ring_usage(u64* upload, u64* local) {
+    *upload = (u64)g_ring_bytes[1];
+    *local = (u64)g_ring_bytes[0];
+}
+
+// Gives up a ring's buffer, once the GPU is done with it.
+static void retire_buffer(GpuRing* r) {
+    InterlockedAdd64(&g_ring_bytes[r->upload ? 1 : 0], -(s64)r->space.size);
+    gpu_retire(r->buffer);
+}
 
 static bool create(GpuRing* r, u64 size) {
     D3D12_HEAP_PROPERTIES heap = {r->upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT};
@@ -32,84 +48,45 @@ static bool create(GpuRing* r, u64 size) {
     }
     gpu_set_name(buffer, "GPU ring (%llu MiB)", size >> 20);
     if (r->buffer)
-        gpu_retire(r->buffer); // what was handed out from it is kept alive by its users' references
+        retire_buffer(r); // what was handed out from it is kept alive by its users' references
+    InterlockedAdd64(&g_ring_bytes[r->upload ? 1 : 0], (s64)size);
     r->buffer = buffer;
     r->mapped = mapped;
-    r->size = size;
     r->address = buffer->GetGPUVirtualAddress();
-    r->head = 0;
-    r->first = r->count = 0;
+    ring_space_reset(&r->space, size);
     return true;
-}
-
-// Forgets the regions whose submission finished.
-static void reclaim(GpuRing* r) {
-    if (!r->count)
-        return;
-    u64 done = gpu_queue_completed(r->slot);
-    while (r->count && r->uses[r->first].submission && r->uses[r->first].submission <= done) {
-        r->first = (r->first + 1) % GPU_RING_MAX_USES;
-        r->count--;
-    }
-}
-
-// Where `bytes` fit between the head and the oldest region in use, or ~0.
-static u64 place(const GpuRing* r, u64 bytes, u64 alignment) {
-    if (!r->count)
-        return bytes <= r->size ? 0 : ~0ull;
-    if (r->count == GPU_RING_MAX_USES)
-        return ~0ull;
-    u64 tail = r->uses[r->first].start;
-    u64 start = ALIGN_UP(r->head, alignment);
-    if (tail < r->head) { // in use: [tail, head)
-        if (start + bytes <= r->size)
-            return start;
-        return bytes <= tail ? 0 : ~0ull; // wrap around
-    }
-    return start + bytes <= tail ? start : ~0ull; // in use: [tail, end) and [0, head)
 }
 
 bool gpu_ring_alloc(GpuRing* r, u64 bytes, u64 alignment, u64* offset) {
-    if (!r->buffer && !create(r, RING_MIN_SIZE > bytes * 2 ? RING_MIN_SIZE : ALIGN_UP(bytes * 2, MiB(1))))
+    u64 least = ALIGN_UP(bytes * 2, MiB(1));
+    if (!r->buffer && !create(r, RING_MIN_SIZE > least ? RING_MIN_SIZE : least))
         return false;
-    reclaim(r);
-    if (!r->count)
-        r->head = 0;
-    u64 start = place(r, bytes, alignment);
-    // Wait for the oldest submitted region while that makes room; else grow.
-    while (start == ~0ull && r->count && r->uses[r->first].submission) {
-        gpu_queue_wait(r->slot, r->uses[r->first].submission);
-        reclaim(r);
-        if (!r->count)
-            r->head = 0;
-        start = place(r, bytes, alignment);
-    }
-    if (start == ~0ull) {
-        u64 size = r->size * 2 > ALIGN_UP(bytes * 2, MiB(1)) ? r->size * 2 : ALIGN_UP(bytes * 2, MiB(1));
-        if (!create(r, size))
-            return false;
-        start = 0;
-    }
-    u32 at = (r->first + r->count) % GPU_RING_MAX_USES;
-    r->uses[at] = {start, start + bytes, 0};
-    r->count++;
-    r->head = start + bytes;
-    *offset = start;
-    return true;
+    ring_space_reclaim(&r->space, gpu_queue_completed(r->slot));
+    // Give back what a burst of work grew the ring to (nothing is in use when it shrinks). A failed
+    // create keeps the ring as it is.
+    u64 smaller = ring_space_shrink_size(&r->space, RING_MIN_SIZE > least ? RING_MIN_SIZE : least);
+    if (smaller && create(r, smaller))
+        LOG_I("gpu", "a GPU ring shrinks to %llu MiB", smaller >> 20);
+    if (ring_space_take(&r->space, bytes, alignment, offset))
+        return true;
+    // Waiting for the GPU to finish older regions could wait for work that waits for the caller's
+    // thread to submit more: grow instead. The ring settles at the size the work in flight needs.
+    u64 size = r->space.size * 2 > least ? r->space.size * 2 : least;
+    if (size >= RING_LARGE_SIZE)
+        LOG_W("gpu", "a GPU ring grows to %llu MiB: its queue is far behind", size >> 20);
+    if (!create(r, size))
+        return false;
+    return ring_space_take(&r->space, bytes, alignment, offset);
 }
 
 void gpu_ring_submitted(GpuRing* r, u64 number) {
-    for (u32 i = 0; i < r->count; i++) {
-        GpuRing::Use& u = r->uses[(r->first + i) % GPU_RING_MAX_USES];
-        if (!u.submission)
-            u.submission = number;
-    }
+    ring_space_submitted(&r->space, number);
 }
 
 void gpu_ring_release(GpuRing* r) {
     if (r->buffer)
-        gpu_retire(r->buffer);
+        retire_buffer(r);
     r->buffer = nullptr;
     r->mapped = nullptr;
-    r->size = 0;
+    ring_space_reset(&r->space, 0);
 }

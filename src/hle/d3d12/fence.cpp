@@ -4,6 +4,7 @@
 // to signal and wait from the GPU. Each fence gets an 8-byte slot in blocks of title memory; the
 // slot's address finds the fence again when a command list names it.
 
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "common/log.h"
@@ -185,6 +186,10 @@ static HRESULT WINAPI fence_signal(ConsoleFence* self, UINT64 value) {
     return self->desktop->Signal(value);
 }
 
+HRESULT console_fence_signal_cpu(ConsoleFence* fence, u64 value) {
+    return fence_signal(fence, value);
+}
+
 static D3D12_FENCE_FLAGS WINAPI fence_get_creation_flags(ConsoleFence* self) {
     return self->desktop->GetCreationFlags();
 }
@@ -247,6 +252,22 @@ static void on_counter_store(u64 base, u64) {
         release_trap_locked(c, value);
     }
     ReleaseSRWLockExclusive(&g_fence_lock);
+}
+
+// The value in memory tells a store we missed (memory past the fence) from one not made yet.
+void console_fence_name(ID3D12Fence* fence, char* out, u32 size) {
+    AcquireSRWLockShared(&g_fence_lock);
+    for (u32 i = 0; i < COUNTER_CAPACITY; i++) {
+        const CounterFence& c = g_counters[i];
+        if (c.address && c.fence == fence) {
+            snprintf(out, size, "counter 0x%llx (memory reads %llu%s)", c.address, *(volatile u64*)c.address,
+                     c.trapped ? "" : ", stores not trapped");
+            ReleaseSRWLockShared(&g_fence_lock);
+            return;
+        }
+    }
+    ReleaseSRWLockShared(&g_fence_lock);
+    snprintf(out, size, "fence %p (no title counter)", (void*)fence);
 }
 
 void console_fence_init() {

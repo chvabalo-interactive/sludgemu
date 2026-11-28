@@ -1,8 +1,11 @@
 cmake_minimum_required(VERSION 3.24)
 project(sludgemu LANGUAGES C CXX)
 
-if(NOT MSVC)
-    message(FATAL_ERROR "sludgemu currently requires MSVC (the title ABI is MSVC x64).")
+# The title ABI is MSVC x64; sludgemu is built with clang-cl (Visual Studio 18 / 2026, see
+# CMakePresets.json): it speaks that ABI and its flags below are what the code is written against.
+if(NOT (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+    message(FATAL_ERROR "sludgemu requires clang-cl (Visual Studio 18 2026 with the C++ Clang tools); "
+        "use a preset from CMakePresets.json.")
 endif()
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "sludgemu must be built for x64.")
@@ -21,14 +24,37 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# Common compile options for everything we build.
+# Optimized builds of everything, third-party libraries included: ThinLTO (cross translation unit
+# inlining at link time, in parallel and cached), full inlining (CMake's RelWithDebInfo default is
+# /Ob1) and one section per function and variable so the linker can drop unreferenced and fold
+# identical ones (/DEBUG turns that off unless asked for).
+set(SLUDGE_LTO_JOBS "" CACHE STRING "ThinLTO backend threads at link time (empty: one per physical core)")
+add_compile_options("$<$<NOT:$<CONFIG:Debug>>:-flto=thin;/Ob2;/Gy;/Gw>")
+# /INCREMENTAL:NO: lld-link never links incrementally, and CMake's default /INCREMENTAL for
+# RelWithDebInfo only earns a warning next to /OPT:REF.
+add_link_options("$<$<NOT:$<CONFIG:Debug>>:/OPT:REF;/OPT:ICF;/INCREMENTAL:NO>")
+add_link_options("$<$<NOT:$<CONFIG:Debug>>:/lldltocache:${CMAKE_BINARY_DIR}/lto_cache>")
+if(SLUDGE_LTO_JOBS)
+    add_link_options("$<$<NOT:$<CONFIG:Debug>>:/opt:lldltojobs=${SLUDGE_LTO_JOBS}>")
+endif()
+
+# Common compile options for our own code.
 add_library(sludge_options INTERFACE)
 target_compile_options(sludge_options INTERFACE
-    /W4 /WX- /permissive- /utf-8 /Zi /Zc:__cplusplus /Zc:preprocessor
-    /GR-          # no RTTI
-    /EHs-c-       # no C++ exceptions
-    /wd4100       # unreferenced parameter (stubs have lots of these)
-    /wd4201       # nameless struct/union
+    /W4 /WX- /permissive- /utf-8 /Zi
+    /GR-                    # no RTTI
+    /EHs-c-                 # no C++ exceptions
+    # The code reinterprets console descriptors, command packets and title memory through other
+    # types; type-based alias analysis would be free to reorder those accesses. clang-cl already
+    # defaults to this (as MSVC behaves), stated so that it never silently changes.
+    -fno-strict-aliasing
+    -Wno-unused-parameter   # stubs and fixed-signature callbacks have lots of these
+    # Partial aggregate initialization (`MEMORYSTATUSEX m = {sizeof(m)};`) zero-fills the rest by
+    # definition; it is the intended idiom for Win32 and D3D12 structures, not an oversight.
+    -Wno-missing-field-initializers
+    # COM-compatible objects declare their interface's methods as virtual directly in the final class
+    # that implements them: the virtual methods are the vtable ABI, not an invitation to override.
+    -Wno-unnecessary-virtual-specifier
 )
 target_compile_definitions(sludge_options INTERFACE
     _HAS_EXCEPTIONS=0
@@ -54,6 +80,7 @@ FetchContent_Declare(libdeflate
     GIT_TAG v1.26
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(libdeflate)
+target_compile_options(libdeflate_static PRIVATE /w) # third-party: not our warnings to fix
 
 # libopus: Opus decoding for the console audio decoder (XApu). It picks its C runtime itself.
 set(OPUS_STATIC_RUNTIME ON CACHE BOOL "" FORCE)
@@ -67,6 +94,14 @@ FetchContent_Declare(opus
     GIT_TAG v1.5.2
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(opus)
+target_compile_options(opus PRIVATE /w) # third-party: not our warnings to fix
+# opus gives its SSE4.1 sources no target flag when the compiler is MSVC-like, as cl.exe accepts the
+# intrinsics without one; clang-cl needs -msse4.1 on exactly those files (opus picks them at run time
+# by CPU feature, so the rest of the library must stay baseline).
+get_target_property(opus_sse41_sources opus SOURCES)
+list(FILTER opus_sse41_sources INCLUDE REGEX "_sse4_1[.]c$")
+list(TRANSFORM opus_sse41_sources PREPEND "${opus_SOURCE_DIR}/")
+set_source_files_properties(${opus_sse41_sources} TARGET_DIRECTORY opus PROPERTIES COMPILE_OPTIONS -msse4.1)
 
 include(cmake/addrlib.cmake)
 

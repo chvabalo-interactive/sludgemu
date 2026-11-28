@@ -37,7 +37,7 @@ static u64 descriptor_memory_attributes(u64 size) {
                                true);
 }
 
-// --- heap registry: console handle -> heap -----------------------------------------------------------
+// --- heap registry: console handle -> heap, desktop CPU descriptor -> heap ---------------------------
 
 struct HeapEntry {
     u64 base;
@@ -45,18 +45,21 @@ struct HeapEntry {
     ConsoleDescriptorHeap* heap;
 };
 
+// Every live heap twice: by its console memory (handles titles pass) and by its CPU-only desktop
+// descriptors (which slot markers name).
 static struct {
-    HeapEntry* entries; // sorted by base, non-overlapping
+    HeapEntry* by_console; // sorted by base, non-overlapping
+    HeapEntry* by_desktop;
     u32 count;
     u32 capacity;
     SRWLOCK lock;
-} g_heaps = {nullptr, 0, 0, SRWLOCK_INIT};
+} g_heaps = {nullptr, nullptr, 0, 0, SRWLOCK_INIT};
 
-static u32 heaps_at_or_below(u64 address) {
+static u32 entries_at_or_below(const HeapEntry* entries, u64 address) {
     u32 lo = 0, hi = g_heaps.count;
     while (lo < hi) {
         u32 mid = lo + (hi - lo) / 2;
-        if (g_heaps.entries[mid].base <= address)
+        if (entries[mid].base <= address)
             lo = mid + 1;
         else
             hi = mid;
@@ -64,29 +67,52 @@ static u32 heaps_at_or_below(u64 address) {
     return lo;
 }
 
+// The heap whose range in `entries` holds `address`, or nullptr. Under the lock.
+static ConsoleDescriptorHeap* heap_holding(const HeapEntry* entries, u64 address) {
+    u32 at = entries_at_or_below(entries, address);
+    return at > 0 && address < entries[at - 1].end ? entries[at - 1].heap : nullptr;
+}
+
+static void insert_entry(HeapEntry* entries, HeapEntry entry) {
+    u32 at = entries_at_or_below(entries, entry.base);
+    memmove(&entries[at + 1], &entries[at], (g_heaps.count - at) * sizeof(HeapEntry));
+    entries[at] = entry;
+}
+
+static void remove_entry(HeapEntry* entries, u64 base, ConsoleDescriptorHeap* heap) {
+    u32 at = entries_at_or_below(entries, base);
+    if (at > 0 && entries[at - 1].heap == heap)
+        memmove(&entries[at - 1], &entries[at], (g_heaps.count - at) * sizeof(HeapEntry));
+}
+
 static void register_heap(ConsoleDescriptorHeap* heap) {
     AcquireSRWLockExclusive(&g_heaps.lock);
     if (g_heaps.count == g_heaps.capacity) {
         u32 capacity = g_heaps.capacity ? g_heaps.capacity * 2 : 64;
-        HeapEntry* grown = (HeapEntry*)realloc(g_heaps.entries, capacity * sizeof(HeapEntry));
-        if (!grown)
+        HeapEntry* by_console = (HeapEntry*)realloc(g_heaps.by_console, capacity * sizeof(HeapEntry));
+        if (by_console)
+            g_heaps.by_console = by_console;
+        HeapEntry* by_desktop = (HeapEntry*)realloc(g_heaps.by_desktop, capacity * sizeof(HeapEntry));
+        if (by_desktop)
+            g_heaps.by_desktop = by_desktop;
+        if (!by_console || !by_desktop)
             FATAL("out of memory tracking descriptor heaps");
-        g_heaps.entries = grown;
         g_heaps.capacity = capacity;
     }
     u64 base = (u64)heap->memory;
-    u32 at = heaps_at_or_below(base);
-    memmove(&g_heaps.entries[at + 1], &g_heaps.entries[at], (g_heaps.count - at) * sizeof(HeapEntry));
-    g_heaps.entries[at] = {base, base + (u64)heap->desc.NumDescriptors * heap->stride, heap};
+    insert_entry(g_heaps.by_console, {base, base + (u64)heap->desc.NumDescriptors * heap->stride, heap});
+    insert_entry(
+        g_heaps.by_desktop,
+        {heap->cpu_start, heap->cpu_start + (u64)heap->desc.NumDescriptors * heap->desktop_stride, heap});
     g_heaps.count++;
     ReleaseSRWLockExclusive(&g_heaps.lock);
 }
 
 static void unregister_heap(ConsoleDescriptorHeap* heap) {
     AcquireSRWLockExclusive(&g_heaps.lock);
-    u32 at = heaps_at_or_below((u64)heap->memory);
-    if (at > 0 && g_heaps.entries[at - 1].heap == heap) {
-        memmove(&g_heaps.entries[at - 1], &g_heaps.entries[at], (g_heaps.count - at) * sizeof(HeapEntry));
+    if (heap_holding(g_heaps.by_console, (u64)heap->memory) == heap) {
+        remove_entry(g_heaps.by_console, (u64)heap->memory, heap);
+        remove_entry(g_heaps.by_desktop, heap->cpu_start, heap);
         g_heaps.count--;
     }
     ReleaseSRWLockExclusive(&g_heaps.lock);
@@ -95,9 +121,8 @@ static void unregister_heap(ConsoleDescriptorHeap* heap) {
 bool console_descriptor_slots(u64 handle, u32 count, DescriptorSlot* out) {
     bool ok = false;
     AcquireSRWLockShared(&g_heaps.lock);
-    u32 at = heaps_at_or_below(handle);
-    if (at > 0 && handle < g_heaps.entries[at - 1].end) {
-        ConsoleDescriptorHeap* heap = g_heaps.entries[at - 1].heap;
+    ConsoleDescriptorHeap* heap = heap_holding(g_heaps.by_console, handle);
+    if (heap) {
         u64 offset = handle - (u64)heap->memory;
         u64 index = offset / heap->stride;
         if (offset % heap->stride == 0 && index + count <= heap->desc.NumDescriptors) {
@@ -153,6 +178,121 @@ void console_descriptor_copy_keepers(const DescriptorSlot& dest, const Descripto
         set_keeper(dest.heap, dest.index + i, src.heap->keepers[src.index + i]);
 }
 
+// --- image descriptor dwords 4-7 ---------------------------------------------------------------------
+
+static ImageWords* heap_image_words(ConsoleDescriptorHeap* heap) {
+    if (!heap->image_words) {
+        ImageWords* words = (ImageWords*)calloc(heap->desc.NumDescriptors, sizeof(ImageWords));
+        if (!words)
+            FATAL("out of memory keeping image descriptors");
+        if (InterlockedCompareExchangePointer((void* volatile*)&heap->image_words, (void*)words, nullptr))
+            free(words); // another thread was first
+    }
+    return heap->image_words;
+}
+
+void console_descriptor_set_image_words(const DescriptorSlot& slot, const ImageWords& words) {
+    heap_image_words(slot.heap)[slot.index] = words;
+}
+
+void console_descriptor_copy_image_words(const DescriptorSlot& dest, const DescriptorSlot& src, u32 count) {
+    if (!src.heap->image_words)
+        return; // no image views were made there, so the copied markers name none
+    memmove(&heap_image_words(dest.heap)[dest.index], &src.heap->image_words[src.index],
+            (usize)count * sizeof(ImageWords));
+}
+
+// Dwords 4-7 of the image descriptor in the slot whose CPU-only desktop descriptor is `desktop` (the
+// slot a view was made in, which markers name), into `out`; false if no live heap has them. `own`: the
+// heap being mirrored, which stays alive meanwhile; another heap is found and read under the registry
+// lock, as it may be going away.
+static bool image_words_by_desktop(ConsoleDescriptorHeap* own, u64 desktop, ImageWords* out) {
+    ConsoleDescriptorHeap* heap = own;
+    u64 end = own->cpu_start + (u64)own->desc.NumDescriptors * own->desktop_stride;
+    bool locked = desktop < own->cpu_start || desktop >= end;
+    if (locked) {
+        AcquireSRWLockShared(&g_heaps.lock);
+        heap = heap_holding(g_heaps.by_desktop, desktop);
+    }
+    bool found = false;
+    if (heap && heap->image_words) {
+        u64 offset = desktop - heap->cpu_start;
+        if (offset % heap->desktop_stride == 0) {
+            *out = heap->image_words[offset / heap->desktop_stride];
+            found = true;
+        }
+    }
+    if (locked)
+        ReleaseSRWLockShared(&g_heaps.lock);
+    return found;
+}
+
+// Copies the descriptor a slot marker names into `dst`, if it is a CPU-only desktop descriptor of a live
+// heap of `own`'s type; false if not (the title left a stale marker over other data, or the heap it
+// named is gone). Another heap stays registered, and so alive, while its descriptor is copied.
+static bool copy_marked_descriptor(ConsoleDescriptorHeap* own, D3D12_CPU_DESCRIPTOR_HANDLE dst, u64 source) {
+    u64 end = own->cpu_start + (u64)own->desc.NumDescriptors * own->desktop_stride;
+    if (source >= own->cpu_start && source < end) {
+        if ((source - own->cpu_start) % own->desktop_stride != 0)
+            return false;
+        gpu_device()->CopyDescriptorsSimple(1, dst, {source}, own->desktop_type);
+        return true;
+    }
+    AcquireSRWLockShared(&g_heaps.lock);
+    ConsoleDescriptorHeap* heap = heap_holding(g_heaps.by_desktop, source);
+    bool live = heap && heap->desktop_type == own->desktop_type &&
+                (source - heap->cpu_start) % heap->desktop_stride == 0;
+    if (live)
+        gpu_device()->CopyDescriptorsSimple(1, dst, {source}, own->desktop_type);
+    ReleaseSRWLockShared(&g_heaps.lock);
+    return live;
+}
+
+// --- descriptor shadow ---------------------------------------------------------------------------------
+
+// The shadow of a resource heap with `visible_count` shader-visible slots, mapped for good (upload heap
+// memory is write-combined: written, never read back). Created zeroed: no view in any slot.
+static ID3D12Resource* create_shadow(u32 visible_count, u8** mapped) {
+    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC1 desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = (u64)visible_count * SHADER_SHADOW_RECORD_BYTES;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* shadow = nullptr;
+    HRESULT hr = gpu_device()->CreateCommittedResource3(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                        D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, nullptr, 0,
+                                                        nullptr, IID_PPV_ARGS(&shadow));
+    if (SUCCEEDED(hr)) {
+        hr = shadow->Map(0, nullptr, (void**)mapped);
+        if (FAILED(hr)) {
+            shadow->Release();
+            shadow = nullptr;
+        }
+    }
+    if (FAILED(hr)) {
+        LOG_E("d3d12", "cannot create the %llu KiB descriptor shadow of a heap of %u slots (0x%08lx)",
+              desc.Width >> 10, visible_count, (unsigned long)hr);
+        return nullptr;
+    }
+    gpu_set_name(shadow, "descriptor shadow (%u slots)", visible_count);
+    return shadow;
+}
+
+// Writes the record of shader-visible slot `desktop_index` (with the descriptor copied there, and the
+// dwords 4-7 the slot of an image view keeps, see shadow_record).
+static void write_shadow(ConsoleDescriptorHeap* heap, u32 desktop_index, const u8* console,
+                         const u32* image_words) {
+    if (!heap->shadow_cpu)
+        return;
+    u32 record[SHADER_SHADOW_RECORD_BYTES / 4];
+    shadow_record(console, image_words, record);
+    memcpy(heap->shadow_cpu + (u64)desktop_index * SHADER_SHADOW_RECORD_BYTES, record, sizeof(record));
+}
+
 void console_descriptor_publish(const DescriptorSlot& slot, u32 count) {
     if (slot.heap->keepers)
         for (u32 i = 0; i < count; i++)
@@ -160,6 +300,11 @@ void console_descriptor_publish(const DescriptorSlot& slot, u32 count) {
     if (!slot.visible_cpu.ptr)
         return;
     gpu_device()->CopyDescriptorsSimple(count, slot.visible_cpu, slot.cpu, slot.type);
+    // Written through the API: the slots keep their image descriptors' dwords (copies took theirs along).
+    const ImageWords* image_words = slot.heap->image_words;
+    for (u32 i = 0; i < count; i++)
+        write_shadow(slot.heap, slot.index + i, slot.console + (u64)i * slot.heap->stride,
+                     image_words ? image_words[slot.index + i].dwords : nullptr);
     if (slot.heap->native)
         for (u32 i = 0; i < count; i++)
             slot.heap->native[slot.index + i].generation = 0;
@@ -176,14 +321,15 @@ void console_descriptor_publish(const DescriptorSlot& slot, u32 count) {
 // on top. Their desktop views are made here, and remade only when the descriptor or the memory
 // windows change.
 
-static void mirror_native_constant_buffer(ConsoleDescriptorHeap* heap, u32 desktop_index, u64 address,
-                                          u64 records) {
+static void mirror_native_constant_buffer(ConsoleDescriptorHeap* heap, u32 desktop_index, const u8* console,
+                                          u64 address, u64 records) {
     ConsoleDescriptorHeap::NativeView& seen = heap->native[desktop_index];
     u32 generation = gpu_window_generation();
     if (seen.generation == generation && seen.address == address && seen.records == records)
-        return;
+        return; // the slot and its shadow record hold this view (other writes of the slot reset `seen`)
     D3D12_CPU_DESCRIPTOR_HANDLE dst = {heap->visible_cpu_start + (u64)desktop_index * heap->desktop_stride};
     write_constant_buffer_view(address, records * 16, dst);
+    write_shadow(heap, desktop_index, console, nullptr);
     seen.address = address;
     seen.records = records;
     seen.generation = generation;
@@ -197,7 +343,6 @@ void console_descriptor_mirror(ConsoleDescriptorHeap* heap, u32 first, u32 count
     if (count > heap->visible_count - desktop_first)
         count = heap->visible_count - desktop_first;
     bool same_index = first == desktop_first;
-    ID3D12Device* device = gpu_device();
     for (u32 k = 0; k < count; k++) {
         u32 i = first + k, d = desktop_first + k;
         const u8* console = heap->memory + (u64)i * heap->stride;
@@ -205,10 +350,10 @@ void console_descriptor_mirror(ConsoleDescriptorHeap* heap, u32 first, u32 count
         memcpy(&q0, console, 8);
         memcpy(&q1, console + 8, 8);
         if (heap->native && (q0 >> 48) == NATIVE_CBV_STRIDE_BITS && (q1 >> 32) == NATIVE_CBV_FORMAT_BITS) {
-            mirror_native_constant_buffer(heap, d, q0 & NATIVE_CBV_ADDRESS_MASK, (u32)q1);
+            mirror_native_constant_buffer(heap, d, console, q0 & NATIVE_CBV_ADDRESS_MASK, (u32)q1);
             continue;
         }
-        u32 magic = (u32)q0, type = (u32)(q0 >> 32);
+        u32 magic = (u32)q0, type_word = (u32)(q0 >> 32), type = type_word & 0xFF;
         u64 source = q1;
         u64 own = heap->cpu_start + (u64)i * heap->desktop_stride;
         if (magic != DESCRIPTOR_MARKER_MAGIC || type != (u32)heap->desktop_type)
@@ -216,7 +361,16 @@ void console_descriptor_mirror(ConsoleDescriptorHeap* heap, u32 first, u32 count
         if (same_index && source == own)
             continue; // written in place, and published then
         D3D12_CPU_DESCRIPTOR_HANDLE dst = {heap->visible_cpu_start + (u64)d * heap->desktop_stride};
-        device->CopyDescriptorsSimple(1, dst, {source}, heap->desktop_type);
+        if (!copy_marked_descriptor(heap, dst, source)) {
+            LOG_W_ONCE("d3d12",
+                       "descriptor slot %u of a table names no live descriptor (0x%llx); left as it was", i,
+                       source);
+            continue;
+        }
+        // A title copy of an image view's slot: dwords 4-7 are where the view was made.
+        ImageWords words;
+        bool image = (type_word & DESCRIPTOR_MARKER_IMAGE) && image_words_by_desktop(heap, source, &words);
+        write_shadow(heap, d, console, image ? words.dwords : nullptr);
         if (heap->native)
             heap->native[d].generation = 0;
     }
@@ -251,7 +405,9 @@ static void descriptor_heap_destroy(void* object) {
     unregister_heap(heap);
     gpu_retire(heap->cpu);
     gpu_retire(heap->visible);
+    gpu_retire(heap->shadow); // unmapped with its release
     free(heap->native);
+    free(heap->image_words);
     if (heap->keepers) {
         for (u32 i = 0; i < heap->desc.NumDescriptors; i++)
             if (heap->keepers[i])
@@ -274,10 +430,18 @@ static D3D12_GPU_DESCRIPTOR_HANDLE WINAPI descriptor_heap_get_gpu_start(ConsoleD
     return {(u64)self->memory};
 }
 
+// Console sampler heaps keep their border colors in a table samplers index. Desktop samplers carry their
+// border color themselves, so there is no table to hand out; handle 0 is the heap's default one.
+static UINT WINAPI descriptor_heap_get_sampler_border_color_table_x(ConsoleDescriptorHeap*) {
+    LOG_W_ONCE("d3d12", "GetSamplerBorderColorTableX: border color tables aren't supported; handle 0");
+    return 0;
+}
+
 static const ConsoleEntry k_descriptor_heap_impl[] = {
     CONSOLE_ENTRY(8, descriptor_heap_get_desc),
     CONSOLE_ENTRY(9, descriptor_heap_get_cpu_start),
     CONSOLE_ENTRY(10, descriptor_heap_get_gpu_start),
+    CONSOLE_ENTRY(11, descriptor_heap_get_sampler_border_color_table_x),
 };
 
 void console_descriptor_heap_init() {
@@ -361,6 +525,18 @@ HRESULT console_create_descriptor_heap(ConsoleDevice* device, const D3D12_DESCRI
             visible->Release();
         return hr;
     }
+    // Translated shaders bind the descriptor shadow of the resource heap they index: without one they
+    // would read through an unbound root descriptor.
+    ID3D12Resource* shadow = nullptr;
+    u8* shadow_cpu = nullptr;
+    if (visible && d.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        shadow = create_shadow(visible_count, &shadow_cpu);
+        if (!shadow) {
+            cpu->Release();
+            visible->Release();
+            return E_OUTOFMEMORY;
+        }
+    }
 
     // Like the console runtime, take the memory from XMemAlloc, where the title's allocation hooks
     // may supply memory set aside for this heap. Handles must fit in 32 bits: console hardware
@@ -374,6 +550,8 @@ HRESULT console_create_descriptor_heap(ConsoleDevice* device, const D3D12_DESCRI
         cpu->Release();
         if (visible)
             visible->Release();
+        if (shadow)
+            shadow->Release();
         return E_OUTOFMEMORY;
     }
 
@@ -390,6 +568,9 @@ HRESULT console_create_descriptor_heap(ConsoleDevice* device, const D3D12_DESCRI
     heap->desktop_stride = g_desktop_stride[d.Type];
     heap->cpu = cpu;
     heap->visible = visible;
+    heap->shadow = shadow;
+    heap->shadow_cpu = shadow_cpu;
+    heap->shadow_gpu = shadow ? shadow->GetGPUVirtualAddress() : 0;
     heap->cpu_start = cpu->GetCPUDescriptorHandleForHeapStart().ptr;
     if (visible) {
         heap->visible_cpu_start = visible->GetCPUDescriptorHandleForHeapStart().ptr;

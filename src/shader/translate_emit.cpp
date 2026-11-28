@@ -44,12 +44,120 @@ const char* sgpr(Translator& t, u32 reg) {
 }
 
 const char* vgpr(Translator& t, u32 reg) {
+    return vgpr_half(t, reg, t.half);
+}
+
+const char* vgpr_half(Translator& t, u32 reg, u32 half) {
     use_vgpr(t, reg);
+    if (t.lanes == 2)
+        return fmt(t, "v%u_%u", reg & 255, half & 1);
     return fmt(t, "v%u", reg & 255);
 }
 
 u32 mask_dwords(const Translator& t) {
     return t.wave32 ? 1 : 2;
+}
+
+const char* exec_cond(const Translator& t) {
+    if (t.lanes == 2)
+        return t.half ? "EXEC1" : "EXEC0";
+    return "EXEC";
+}
+
+u32 lane_mask_part(const Translator& t) {
+    return t.lanes == 2 ? t.half : 0u;
+}
+
+bool sgpr_is_mask(Translator& t, u32 reg) {
+    reg &= 127;
+    return tag_kind(t.tags.sgpr[reg]) == TAG_MASK || reg == SRC_EXEC_LO || reg == SRC_EXEC_HI;
+}
+
+// A constant dword of bits in mask form: all clear and all set read the same either way.
+static const char* lane_mask_constant(Translator& t, u32 bits) {
+    if (bits == 0)
+        return "0u";
+    if (bits == 0xFFFFFFFFu)
+        return "0xffffffffu";
+    return fmt(t, "lane_mask(0x%08xu)", bits);
+}
+
+bool literal_value(const char* s, u32* value) {
+    if (strcmp(s, "0u") == 0) {
+        *value = 0;
+        return true;
+    }
+    if (strlen(s) != 11 || s[0] != '0' || s[1] != 'x' || s[10] != 'u')
+        return false;
+    u32 v = 0;
+    for (u32 i = 2; i < 10; i++) {
+        char c = s[i];
+        u32 d = c >= '0' && c <= '9' ? (u32)(c - '0') : c >= 'a' && c <= 'f' ? (u32)(c - 'a' + 10) : 16u;
+        if (d == 16)
+            return false;
+        v = v << 4 | d;
+    }
+    *value = v;
+    return true;
+}
+
+const char* lane_mask_of(Translator& t, const char* bits) {
+    u32 value;
+    if (literal_value(bits, &value))
+        return lane_mask_constant(t, value);
+    return fmt(t, "lane_mask(%s)", bits);
+}
+
+static bool is_scalar_register(const RdnaOperand& o) {
+    return o.kind == OPND_SGPR || (o.kind == OPND_SPECIAL && o.reg < 128 && o.reg != SRC_NULL);
+}
+
+const char* raw_operand(Translator& t, const RdnaInst& in, u32 i, u32 part) {
+    const RdnaOperand& o = in.src[i];
+    if (is_scalar_register(o))
+        return sgpr(t, o.reg + part);
+    return src_u32(t, in, i, TYPE_32, part);
+}
+
+const char* mask_operand(Translator& t, const RdnaInst& in, u32 i, u32 part) {
+    if (!t.exact)
+        return src_u32(t, in, i, TYPE_32, part);
+    const RdnaOperand& o = in.src[i];
+    if (is_scalar_register(o)) {
+        u32 reg = (o.reg + part) & 127;
+        u32 value;
+        if (sgpr_constant(t.tags, reg, &value) && !sgpr_is_mask(t, reg))
+            return lane_mask_constant(t, value);
+        if (sgpr_is_mask(t, reg) || sgpr_neutral(t.tags, reg))
+            return sgpr(t, reg);
+        return fmt(t, "lane_mask(%s)", sgpr(t, reg));
+    }
+    if (o.kind == OPND_VGPR) {
+        translator_fail(t, "lane mask from a vector register in %s at 0x%x", rdna_op_name(in.op), in.offset);
+        return "0u";
+    }
+    return lane_mask_of(t, src_u32(t, in, i, TYPE_32, part));
+}
+
+// Whether any lane of a mask register pair (or of a 32-bit mask in wave32 programs) is set, in scalar
+// code. Data in VCC counts its bits.
+static const char* mask_nonzero(Translator& t, u32 reg) {
+    if (!t.exact)
+        return fmt(t, "wave_any(%s)", sgpr(t, reg));
+    if (t.in_lane_op) {
+        translator_fail(t, "whole-mask test of s%u by a vector instruction at 0x%x", reg, t.inst_offset);
+        return "false";
+    }
+    bool mask = sgpr_is_mask(t, reg);
+    if (!t.wave32 && sgpr_is_mask(t, reg + 1) != mask) {
+        translator_fail(t, "s%u and s%u: one a lane mask, the other data", reg, reg + 1);
+        return "false";
+    }
+    if (mask)
+        return t.lanes == 2 ? fmt(t, "mask_any(%s, %s)", sgpr(t, reg), sgpr(t, reg + 1))
+                            : fmt(t, "wave_any(%s)", sgpr(t, reg));
+    return t.wave32 ? fmt(t, "(%s != 0u)", sgpr(t, reg))
+                    : fmt(t, "((%s | %s) != 0u)", sgpr(t, reg), sgpr(t, reg + 1));
 }
 
 static const u32 k_inline_f32[9] = {0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
@@ -61,9 +169,9 @@ static const u32 k_inline_f64_hi[9] = {0x3fe00000, 0xbfe00000, 0x3ff00000, 0xbff
 static const char* operand_u32(Translator& t, const RdnaOperand& o, OperandType type, u32 part) {
     switch (o.kind) {
     case OPND_SGPR:
-        return sgpr(t, o.reg + part);
+        return sgpr_data(t, o.reg + part);
     case OPND_VGPR:
-        return vgpr(t, o.reg + part);
+        return vgpr_data(t, o.reg + part);
     case OPND_LITERAL:
         return part ? "0u" : fmt(t, "0x%08xu", o.value);
     case OPND_INLINE: {
@@ -87,16 +195,16 @@ static const char* operand_u32(Translator& t, const RdnaOperand& o, OperandType 
         case SRC_EXEC_LO:
         case SRC_EXEC_HI:
         case SRC_M0:
-            return sgpr(t, o.reg + part);
+            return sgpr_data(t, o.reg + part);
         case SRC_NULL:
             return "0u";
         case SRC_SCC:
             t.scc_used = true;
             return "(scc ? 1u : 0u)";
         case SRC_VCCZ:
-            return "(wave_any(s106) ? 0u : 1u)";
+            return fmt(t, "(%s ? 0u : 1u)", mask_nonzero(t, SRC_VCC_LO));
         case SRC_EXECZ:
-            return "(wave_any(s126) ? 0u : 1u)";
+            return fmt(t, "(%s ? 0u : 1u)", mask_nonzero(t, SRC_EXEC_LO));
         default:
             translator_fail(t, "unsupported operand %u", o.reg);
             return "0u";
@@ -105,6 +213,46 @@ static const char* operand_u32(Translator& t, const RdnaOperand& o, OperandType 
         translator_fail(t, "missing operand");
         return "0u";
     }
+}
+
+const char* register_data(Translator& t, Tag tag, const char* raw, bool vector) {
+    if (!heap_loaded(tag) || t.copying)
+        return raw;
+    u32 payload = tag_payload(tag);
+    if (payload & HEAP_MODIFIED)
+        translator_fail(t, "register read as a value at 0x%x holds a descriptor dword on some paths only",
+                        t.inst_offset);
+    else if ((payload & 1) == HEAP_SAMPLERS)
+        translator_fail(t, "sampler descriptor dword read as a value at 0x%x", t.inst_offset);
+    // The shadow holds each desktop slot's descriptor as console heap memory does, image descriptors'
+    // dwords too (shadow_at finds the dword at a heap byte address). Lanes outside EXEC may hold anything
+    // in a vector register, and the shadow, a root descriptor, has no bounds: they read the first record
+    // instead.
+    t.needs_descriptor_info = true;
+    if (vector)
+        return fmt(t, "g_descriptor_info.Load(shadow_at(%s ? %s : 0u))", exec_cond(t), raw);
+    return fmt(t, "g_descriptor_info.Load(shadow_at(%s))", raw);
+}
+
+// With exact lanes a mask is read as its bits too, with a ballot: inline in scalar code, before the
+// instruction for per-lane ones (see hoist_mask_reads; under their EXEC guards not all lanes would take
+// part). Unlike descriptor dwords, masks are converted for copies as well: only scalar moves keep the
+// mask form, and they read their sources with raw_operand.
+const char* sgpr_data(Translator& t, u32 reg) {
+    reg &= 127;
+    if (!t.exact || !sgpr_is_mask(t, reg))
+        return register_data(t, t.tags.sgpr[reg], sgpr(t, reg), false);
+    if (!t.in_lane_op)
+        return fmt(t, "mask_bits(%s)", sgpr(t, reg));
+    for (u32 k = 0; k < t.hoisted_count; k++)
+        if (t.hoisted[k] == reg)
+            return fmt(t, "mb%u_", reg);
+    translator_fail(t, "lane mask s%u read as data by a vector instruction at 0x%x", reg, t.inst_offset);
+    return "0u";
+}
+
+const char* vgpr_data(Translator& t, u32 reg) {
+    return register_data(t, t.tags.vgpr[reg & 255], vgpr(t, reg), true);
 }
 
 const char* src_u32(Translator& t, const RdnaInst& in, u32 i, OperandType type, u32 part) {
@@ -145,20 +293,66 @@ const char* float_result(Translator& t, const RdnaInst& in, const char* value) {
     return fmt(t, "asuint(%s)", v);
 }
 
+// Whether a value may be computed in lanes outside EXEC too: everything but cross-lane operations (the
+// lanes outside EXEC would take part), texture sampling with derivatives and reads through root
+// descriptors, which aren't bounds-checked (addresses there may be anything). Buffer views and LDS
+// are bounds-checked and contained, and translated code already reads them in every lane.
+static bool computable_in_every_lane(const char* value) {
+    static const char* const k_lane_bound[] = {
+        "g_root",   "WaveActive", "WavePrefix", "WaveRead",      "WaveMatch",   "WaveMulti", "QuadRead",
+        "wave_any", "wave_count", "wave_first", "wave_last",     "read_first",  "quad_any",  "mask_bits",
+        "mask_any", "Sample",     "Gather",     "LevelOfDetail", "Interlocked",
+    };
+    for (u32 i = 0; i < ARRAY_COUNT(k_lane_bound); i++)
+        if (strstr(value, k_lane_bound[i]))
+            return false;
+    return true;
+}
+
 void write_vgpr(Translator& t, const RdnaInst& in, u32 reg, const char* value) {
     const char* dst = vgpr(t, reg);
+    const RdnaOperand& d = in.dst[0];
+    u32 at = (reg - d.reg) & 255;
+    bool in_destination = d.kind == OPND_VGPR && at < (d.count ? d.count : 1u);
+    if (in_destination && at < 32)
+        t.lane_written |= 1u << at;
     if (in.has_sdwa && in.sdwa.dst_sel != SDWA_DWORD) {
         u32 sel = in.sdwa.dst_sel;
         u32 shift = sel <= SDWA_BYTE_3 ? sel * 8 : (sel - SDWA_WORD_0) * 16;
         u32 width = sel <= SDWA_BYTE_3 ? 8 : 16;
         u32 field = ((1u << width) - 1) << shift;
         const char* bits = fmt(t, "((%s << %u) & 0x%08xu)", value, shift, field);
-        if (in.sdwa.dst_unused == 2) // preserve the other bits
+        if (in.sdwa.dst_unused == 2) { // preserve the other bits
             value = fmt(t, "((%s & 0x%08xu) | %s)", dst, ~field, bits);
-        else
+            if (lane_write_replaces(t, in))
+                t.lane_check_failed = true;
+        } else {
             value = bits;
+        }
     }
-    emit(t, t.dpp_has_mask ? "if (EXEC && dpp_en_) %s = %s;" : "if (EXEC) %s = %s;", dst, value);
+    if (strcmp(value, dst) == 0)
+        return; // a move onto itself (v_mov v1, v1 and the like)
+    bool every_lane = computable_in_every_lane(value);
+    if (t.write_all_lanes) {
+        // The lanes outside EXEC are never read again (see translate_lanes.cpp): write them all, so
+        // that the old value dies here. Only the destination the analysis knows may be written so.
+        if (!in_destination || t.dpp_has_mask)
+            t.lane_check_failed = true;
+        if (every_lane) {
+            emit(t, "%s = %s;", dst, value);
+            return;
+        }
+    }
+    // The lanes outside EXEC keep the old value. In compute programs a select says so without a branch
+    // (long programs full of branches on EXEC keep the desktop compiler's jump threading busy for
+    // minutes); it computes the value in every lane. Graphics programs keep the branches, which the
+    // compiler merges into fewer instructions there.
+    if (t.dpp_has_mask)
+        emit(t, "if (%s && dpp_en_) %s = %s;", exec_cond(t), dst, value);
+    else if (every_lane && t.exact)
+        emit(t, "%s = select(%s, %s, %s);", dst, exec_cond(t), value, dst);
+    else
+        emit(t, "if (%s) %s = %s;", exec_cond(t), dst, value);
 }
 
 void write_sgpr(Translator& t, const RdnaOperand& dst, u32 part, const char* value) {
@@ -168,7 +362,13 @@ void write_sgpr(Translator& t, const RdnaOperand& dst, u32 part, const char* val
         translator_fail(t, "bad scalar destination");
         return;
     }
-    emit(t, "%s = %s;", sgpr(t, dst.reg + part), value);
+    u32 reg = (dst.reg + part) & 127;
+    if (t.exec_bits && (reg == SRC_EXEC_LO || reg == SRC_EXEC_HI))
+        value = lane_mask_of(t, value);
+    const char* name = sgpr(t, reg);
+    if (strcmp(value, name) == 0)
+        return; // a move onto itself
+    emit(t, "%s = %s;", name, value);
 }
 
 // --- pixel shader input VGPRs ------------------------------------------------------------------------
@@ -252,10 +452,33 @@ static Interpolation interpolation_of(const Translator& t, u32 reg) {
 static const char* const k_mode_names[8] = {"none",   "center",          "centroid",      "sample",
                                             "linear", "linear_centroid", "linear_sample", "flat"};
 
+// Attribute interpolation. The desktop interpolates the attributes as declared (see
+// write_attribute_declarations), so the first step (P1: P0 + I * P10) is folded into the second (P2:
+// + J * P20): only the final value is observable. The 16-bit forms interpolate one half of each
+// attribute dword, which holds two 16-bit values: the vertex shader packed them.
 static bool emit_interpolation(Translator& t, const RdnaInst& in) {
     if (t.info->stage != SHADER_PIXEL) {
         translator_fail(t, "interpolation outside a pixel shader");
         return false;
+    }
+    bool half = in.enc == ENC_VOP3;
+    if (half) {
+        // The P1LV form takes P0 from a VGPR (16-bank LDS): not what folding the first step assumes.
+        if (in.op == OP_V_INTERP_P1LV_F16) {
+            translator_fail(t, "v_interp_p1lv_f16 at 0x%x", in.offset);
+            return false;
+        }
+        for (u32 i = 0; i < in.num_src; i++) {
+            if (in.src[i].abs || in.src[i].neg) {
+                translator_fail(t, "%s with source modifiers at 0x%x", rdna_op_name(in.op), in.offset);
+                return false;
+            }
+        }
+        if (in.omod || in.op_sel) {
+            translator_fail(t, "%s with an output modifier or op_sel at 0x%x", rdna_op_name(in.op),
+                            in.offset);
+            return false;
+        }
     }
     Interpolation mode = INTERP_FLAT;
     if (in.op != OP_V_INTERP_MOV_F32) {
@@ -273,13 +496,24 @@ static bool emit_interpolation(Translator& t, const RdnaInst& in) {
     if (slot >= 32)
         slot = attr;
     t.attribute_modes[slot] |= (u8)(1u << mode);
+    if (half)
+        t.attribute_halves |= 1u << slot;
     t.out->ps_attribute_mask |= 1u << slot;
-    // The P1 step is folded into P2: only the final value is observable.
-    if (in.op == OP_V_INTERP_P1_F32)
+    if (in.op == OP_V_INTERP_P1_F32 || in.op == OP_V_INTERP_P1LL_F16)
         return true;
+    char chan = "xyzw"[in.attr_chan & 3];
+    if (half) {
+        // The result goes to the low half; the high half is kept.
+        const char* v =
+            fmt(t, "attr%u_%s_half(%c, %u)", slot, k_mode_names[mode], chan, in.attr_high ? 16u : 0u);
+        if (in.clamp)
+            v = fmt(t, "saturate(%s)", v);
+        const char* d = vgpr(t, in.dst[0].reg);
+        write_vgpr(t, in, in.dst[0].reg, fmt(t, "((%s & 0xffff0000u) | f32tof16(%s))", d, v));
+        return true;
+    }
     // Read through a per-mode name the declarations define (see write_attribute_declarations).
-    write_vgpr(t, in, in.dst[0].reg,
-               fmt(t, "asuint(attr%u_%s.%c)", slot, k_mode_names[mode], "xyzw"[in.attr_chan & 3]));
+    write_vgpr(t, in, in.dst[0].reg, fmt(t, "asuint(attr%u_%s.%c)", slot, k_mode_names[mode], chan));
     return true;
 }
 
@@ -400,6 +634,10 @@ static bool emit_instruction(Translator& t, const RdnaInst& in) {
         return emit_alu(t, in);
     case ENC_VINTRP:
         return emit_interpolation(t, in);
+    case ENC_VOP3:
+        if (in.op == OP_V_INTERP_P1LL_F16 || in.op == OP_V_INTERP_P1LV_F16 || in.op == OP_V_INTERP_P2_F16)
+            return emit_interpolation(t, in);
+        return emit_alu(t, in);
     case ENC_EXP:
         return emit_export(t, in);
     case ENC_SMEM:
@@ -415,80 +653,172 @@ static bool emit_instruction(Translator& t, const RdnaInst& in) {
     }
 }
 
-static void emit_block(Translator& t, u32 b) {
+// Exact lanes: instructions emitted once for the console wave. Scalar ones, and vector ones reaching
+// across lanes in ways one half at a time can't (they name both halves themselves).
+static bool whole_wave(const Translator& t, const RdnaInst& in) {
+    switch (in.enc) {
+    case ENC_SOP1:
+    case ENC_SOP2:
+    case ENC_SOPC:
+    case ENC_SOPK:
+    case ENC_SOPP:
+    case ENC_SMEM:
+        return true;
+    default:
+        break;
+    }
+    switch (in.op) {
+    case OP_V_READLANE_B32:
+    case OP_V_WRITELANE_B32:
+    case OP_V_READFIRSTLANE_B32:
+        return true;
+    case OP_DS_APPEND:
+    case OP_DS_CONSUME:
+    case OP_DS_BPERMUTE_B32:
+        return t.lanes == 2;
+    default:
+        return false;
+    }
+}
+
+static bool is_valu(const RdnaInst& in) {
+    RdnaEncoding base = rdna_op_encoding(in.op);
+    return base == ENC_VOP1 || base == ENC_VOP2 || base == ENC_VOPC || base == ENC_VOP3 || base == ENC_VOP3P;
+}
+
+// Operands vector instructions read as lane masks (the lane's bit): selects and carries in.
+static bool mask_position(const RdnaInst& in, u32 i) {
+    return i == 2 && (in.op == OP_V_CNDMASK_B32 || in.op == OP_V_ADD_CO_CI_U32 ||
+                      in.op == OP_V_SUB_CO_CI_U32 || in.op == OP_V_SUBREV_CO_CI_U32);
+}
+
+static bool writes_sgpr(const RdnaInst& in, u32 reg) {
+    for (u32 d = 0; d < 2; d++) {
+        const RdnaOperand& o = in.dst[d];
+        if (is_scalar_register(o) && ((reg - o.reg) & 127) < (o.count ? o.count : 1u))
+            return true;
+    }
+    return false;
+}
+
+// Masks a vector instruction reads as data, as bits: ballots before the instruction, where every lane
+// takes part. Returns whether it opened a scope for them.
+static bool hoist_mask_reads(Translator& t, const RdnaInst& in) {
+    t.hoisted_count = 0;
+    if (!is_valu(in))
+        return false;
+    bool opened = false;
+    for (u32 j = 0; j < in.num_src && !t.failed; j++) {
+        const RdnaOperand& o = in.src[j];
+        if (!is_scalar_register(o) || mask_position(in, j))
+            continue;
+        for (u32 k = 0; k < (o.count ? o.count : 1u); k++) {
+            u32 reg = (o.reg + k) & 127;
+            bool mask = sgpr_is_mask(t, reg);
+            // Two lanes per thread: the first half's mask result would be read by the second half.
+            if (t.lanes == 2 && !mask && writes_sgpr(in, reg)) {
+                translator_fail(t, "%s at 0x%x reads s%u, which its lane mask result writes",
+                                rdna_op_name(in.op), in.offset, reg);
+                return opened;
+            }
+            bool known = false;
+            for (u32 h = 0; h < t.hoisted_count; h++)
+                known = known || t.hoisted[h] == reg;
+            if (!mask || known)
+                continue;
+            if (t.hoisted_count == SHADER_MAX_HOISTED) {
+                translator_fail(t, "too many lane masks read as data at 0x%x", in.offset);
+                return opened;
+            }
+            if (!opened) {
+                emit(t, "{");
+                t.depth++;
+                opened = true;
+            }
+            emit(t, "uint mb%u_ = mask_bits(%s);", reg, sgpr(t, reg));
+            t.hoisted[t.hoisted_count++] = (u8)reg;
+        }
+    }
+    return opened;
+}
+
+// A per-lane instruction with exact lanes: once per half.
+static void emit_lanes(Translator& t, const RdnaInst& in) {
+    bool opened = hoist_mask_reads(t, in);
+    t.in_lane_op = true;
+    for (u32 h = 0; h < t.lanes && !t.failed; h++) {
+        t.half = (u8)h;
+        emit_instruction(t, in);
+    }
+    t.in_lane_op = false;
+    t.half = 0;
+    t.hoisted_count = 0;
+    if (opened) {
+        t.depth--;
+        emit(t, "}");
+    }
+}
+
+void emit_block(Translator& t, u32 b) {
     const Block& blk = t.program.blocks[b];
     t.tags = t.block_entry[b];
     for (u32 i = blk.first; i < blk.end && !t.failed; i++) {
         const RdnaInst& in = t.program.insts[i];
-        emit_instruction(t, in);
+        t.inst_offset = in.offset;
+        t.copying = copies_tags(t, t.tags, in, i);
+        t.write_all_lanes = t.lane_write[i] != 0;
+        t.lane_written = 0;
+        if (!t.exact || whole_wave(t, in))
+            emit_instruction(t, in);
+        else
+            emit_lanes(t, in);
+        if (!lane_write_complete(t, in, t.lane_written))
+            t.lane_check_failed = true;
         tags_transfer(t, t.tags, in, i);
     }
+    t.write_all_lanes = false;
 }
 
-// The condition under which a block's last instruction branches.
-static const char* branch_condition(Translator& t, const RdnaInst& in) {
+const char* branch_condition(Translator& t, const RdnaInst& in, bool negate) {
+    const char* test = "true";
+    bool taken_if_set = true;
     switch (in.op) {
     case OP_S_CBRANCH_SCC0:
-        t.scc_used = true;
-        return "!scc";
     case OP_S_CBRANCH_SCC1:
         t.scc_used = true;
-        return "scc";
+        test = "scc";
+        taken_if_set = in.op == OP_S_CBRANCH_SCC1;
+        break;
     case OP_S_CBRANCH_VCCZ:
-        use_sgpr(t, SRC_VCC_LO);
-        return "!wave_any(s106)";
     case OP_S_CBRANCH_VCCNZ:
-        use_sgpr(t, SRC_VCC_LO);
-        return "wave_any(s106)";
+        test = mask_nonzero(t, SRC_VCC_LO);
+        taken_if_set = in.op == OP_S_CBRANCH_VCCNZ;
+        break;
     case OP_S_CBRANCH_EXECZ:
-        return "!wave_any(s126)";
     case OP_S_CBRANCH_EXECNZ:
-        return "wave_any(s126)";
+        test = mask_nonzero(t, SRC_EXEC_LO);
+        taken_if_set = in.op == OP_S_CBRANCH_EXECNZ;
+        break;
     default:
-        return "true";
+        return negate ? "false" : "true";
     }
-}
-
-#define PC_EXIT 0xFFFFFFFFu
-
-// Several blocks: a loop over a switch on the block number. Branch conditions are uniform, so the
-// whole wave always takes the same case.
-static void emit_blocks(Translator& t) {
-    const Program& p = t.program;
-    if (p.block_count == 1) {
-        emit_block(t, 0);
-        return;
-    }
-    emit(t, "uint pc = 0;");
-    emit(t, "[loop] while (pc != 0x%08xu) {", PC_EXIT);
-    t.depth++;
-    emit(t, "switch (pc) {");
-    for (u32 b = 0; b < p.block_count && !t.failed; b++) {
-        emit(t, "case %u: {", b);
-        t.depth++;
-        emit_block(t, b);
-        const Block& blk = p.blocks[b];
-        const RdnaInst& last = p.insts[blk.end - 1];
-        u32 next0 = blk.next[0] < 0 ? PC_EXIT : (u32)blk.next[0];
-        if (blk.next[1] >= 0)
-            emit(t, "pc = %s ? %uu : %uu;", branch_condition(t, last), next0, (u32)blk.next[1]);
-        else
-            emit(t, "pc = %uu;", next0);
-        emit(t, "break;");
-        t.depth--;
-        emit(t, "}");
-    }
-    emit(t, "default: pc = 0x%08xu; break;", PC_EXIT);
-    emit(t, "}");
-    t.depth--;
-    emit(t, "}");
+    return taken_if_set != negate ? test : fmt(t, "!%s", test);
 }
 
 // --- the program -------------------------------------------------------------------------------------
 
+static const char k_preamble_head[] = "// Translated console shader.\n";
+static const char k_exec_one[] = "#define EXEC (s126 != 0u)\n";
+// Two lanes per thread: an EXEC test per half (see translate.h).
+static const char k_exec_two[] = "#define EXEC0 (s126 != 0u)\n#define EXEC1 (s127 != 0u)\n";
+
+// Exact lanes (desktop waves of 32 lanes): masks between broadcast form and bits.
+static const char k_exact_helpers[] =
+    "uint mask_bits(uint m) { return WaveActiveBallot(m != 0u).x; }\n"
+    "bool mask_any(uint lo, uint hi) { return WaveActiveAnyTrue(lo != 0u || hi != 0u); }\n"
+    "uint lane_mask(uint bits) { return mask_of(((bits >> WaveGetLaneIndex()) & 1u) != 0u); }\n";
+
 static const char k_preamble[] =
-    "// Translated console shader.\n"
-    "#define EXEC (s126 != 0u)\n"
     "uint mask_of(bool b) { return b ? 0xffffffffu : 0u; }\n"
     "bool wave_any(uint m) { return WaveActiveAnyTrue(m != 0u); }\n"
     "uint wave_count(uint m) { uint4 b = WaveActiveBallot(m != 0u); return countbits(b.x) + countbits(b.y) + "
@@ -502,7 +832,8 @@ static const char k_preamble[] =
     // The first clear bit of a console mask `width` bits wide: lanes the desktop wave lacks count as clear.
     "uint wave_first_zero(uint m, uint width) { uint4 b = WaveActiveBallot(m != 0u); uint lo = ~b.x, hi = "
     "width > 32u ? ~b.y : 0u; return lo ? firstbitlow(lo) : hi ? 32u + firstbitlow(hi) : 0xffffffffu; }\n"
-    "uint read_first(uint v, uint m) { uint lane = WaveActiveMin(m != 0u ? WaveGetLaneIndex() : 0xffffffffu); "
+    "uint read_first(uint v, uint m) { uint lane = WaveActiveMin(m != 0u ? WaveGetLaneIndex() : "
+    "0xffffffffu); "
     "return WaveActiveBitOr(WaveGetLaneIndex() == (lane == 0xffffffffu ? 0u : lane) ? v : 0u); }\n"
     "float mul_legacy(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }\n"
     "uint f32_to_u32(float f) { return f != f ? 0u : f >= 4294967040.0f ? 0xffffffffu : f <= 0.0f ? 0u : "
@@ -557,7 +888,20 @@ static const char k_preamble[] =
     "a.y >= a.x ? v.x : (v.x < 0.0f ? v.z : -v.z); }\n"
     "float cube_tc(float3 v) { float3 a = abs(v); return a.z >= a.x && a.z >= a.y ? -v.y : a.y >= a.x ? (v.y "
     "< "
-    "0.0f ? -v.z : v.z) : -v.y; }\n";
+    "0.0f ? -v.z : v.z) : -v.y; }\n"
+    // Cube sampling takes face coordinates on console (s, t in [1, 2] across the face, then
+    // slice * 8 + face), desktop a direction: cube_coord turns them back into one, the inverse of
+    // cube_sc/cube_tc above with the major axis at 1. Face-space gradients stay in the face's plane.
+    "uint cube_face(float f) { return (uint)round(max(f, 0.0f)); }\n"
+    "float3 cube_plane(uint id, float sc, float tc) { return id == 0u ? float3(0.0f, -tc, -sc) : id == 1u ? "
+    "float3(0.0f, -tc, sc) : id == 2u ? float3(sc, 0.0f, tc) : id == 3u ? float3(sc, 0.0f, -tc) : id == 4u ? "
+    "float3(sc, -tc, 0.0f) : float3(-sc, -tc, 0.0f); }\n"
+    "float3 cube_major(uint id) { float m = (id & 1u) != 0u ? -1.0f : 1.0f; return id < 2u ? float3(m, 0.0f, "
+    "0.0f) : id < 4u ? float3(0.0f, m, 0.0f) : float3(0.0f, 0.0f, m); }\n"
+    "float4 cube_coord(float s, float t, float face) { uint f = cube_face(face); uint id = min(f & 7u, 5u); "
+    "return float4(cube_major(id) + cube_plane(id, 2.0f * s - 3.0f, 2.0f * t - 3.0f), (float)(f >> 3)); }\n"
+    "float3 cube_grad(float face, float ds, float dt) { return cube_plane(min(cube_face(face) & 7u, 5u), "
+    "2.0f * ds, 2.0f * dt); }\n";
 
 static const char* interpolation_keyword(Interpolation mode) {
     switch (mode) {
@@ -597,7 +941,8 @@ static u32 raw_element_format(u32 components) {
 
 // Pixel shader inputs. An attribute read with one interpolation is declared with it. Console
 // shaders may also read some components flat and others interpolated (the hardware interpolates
-// per instruction); such attributes are declared flat and interpolated with the barycentrics.
+// per instruction); such attributes are declared flat and interpolated with the barycentrics. So are
+// attributes holding pairs of 16-bit values: each half is interpolated on its own.
 static bool write_attribute_declarations(Translator& t, Text& h) {
     static const PsInput k_untranslated[] = {PS_PERSP_PULL_MODEL, PS_LINE_STIPPLE, PS_ANCILLARY};
     static const char* const k_untranslated_names[] = {"pull-model interpolation", "line stipple",
@@ -612,7 +957,7 @@ static bool write_attribute_declarations(Translator& t, Text& h) {
     u8 interpolated_modes = 0; // modes mixed attributes need barycentrics for
     for (u32 i = 0; i < 32; i++) {
         u8 modes = t.attribute_modes[i];
-        if (modes & (modes - 1)) {
+        if ((modes & (modes - 1)) || (t.attribute_halves & (1u << i))) {
             t.out->ps_mixed_mask |= 1u << i;
             interpolated_modes |= (u8)(modes & ~(1u << INTERP_FLAT));
         }
@@ -630,7 +975,7 @@ static bool write_attribute_declarations(Translator& t, Text& h) {
         u8 modes = t.attribute_modes[i];
         if (!modes)
             continue;
-        bool mixed = (modes & (modes - 1)) != 0;
+        bool mixed = (t.out->ps_mixed_mask & (1u << i)) != 0;
         Interpolation single = INTERP_NONE;
         for (u32 m = 0; m < 8; m++)
             if (modes & (1u << m))
@@ -644,10 +989,17 @@ static bool write_attribute_declarations(Translator& t, Text& h) {
     h.put("    bool front_face : SV_IsFrontFace;\n};\n");
     for (u32 i = 0; i < 32; i++) {
         u8 modes = t.attribute_modes[i];
-        bool mixed = (modes & (modes - 1)) != 0;
+        bool mixed = (t.out->ps_mixed_mask & (1u << i)) != 0;
         for (u32 m = 1; m < 8; m++) {
             if (!(modes & (1u << m)))
                 continue;
+            // A 16-bit value: the half of channel c starting at bit s, as a float.
+            if ((t.attribute_halves & (1u << i)) && m != INTERP_FLAT)
+                h.put("#define attr%u_%s_half(c, s) ("
+                      "f16tof32(asuint(GetAttributeAtVertex(input.p%u, 0).c) >> s) * input.barycentrics.x + "
+                      "f16tof32(asuint(GetAttributeAtVertex(input.p%u, 1).c) >> s) * input.barycentrics.y + "
+                      "f16tof32(asuint(GetAttributeAtVertex(input.p%u, 2).c) >> s) * input.barycentrics.z)\n",
+                      i, k_mode_names[m], i, i, i);
             if (!mixed)
                 h.put("#define attr%u_%s input.p%u\n", i, k_mode_names[m], i);
             else if (m == INTERP_FLAT)
@@ -663,9 +1015,68 @@ static bool write_attribute_declarations(Translator& t, Text& h) {
     return true;
 }
 
+// The console thread ID VGPRs (x, y, z), from the flat index.
+static const char* thread_id(Translator& t, u32 axis, u32 half) {
+    const ShaderInfo& info = *t.info;
+    u32 tx = info.threads[0] ? info.threads[0] : 1u;
+    u32 ty = info.threads[1] ? info.threads[1] : 1u;
+    u32 tz = info.threads[2] ? info.threads[2] : 1u;
+    const char* c = half ? "thread1" : "thread0"; // the console flat thread index (write_compute_head)
+    if (axis == 0)
+        return ty * tz == 1 ? c : fmt(t, "(%s %% %uu)", c, tx);
+    if (axis == 1)
+        return ty == 1   ? "0u"
+               : tz == 1 ? fmt(t, "(%s / %uu)", c, tx)
+                         : fmt(t, "((%s / %uu) %% %uu)", c, tx, ty);
+    return tz == 1 ? "0u" : fmt(t, "(%s / %uu)", c, tx * ty);
+}
+
+// Desktop groups get 32 KiB of LDS, console ones up to 64 KiB.
+#define DESKTOP_MAX_LDS_BYTES 32768
+
+// The LDS the program's group allocates (all of it where the pipeline doesn't say), or 0 without LDS
+// accesses.
+static u32 program_lds_bytes(const Translator& t) {
+    if (!t.uses_lds)
+        return 0;
+    return t.info->lds_bytes ? t.info->lds_bytes : 65536;
+}
+
+// Compute with exact lanes (see translate.h): desktop groups of whole desktop waves of 32, one console
+// wave each. Which threads a driver puts in a wave is its business, so waves take console wave numbers
+// from a counter, and console thread IDs follow from the wave and lane.
+static void write_compute_head(Translator& t, Text& h) {
+    u32 lds_bytes = program_lds_bytes(t);
+    // Without room for the counter next to the program's LDS, its first dword holds it at the start:
+    // console LDS starts undefined.
+    bool borrow = lds_bytes + 4 > DESKTOP_MAX_LDS_BYTES;
+    bool counted = t.group_waves > 1;
+    if (counted && !borrow)
+        h.put("groupshared uint g_wave_counter;\n");
+    h.put("[WaveSize(32)]\n[numthreads(%u, 1, 1)]\n", t.group_waves * 32);
+    h.put("void main(%suint3 group_id : SV_GroupID) {\n", counted ? "uint gi : SV_GroupIndex, " : "");
+    if (counted) {
+        const char* counter = borrow ? "g_lds[0]" : "g_wave_counter";
+        h.put("    if (gi == 0u) %s = 0u;\n    GroupMemoryBarrierWithGroupSync();\n", counter);
+        h.put("    uint wave_index = 0u;\n    if (WaveIsFirstLane()) InterlockedAdd(%s, 1u, wave_index);\n",
+              counter);
+        h.put("    wave_index = WaveReadLaneFirst(wave_index);\n");
+        if (borrow)
+            h.put("    GroupMemoryBarrierWithGroupSync();\n");
+        h.put("    uint thread0 = wave_index * %uu + WaveGetLaneIndex();\n", t.lanes * 32u);
+    } else {
+        h.put("    uint thread0 = WaveGetLaneIndex();\n");
+    }
+    if (t.lanes == 2)
+        h.put("    uint thread1 = thread0 + 32u;\n");
+}
+
 static void write_declarations(Translator& t, Text& h) {
     const ShaderInfo& info = *t.info;
+    h.put("%s%s", k_preamble_head, t.lanes == 2 ? k_exec_two : k_exec_one);
     h.put("%s", k_preamble);
+    if (t.exact)
+        h.put("%s", k_exact_helpers);
     u32 user_vec4 = (info.user_sgprs + 3) / 4;
     if (user_vec4)
         h.put("cbuffer UserData : register(b0, space100) { uint4 g_user[%u]; };\n", user_vec4);
@@ -692,14 +1103,20 @@ static void write_declarations(Translator& t, Text& h) {
         }
         h.put("0u};\n");
     }
-    if (t.needs_descriptor_info)
-        h.put("ByteAddressBuffer g_descriptor_info : register(t0, space101);\n");
+    if (t.needs_descriptor_info) {
+        // A record holds a slot's descriptor, then its kind (see SHADER_SHADOW_RECORD_BYTES): the dword
+        // at heap byte address a comes after the kinds of the a / 32 slots before it.
+        h.put("ByteAddressBuffer g_descriptor_info : register(t0, space%d);\n",
+              SHADER_DESCRIPTOR_SHADOW_SPACE);
+        h.put("uint shadow_at(uint a) { return a + a / %uu * %uu; }\n", SHADER_SHADOW_DESCRIPTOR_BYTES,
+              SHADER_SHADOW_RECORD_BYTES - SHADER_SHADOW_DESCRIPTOR_BYTES);
+    }
     for (u32 i = 0; i < t.out->sampler_count; i++)
         h.put("%s g_sampler%u : register(s%u, space%d);\n",
               t.sampler_compare & (1u << i) ? "SamplerComparisonState" : "SamplerState", i, i,
               SHADER_INLINE_SAMPLER_SPACE);
     if (t.uses_lds)
-        h.put("groupshared uint g_lds[%u];\n", (info.lds_bytes ? info.lds_bytes : 65536) / 4);
+        h.put("groupshared uint g_lds[%u];\n", program_lds_bytes(t) / 4);
     h.put("struct CbArray { uint4 c[4096]; };\n");
 
     if (info.stage == SHADER_VERTEX) {
@@ -731,9 +1148,7 @@ static void write_declarations(Translator& t, Text& h) {
         h.put("};\n");
         h.put("Output main(Input input) {\n    Output output = (Output)0;\n");
     } else {
-        h.put("[numthreads(%u, %u, %u)]\n", info.threads[0] ? info.threads[0] : 1,
-              info.threads[1] ? info.threads[1] : 1, info.threads[2] ? info.threads[2] : 1);
-        h.put("void main(uint3 thread_id : SV_GroupThreadID, uint3 group_id : SV_GroupID) {\n");
+        write_compute_head(t, h);
     }
 
     // Registers: user SGPRs from the root constants, system values, the rest zero.
@@ -754,25 +1169,40 @@ static void write_declarations(Translator& t, Text& h) {
                 at++;
             }
     }
-    // EXEC starts with the lanes that run; in pixel shaders, helper lanes are off until WQM.
+    // EXEC starts with the lanes that run; in pixel shaders, helper lanes are off until WQM. Compute
+    // groups that don't fill their last console wave have its last lanes off.
+    bool partial = info.stage == SHADER_COMPUTE && t.wave_threads % (t.lanes * 32u) != 0;
     if (info.stage == SHADER_PIXEL)
         h.put("    s126 = mask_of(!IsHelperLane());\n    s127 = s126;\n");
-    else
+    else if (!partial)
         h.put("    s126 = 0xffffffffu;\n    s127 = 0xffffffffu;\n");
+    else if (t.lanes == 2)
+        h.put("    s126 = mask_of(thread0 < %uu);\n    s127 = mask_of(thread1 < %uu);\n", t.wave_threads,
+              t.wave_threads);
+    else
+        h.put("    s126 = mask_of(thread0 < %uu);\n    s127 = s126;\n", t.wave_threads);
     if (t.scc_used)
         h.put("    bool scc = false;\n");
+    if (t.far_jumps)
+        h.put("    uint go_ = 0u;\n");
     for (u32 r = 0; r < 256; r++) {
         if (!t.vgpr_used[r])
             continue;
+        if (info.stage == SHADER_COMPUTE) {
+            bool id = r < info.thread_id_count;
+            if (t.lanes == 2)
+                h.put("    uint v%u_0 = %s, v%u_1 = %s;\n", r, id ? thread_id(t, r, 0) : "0u", r,
+                      id ? thread_id(t, r, 1) : "0u");
+            else
+                h.put("    uint v%u = %s;\n", r, id ? thread_id(t, r, 0) : "0u");
+            continue;
+        }
         const char* init = "0u";
         if (info.stage == SHADER_VERTEX) {
             if (r == 0)
                 init = "input.vertex_id";
             else if (r == 3)
                 init = "input.instance_id";
-        } else if (info.stage == SHADER_COMPUTE) {
-            if (r < info.thread_id_count)
-                init = r == 0 ? "thread_id.x" : r == 1 ? "thread_id.y" : "thread_id.z";
         } else {
             static const char* const k_pos[4] = {"asuint(input.position.x)", "asuint(input.position.y)",
                                                  "asuint(input.position.z)", "asuint(input.position.w)"};
@@ -833,7 +1263,11 @@ void detect_wave_size(Translator& t) {
             (in.enc == ENC_VOP3 && in.dst[1].kind == OPND_SGPR && (in.dst[1].reg & 1u)))
             has_exec32 = true;
     }
-    t.wave32 = !has_exec64 && has_exec32;
+    // What the code proves wins (the pipeline's wave size is not verified yet); the pipeline's decides
+    // the programs whose code works either way, and wave64 if it doesn't say either.
+    u32 code = has_exec64 ? 64 : has_exec32 ? 32 : 0;
+    t.out->code_wave_size = (u8)code;
+    t.wave32 = code ? code == 32 : t.info->wave_size == 32;
 }
 
 void emit_program(Translator& t) {
@@ -841,11 +1275,15 @@ void emit_program(Translator& t) {
         layout_ps_inputs(t);
     t.depth = 1;
     t.sgpr_used[SRC_EXEC_LO] = t.sgpr_used[SRC_EXEC_HI] = 1;
-    emit_blocks(t);
+    emit_control_flow(t);
     if (t.failed)
         return;
     if (t.info->stage == SHADER_VERTEX && !t.position_exported) {
         translator_fail(t, "vertex shader without a position export");
+        return;
+    }
+    if (program_lds_bytes(t) > DESKTOP_MAX_LDS_BYTES) {
+        translator_fail(t, "%u bytes of LDS, more than a desktop group has", program_lds_bytes(t));
         return;
     }
     // Desktop input formats for the fetched elements.

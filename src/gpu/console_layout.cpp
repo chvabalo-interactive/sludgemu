@@ -171,6 +171,15 @@ u32 console_suggest_layout(const ConsoleTextureDesc& d) {
     return CONSOLE_LAYOUT_SWIZZLE | mode;
 }
 
+u32 console_swizzle_mode(const ConsoleTextureDesc& d) {
+    u32 layout = d.layout;
+    if (layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
+        return ADDR_SW_LINEAR;
+    if ((layout & ~0xF000u) < CONSOLE_LAYOUT_SWIZZLE)
+        layout = console_suggest_layout(d);
+    return layout & 0x1F;
+}
+
 // --- layouts -----------------------------------------------------------------------------------------
 
 // Computes one image plane (the color image, or the depth or stencil part of a depth format).
@@ -384,12 +393,7 @@ bool console_texture_layout(const ConsoleTextureDesc& d, ConsoleTextureLayout* o
     FormatInfo info = format_info(d.format);
     if (!g_addrlib || info.kind == FORMAT_KIND_UNKNOWN || d.width == 0 || d.height == 0)
         return false;
-    u32 layout = d.layout;
-    if (layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
-        layout = CONSOLE_LAYOUT_SWIZZLE | ADDR_SW_LINEAR;
-    else if ((layout & ~0xF000u) < CONSOLE_LAYOUT_SWIZZLE)
-        layout = console_suggest_layout(d);
-    AddrSwizzleMode swizzle = (AddrSwizzleMode)(layout & 0x1F);
+    AddrSwizzleMode swizzle = (AddrSwizzleMode)console_swizzle_mode(d);
 
     out->mip_levels = mip_count(d);
     out->dimension = d.dimension;
@@ -623,7 +627,8 @@ static const SwizzlePattern* swizzle_pattern(const ConsoleTextureDesc& d, const 
 }
 
 bool console_subresource_addressing(const ConsoleTextureDesc& d, const ConsoleTextureLayout& layout,
-                                    u32 plane, u32 mip, u32 slice, ConsoleSubresourceAddressing* out, bool check) {
+                                    u32 plane, u32 mip, u32 slice, ConsoleSubresourceAddressing* out,
+                                    bool check) {
     memset(out, 0, sizeof(*out));
     if (plane >= layout.plane_count || mip >= layout.mip_levels || d.sample_count > 1)
         return false;

@@ -14,11 +14,13 @@ int g_failures = 0;
 
 #define PAGE MEM_PAGE_SIZE
 
-static u32 g_notifications = 0;
-static const u8* g_last_notified = nullptr;
+// State the callbacks write is volatile, and so are accesses through aliases: callbacks run from the
+// fault handler in the middle of a plain store or load, which optimized builds otherwise move or fold.
+static volatile u32 g_notifications = 0;
+static const u8* volatile g_last_notified = nullptr;
 
 static void on_mapping_changed(const u8* base, u64) {
-    g_notifications++;
+    g_notifications = g_notifications + 1;
     g_last_notified = base;
 }
 
@@ -204,8 +206,8 @@ static void test_runs_and_remaps() {
 
     // Aliasing: the same frame at a second address, writes visible through both.
     CHECK(mem_map_physical(base + 20 * PAGE, 1, &other[0]));
-    base[20 * PAGE + 100] = 0x77;
-    CHECK(base[7 * PAGE + 100] == 0x77);
+    ((volatile u8*)base)[20 * PAGE + 100] = 0x77;
+    CHECK(((volatile u8*)base)[7 * PAGE + 100] == 0x77);
 
     // Unmapping returns a page to a placeholder.
     u64 invalid = MEM_INVALID_PFN;
@@ -314,6 +316,42 @@ static void test_lazy_backing() {
     mem_physical_free(pages, frames);
 }
 
+// Pages showing frames nothing has written are pending until touched; asking doesn't back them.
+static void test_pending_pages() {
+    const u32 pages = 4;
+    MemAddressLimits limits = {};
+    u8* base = (u8*)mem_reserve_placeholder(pages * PAGE, limits, 0, PAGE_READWRITE, 0);
+    CHECK(base != nullptr);
+    if (!base)
+        return;
+    CHECK(!mem_any_pending(base, pages * PAGE)); // nothing mapped
+    u64 frames[pages];
+    CHECK(mem_physical_alloc(pages, frames));
+    CHECK(mem_map_physical(base, pages, frames));
+    CHECK(mem_any_pending(base, pages * PAGE));
+    CHECK(mem_any_pending(base + 3 * PAGE, PAGE));
+    CHECK(mem_physical_bound_pages_at(base, pages * PAGE) == 0);
+    mem_prepare(base, PAGE); // backs the slice: every page here
+    CHECK(!mem_any_pending(base, pages * PAGE));
+    CHECK(mem_physical_bound_pages_at(base, pages * PAGE) == pages);
+    // A frame written through one address and shown at another has data there, though that page waits
+    // for its first touch: it isn't read as zeros.
+    base[5] = 42;
+    CHECK(mem_map_physical(base + PAGE, 1, &frames[0]));
+    CHECK(!mem_any_pending(base, pages * PAGE));
+    CHECK(base[PAGE + 5] == 42);
+    // A frame nothing has written, mapped over a backed page, is pending.
+    u64 fresh;
+    CHECK(mem_physical_alloc(1, &fresh));
+    CHECK(mem_map_physical(base + 2 * PAGE, 1, &fresh));
+    CHECK(mem_any_pending(base, pages * PAGE));
+    CHECK(mem_any_pending(base + 2 * PAGE, PAGE));
+    CHECK(!mem_any_pending(base + 3 * PAGE, PAGE));
+    CHECK(mem_release(base));
+    mem_physical_free(1, &fresh);
+    mem_physical_free(pages, frames);
+}
+
 // Large commits are reserved and committed as they're touched, a granule at a time.
 static void test_lazy_commit() {
     MemAddressLimits limits = {};
@@ -381,17 +419,17 @@ static void test_gpu_section_ranges() {
     CHECK(range_is_free(base, size));
 }
 
-static u32 g_write_reports = 0;
-static u64 g_write_base = 0, g_write_size = 0;
+static volatile u32 g_write_reports = 0;
+static volatile u64 g_write_base = 0, g_write_size = 0;
 
-static u32 g_dropped_reports; // watches ended by other memory mapped where they were
+static volatile u32 g_dropped_reports; // watches ended by other memory mapped where they were
 
 static void on_write(u64 base, u64 size, MemWriteKind kind) {
     if (kind == MEM_WATCH_DROPPED) {
-        g_dropped_reports++;
+        g_dropped_reports = g_dropped_reports + 1;
         return;
     }
-    g_write_reports++;
+    g_write_reports = g_write_reports + 1;
     g_write_base = base;
     g_write_size = size;
 }
@@ -486,12 +524,12 @@ static void test_write_watches() {
         mem_watch_writes(gpu + MiB(3), 4096);
         mem_prepare(gpu + MiB(3), MiB(1)); // commits the granule again
         CHECK(!page_writable(gpu + MiB(3)));
-        gpu[MiB(3) + 10] = 3;
+        ((volatile u8*)gpu)[MiB(3) + 10] = 3;
         CHECK(g_write_reports == 1 && g_write_base == (u64)gpu + MiB(3) && g_write_size == 4096);
         // A write elsewhere in a protected host page (small textures share pages) is caught too.
         gpu[MiB(5)] = 1;
         mem_watch_writes(gpu + MiB(5), 0x400);
-        gpu[MiB(5) + 0xB00] = 4;
+        ((volatile u8*)gpu)[MiB(5) + 0xB00] = 4;
         CHECK(g_write_reports == 2 && g_write_base == (u64)gpu + MiB(5) && g_write_size == 0x400);
         CHECK(mem_release(gpu));
     }
@@ -517,10 +555,10 @@ static void test_watch_counts() {
     mem_watch_writes(gpu, 3 * 4096, 1);     // another client's watch over the same range
     mem_unwatch_writes(gpu, 3 * 4096, 1);   // that client lets go: watch A stays
     CHECK(!page_writable(gpu) && !page_writable(gpu + 3 * 4096));
-    gpu[3 * 4096] = 1; // B's own page: B ends, A's pages stay protected
+    ((volatile u8*)gpu)[3 * 4096] = 1; // B's own page: B ends, A's pages stay protected
     CHECK(g_write_reports == 1 && g_write_base == (u64)gpu + 2 * 4096);
     CHECK(!page_writable(gpu + 2 * 4096) && page_writable(gpu + 3 * 4096));
-    gpu[2 * 4096] = 1; // now only A covers page 2
+    ((volatile u8*)gpu)[2 * 4096] = 1; // now only A covers page 2
     CHECK(g_write_reports == 2 && g_write_base == (u64)gpu && page_writable(gpu));
 
     // Two watches over one page; unwatching one keeps the page protected for the other.
@@ -528,7 +566,7 @@ static void test_watch_counts() {
     mem_watch_writes(gpu + 4 * 4096 + 0x800, 0x100);
     mem_unwatch_writes(gpu + 4 * 4096, 0x100);
     CHECK(!page_writable(gpu + 4 * 4096));
-    gpu[4 * 4096 + 0x10] = 1; // the page is written: the remaining watch ends
+    ((volatile u8*)gpu)[4 * 4096 + 0x10] = 1; // the page is written: the remaining watch ends
     CHECK(g_write_reports == 3 && g_write_base == (u64)gpu + 4 * 4096 + 0x800 &&
           page_writable(gpu + 4 * 4096));
     CHECK(mem_release(gpu));
@@ -548,11 +586,11 @@ static void test_watch_counts() {
     mem_remove_write_listener(on_write);
 }
 
-static u32 g_store_reports = 0;
-static u64 g_store_base = 0, g_store_value = 0;
+static volatile u32 g_store_reports = 0;
+static volatile u64 g_store_base = 0, g_store_value = 0;
 
 static void on_store(u64 base, u64) {
-    g_store_reports++;
+    g_store_reports = g_store_reports + 1;
     g_store_base = base;
     g_store_value = *(volatile u64*)base; // the store is done when it is reported
 }
@@ -573,12 +611,12 @@ static DWORD WINAPI store_thread(void* p) {
 // shares, by stores straddling two trapped pages and by repeated string stores; the pages stay
 // protected throughout, also while another thread stores.
 // The taken listener brings a page up to date through the host view of its memory and gives it back.
-static u32 g_taken_calls = 0;
-static const void* g_taken_addr = nullptr;
-static u8 g_taken_value = 0;
+static volatile u32 g_taken_calls = 0;
+static const void* volatile g_taken_addr = nullptr;
+static volatile u8 g_taken_value = 0;
 
 static void on_taken(const void* addr) {
-    g_taken_calls++;
+    g_taken_calls = g_taken_calls + 1;
     g_taken_addr = addr;
     MemBlock block;
     if (mem_backing_block(addr, &block)) {
@@ -685,8 +723,8 @@ static void test_store_traps() {
     CHECK(!page_writable((const void*)counter));
     *counter = 3;
     CHECK(g_store_reports == 2 && g_store_value == 3 && *counter == 3);
-    gpu[0x1800] = 7; // elsewhere on the page: reported too, the listener checks the values
-    CHECK(g_store_reports == 3 && gpu[0x1800] == 7);
+    ((volatile u8*)gpu)[0x1800] = 7; // elsewhere on the page: reported too, the listener checks the values
+    CHECK(g_store_reports == 3 && ((volatile u8*)gpu)[0x1800] == 7);
 
     // A watch on the same page ends at the first write; the trap stays.
     g_write_reports = 0;
@@ -791,6 +829,13 @@ void test_xdsp();
 void test_xma();
 void test_layout_addressing();
 void test_bcpack();
+void test_shader_translate();
+void test_shader_lanes();
+void test_shader_cache();
+void test_shader_schedule();
+void test_submission();
+void test_command_args();
+void test_shared_tiles();
 
 int main() {
     log_init(nullptr, LOG_LEVEL_WARN);
@@ -805,6 +850,7 @@ int main() {
     test_backed_release();
     test_frames_zeroed_on_reuse();
     test_lazy_backing();
+    test_pending_pages();
     test_lazy_commit();
     test_gpu_section_ranges();
     test_write_watches();
@@ -812,12 +858,19 @@ int main() {
     test_store_traps();
     test_taken_pages();
     test_device_writes();
+    test_shared_tiles();
     test_xapu_decode();
     test_xapu_convert();
     test_xdsp();
     test_xma();
     test_layout_addressing();
     test_bcpack();
+    test_shader_translate();
+    test_shader_lanes();
+    test_shader_cache();
+    test_shader_schedule();
+    test_submission();
+    test_command_args();
     printf("%s (%d failures)\n", g_failures ? "FAILED" : "passed", g_failures);
     return g_failures;
 }

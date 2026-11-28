@@ -6,9 +6,12 @@
 //   shader_tool translate <dir> <pipeline> <vs|ps>   translate one stage of a dumped pipeline to HLSL
 //   shader_tool translate-all <dir> <out dir>        translate every unique program of a dump, write
 //                                                    the HLSL and a summary of failures
-//   shader_tool retranslate <dir> <out dir>          the same for a runtime dump (SLUDGE_SHADER_DUMP:
+//   shader_tool retranslate <dir> <out dir> [-v]     the same for a runtime dump (SLUDGE_SHADER_DUMP:
 //                                                    <key>.bin code and <key>.info); HLSL goes to
-//                                                    <key>_vs/ps/cs.hlsl
+//                                                    <key>_vs/ps/cs.hlsl; -v lists every failure
+//
+// Translations are for a desktop device running compute waves of 32 lanes; --wave <min> <max> (before
+// the command) names another range of wave sizes.
 //
 // Dumps hold, per pipeline pNNNNN: _g_packet.bin, _g_meta.bin, _rs.txt (root signature as text) and
 // _vs_code.bin / _ps_code.bin.
@@ -21,6 +24,8 @@
 #include "shader/console_pipeline.h"
 #include "shader/rdna.h"
 #include "shader/translate.h"
+
+static ShaderTarget g_target = {32, 32};
 
 static u8* read_file(const char* path, u32* size) {
     FILE* f = fopen(path, "rb");
@@ -261,7 +266,7 @@ static int translate_one(const char* dir, const char* name, const char* stage) {
         return 1;
     }
     TranslatedShader out = {};
-    bool ok = shader_translate(code, size, info, &out);
+    bool ok = shader_translate(code, size, info, g_target, &out);
     if (out.hlsl.data)
         fputs(out.hlsl.data, stdout);
     if (!ok)
@@ -276,6 +281,22 @@ struct FailureCount {
     u32 count;
     char example[64];
 };
+
+// A translation error without the instruction offsets in it (" at 0x1234"), so that failures group by
+// what they are.
+static void failure_reason(const char* error, char* out, usize size) {
+    usize n = 0;
+    for (const char* p = error; *p && n + 1 < size;) {
+        if (!strncmp(p, " at 0x", 6)) {
+            p += 6;
+            while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))
+                p++;
+            continue;
+        }
+        out[n++] = *p++;
+    }
+    out[n] = 0;
+}
 
 static int translate_all(const char* dir, const char* out_dir) {
     static u64 seen[1 << 16];
@@ -300,7 +321,7 @@ static int translate_all(const char* dir, const char* out_dir) {
             u8* code = read_file(path, &size);
             if (!code)
                 continue;
-            u64 h = hash_bytes(code, size) ^ (stage ? 0x9e3779b97f4a7c15ull : 0) | 1;
+            u64 h = (hash_bytes(code, size) ^ (stage ? 0x9e3779b97f4a7c15ull : 0)) | 1;
             u32 slot = (u32)h & 0xFFFF;
             bool fresh = true;
             while (seen[slot]) {
@@ -317,7 +338,7 @@ static int translate_all(const char* dir, const char* out_dir) {
             }
             seen[slot] = h;
             programs++;
-            if (shader_translate(code, size, info, &out)) {
+            if (shader_translate(code, size, info, g_target, &out)) {
                 translated++;
                 snprintf(path, sizeof(path), "%s\\%s_%s.hlsl", out_dir, name, stage_name);
                 FILE* f = fopen(path, "w");
@@ -328,10 +349,7 @@ static int translate_all(const char* dir, const char* out_dir) {
             } else {
                 // Group by reason, ignoring offsets.
                 char reason[160];
-                snprintf(reason, sizeof(reason), "%s", out.error);
-                char* at = strstr(reason, " at 0x");
-                if (at)
-                    *at = 0;
+                failure_reason(out.error, reason, sizeof(reason));
                 u32 k = 0;
                 while (k < failure_kinds && strcmp(failures[k].reason, reason) != 0)
                     k++;
@@ -363,8 +381,10 @@ static int translate_all(const char* dir, const char* out_dir) {
 }
 
 // Translates every program of a runtime dump again: code from <key>.bin, what the translator was told
-// from <key>.info (a ShaderInfo of this build).
-static int retranslate(const char* dir, const char* out_dir) {
+// from <key>.info (a ShaderInfo of this build). Each failure's error goes to <out dir>.failures.txt (and
+// with `verbose` to the console), and the inline samplers of the programs that translate (which the HLSL
+// doesn't show) to <out dir>.samplers.txt.
+static int retranslate(const char* dir, const char* out_dir, bool verbose) {
     static FailureCount failures[512];
     u32 failure_kinds = 0, programs = 0, translated = 0;
     char pattern[MAX_PATH];
@@ -374,6 +394,11 @@ static int retranslate(const char* dir, const char* out_dir) {
     if (find == INVALID_HANDLE_VALUE)
         return 1;
     CreateDirectoryA(out_dir, nullptr);
+    char list_path[MAX_PATH];
+    snprintf(list_path, sizeof(list_path), "%s.failures.txt", out_dir);
+    FILE* list = fopen(list_path, "w");
+    snprintf(list_path, sizeof(list_path), "%s.samplers.txt", out_dir);
+    FILE* sampler_list = fopen(list_path, "w");
     TranslatedShader out = {};
     do {
         char key[32] = {};
@@ -396,7 +421,7 @@ static int retranslate(const char* dir, const char* out_dir) {
         free(info_bytes);
         programs++;
         const char* stage = info.stage == SHADER_VERTEX ? "vs" : info.stage == SHADER_PIXEL ? "ps" : "cs";
-        if (shader_translate(code, size, info, &out)) {
+        if (shader_translate(code, size, info, g_target, &out)) {
             translated++;
             snprintf(path, sizeof(path), "%s\\%s_%s.hlsl", out_dir, key, stage);
             FILE* f = fopen(path, "w");
@@ -404,12 +429,23 @@ static int retranslate(const char* dir, const char* out_dir) {
                 fputs(out.hlsl.data, f);
                 fclose(f);
             }
+            for (u32 i = 0; i < out.sampler_count && sampler_list; i++) {
+                const InlineSampler& smp = out.samplers[i];
+                fprintf(
+                    sampler_list,
+                    "%s_%s: s%u filter 0x%x address %u %u %u aniso %u compare %u border %u unnormalized %u "
+                    "bias %g lod %g..%g\n",
+                    key, stage, i, smp.filter, smp.address[0], smp.address[1], smp.address[2],
+                    smp.max_anisotropy, smp.comparison, smp.border_color, smp.unnormalized ? 1 : 0,
+                    smp.mip_bias, smp.min_lod, smp.max_lod);
+            }
         } else {
+            if (list)
+                fprintf(list, "%s_%s: %s\n", key, stage, out.error);
+            if (verbose)
+                printf("%s_%s: %s\n", key, stage, out.error);
             char reason[160];
-            snprintf(reason, sizeof(reason), "%s", out.error);
-            char* at = strstr(reason, " at 0x");
-            if (at)
-                *at = 0;
+            failure_reason(out.error, reason, sizeof(reason));
             u32 k = 0;
             while (k < failure_kinds && strcmp(failures[k].reason, reason) != 0)
                 k++;
@@ -424,6 +460,10 @@ static int retranslate(const char* dir, const char* out_dir) {
         free(code);
     } while (FindNextFileA(find, &fd));
     FindClose(find);
+    if (list)
+        fclose(list);
+    if (sampler_list)
+        fclose(sampler_list);
     out.hlsl.release();
     printf("%u programs, %u translated\n", programs, translated);
     for (;;) {
@@ -441,6 +481,12 @@ static int retranslate(const char* dir, const char* out_dir) {
 
 int main(int argc, char** argv) {
     rdna_init();
+    if (argc >= 4 && strcmp(argv[1], "--wave") == 0) {
+        g_target.wave_min = (u8)atoi(argv[2]);
+        g_target.wave_max = (u8)atoi(argv[3]);
+        argv += 3;
+        argc -= 3;
+    }
     if (argc >= 3 && strcmp(argv[1], "disasm") == 0)
         return disasm(argv[2]);
     if (argc >= 5 && strcmp(argv[1], "translate") == 0)
@@ -450,8 +496,9 @@ int main(int argc, char** argv) {
     if (argc >= 3 && strcmp(argv[1], "stats") == 0)
         return stats(argv[2], argc >= 4 ? argv[3] : nullptr);
     if (argc >= 4 && strcmp(argv[1], "retranslate") == 0)
-        return retranslate(argv[2], argv[3]);
-    fprintf(stderr, "usage: shader_tool disasm <code.bin> | stats <dir> [filter] | translate <dir> "
-                    "<pipeline> <vs|ps> | translate-all <dir> <out> | retranslate <dir> <out>\n");
+        return retranslate(argv[2], argv[3], argc >= 5 && strcmp(argv[4], "-v") == 0);
+    fprintf(stderr,
+            "usage: shader_tool [--wave <min> <max>] disasm <code.bin> | stats <dir> [filter] | "
+            "translate <dir> <pipeline> <vs|ps> | translate-all <dir> <out> | retranslate <dir> <out>\n");
     return 1;
 }

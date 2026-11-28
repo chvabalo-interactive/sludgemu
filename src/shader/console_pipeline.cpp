@@ -127,16 +127,19 @@ bool console_parse_graphics(const void* packet, usize packet_size, const void* m
     return true;
 }
 
-// The compute packet: header, threads per group (x | y << 16, then z), COMPUTE_PGM_RSRC1/RSRC2.
+// The compute packet: header, threads per group (x | y << 16, then z with launch flags above it),
+// COMPUTE_PGM_RSRC1/RSRC2.
 bool console_parse_compute(const void* packet, usize packet_size, ConsoleComputeShader* out) {
     memset(out, 0, sizeof(*out));
     const u8* pk = (const u8*)packet;
     if (packet_size < 28)
         return false;
     u32 xy = read_u32(pk + 12);
+    u32 z = read_u32(pk + 16);
     out->threads[0] = (u16)(xy & 0xFFFF);
     out->threads[1] = (u16)(xy >> 16);
-    out->threads[2] = (u16)read_u32(pk + 16);
+    out->threads[2] = (u16)z;
+    out->wave32 = ((z >> 20) & 1u) != 0;
     u32 rsrc2 = read_u32(pk + 24);
     out->user_sgprs = (u8)((rsrc2 >> 1) & 31);
     out->group_id_mask = (u8)((rsrc2 >> 7) & 7);

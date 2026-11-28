@@ -270,7 +270,6 @@ static u8 vop3_sources(RdnaOp op) {
     case OP_V_CVT_PK_I16_I32:
     case OP_V_SUB_NC_I32:
     case OP_V_ADD_NC_I32:
-    case OP_V_INTERP_P1LL_F16:
         return 2;
     default:
         return 3;
@@ -310,6 +309,11 @@ static bool is_vop3b(RdnaOp op) {
     default:
         return false;
     }
+}
+
+// The 16-bit interpolation instructions: VOP3 with the attribute in the src0 field.
+static bool is_vop3_interpolation(RdnaOp op) {
+    return op == OP_V_INTERP_P1LL_F16 || op == OP_V_INTERP_P1LV_F16 || op == OP_V_INTERP_P2_F16;
 }
 
 // --- operands ----------------------------------------------------------------------------------------
@@ -561,12 +565,37 @@ static void decode_smem(Reader& r, u32 w, u32 w1, RdnaInst* in) {
     in->mem.offset = sign_extend(bits(w1, 0, 21), 21);
 }
 
+// The src0 field holds the attribute (bits 0-5), its channel (6-7) and the half of each attribute
+// dword the value is in (8). Sources are numbered as for VINTRP: src[0] is the I or J VGPR (the src1
+// field), src[1] the src2 field (P0 values for v_interp_p1lv_f16, the first step's result for
+// v_interp_p2_f16).
+static void decode_vop3_interpolation(Reader& r, u32 w, u32 w1, RdnaInst* in) {
+    u32 attribute = bits(w1, 0, 9);
+    in->attr = (u8)(attribute & 63);
+    in->attr_chan = (u8)((attribute >> 6) & 3);
+    in->attr_high = (attribute >> 8) != 0;
+    in->num_src = in->op == OP_V_INTERP_P1LL_F16 ? 1 : 2;
+    for (u8 i = 0; i < in->num_src; i++) {
+        in->src[i] = source(r, bits(w1, 9 + 9 * i, 9), 1);
+        in->src[i].neg = bits(w1, 30 + i, 1);
+        in->src[i].abs = bits(w, 9 + i, 1);
+    }
+    in->dst[0] = vgpr(bits(w, 0, 8), 1);
+    in->omod = (u8)bits(w1, 27, 2);
+    in->clamp = bits(w, 15, 1);
+    in->op_sel = (u8)bits(w, 11, 4);
+}
+
 static void decode_vop3(Reader& r, u32 w, u32 w1, RdnaInst* in) {
     in->enc = ENC_VOP3;
     u32 opcode = bits(w, 16, 10);
     in->op = g_vop3[opcode];
     if (!in->op)
         return;
+    if (is_vop3_interpolation(in->op)) {
+        decode_vop3_interpolation(r, w, w1, in);
+        return;
+    }
     RdnaEncoding base = g_ops[in->op].enc;
     Widths wd = op_widths(in->op);
     u8 n = 3;

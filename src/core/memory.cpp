@@ -164,27 +164,16 @@ static u8* real_ptr(u32 real) {
 
 bool mem_commit_available(u64 bytes) {
     MEMORYSTATUSEX m = {sizeof(m)};
-    return !GlobalMemoryStatusEx(&m) || m.ullAvailPageFile >= bytes + MEM_COMMIT_RESERVE;
-}
-
-// Stops the title rather than take the system's last commit for title memory.
-static void require_commit(u64 bytes) {
-    if (mem_commit_available(bytes))
-        return;
-    MEMORYSTATUSEX m = {sizeof(m)};
-    GlobalMemoryStatusEx(&m);
-    FATAL("the system is nearly out of commit (%llu MiB of %llu MiB left); stopping instead of committing %llu "
-          "MiB more of title memory",
-          m.ullAvailPageFile >> 20, m.ullTotalPageFile >> 20, bytes >> 20);
+    return !GlobalMemoryStatusEx(&m) || m.ullAvailPageFile >= bytes;
 }
 
 // Creates the section for a chunk and maps it into its slot of the linear view. phys_lock held.
 static void create_chunk(u32 index) {
-    require_commit(MEM_CHUNK_SIZE);
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
                                         (DWORD)(MEM_CHUNK_SIZE >> 32), (DWORD)MEM_CHUNK_SIZE, nullptr);
     if (!section)
-        FATAL("cannot commit %llu MiB of physical memory (%lu)", MEM_CHUNK_SIZE >> 20, GetLastError());
+        FATAL("cannot commit %llu MiB of physical memory (%lu): the system is out of commit", MEM_CHUNK_SIZE >> 20,
+              GetLastError());
     u8* slot = g_mem.linear + (u64)index * MEM_CHUNK_SIZE;
     if (!g_mem.map_view3(section, GetCurrentProcess(), slot, 0, MEM_CHUNK_SIZE, MEM_REPLACE_PLACEHOLDER,
                          PAGE_READWRITE, nullptr, 0))
@@ -616,6 +605,35 @@ bool mem_is_mapped(const void* addr, u64 size) {
     return ok;
 }
 
+bool mem_any_pending(const void* addr, u64 size) {
+    const u8* p = (const u8*)addr;
+    const u8* end = p + size;
+    bool any = false;
+    AcquireSRWLockShared(&g_mem.range_lock);
+    AcquireSRWLockShared(&g_mem.phys_lock);
+    while (!any && p < end) {
+        RangeSlot* s = find_range_locked(p);
+        if (!s)
+            break;
+        const u8* range_end = s->info.base + s->info.size;
+        const u8* stop = end < range_end ? end : range_end;
+        if ((s->info.flags & MEM_RANGE_PLACEHOLDER) && s->pending) {
+            u32 first = (u32)((u64)(p - s->info.base) >> MEM_PAGE_SHIFT);
+            u32 last = (u32)(((u64)(stop - s->info.base) + MEM_PAGE_SIZE - 1) >> MEM_PAGE_SHIFT);
+            // A page waits for its first touch here even when its frame is bound already (written
+            // through another address that shows it): only an unbound frame reads as zero.
+            for (u32 page = first; !any && page < last; page++) {
+                u32 id = s->pending[page];
+                any = id != MEM_INVALID_PFN && g_mem.id_to_real[id] == MEM_INVALID_PFN;
+            }
+        }
+        p = stop;
+    }
+    ReleaseSRWLockShared(&g_mem.phys_lock);
+    ReleaseSRWLockShared(&g_mem.range_lock);
+    return any;
+}
+
 void mem_add_mapping_listener(MemMappingListener listener) {
     long n = g_mem.mapping_listener_count;
     if (n == MAX_MAPPING_LISTENERS)
@@ -954,7 +972,6 @@ static bool commit_lazy_locked(const RangeSlot* s, const u8* addr, u64 size) {
     }
     if (!reserved)
         return true;
-    require_commit(reserved);
     if (VirtualAlloc(lo, (u64)(hi - lo), MEM_COMMIT, mapping_protect(s))) {
         tracking_committed(s, (u64)lo, (u64)hi); // committing pages already there resets their protection
         return true;

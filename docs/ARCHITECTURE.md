@@ -41,8 +41,8 @@ the native loader always gives the main executable slot 0. So the title exe has 
 `sludgemu.exe`'s own implicit TLS is nothing but a 64 KiB reserve block, so its slot 0 is handed
 to the title. An exe TLS callback copies the title's TLS template into that block on every thread
 attach, which is what the native loader would do. `sludgemu.exe` therefore must not use implicit
-TLS itself: no `thread_local`, `/Zc:threadSafeInit-`, no incremental linking. Its per-thread
-state uses `TlsAlloc` slots instead. A startup check enforces this.
+TLS itself: no `thread_local`, no thread-safe statics (`/Zc:threadSafeInit-`), no incremental
+linking. Its per-thread state uses `TlsAlloc` slots instead. A startup check enforces this.
 
 The title's TLS callbacks and its hand-mapped DLLs' thread notifications run only on threads
 the title created. Running title CRT code under the loader lock on our helper threads or on host

@@ -28,3 +28,9 @@ struct ConsoleDeviceParams {
 static_assert(sizeof(ConsoleDeviceParams) == 80, "console device parameters layout");
 
 HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, REFIID iid, void** out);
+
+// Device entries beyond creating the core objects (device_x.cpp): resource and pipeline variants,
+// residency, features, footprints, and the console's debugging and tuning entries.
+struct ConsoleEntry;
+extern const ConsoleEntry k_device_x_entries[];
+extern const u32 k_device_x_entry_count;

@@ -50,11 +50,8 @@ struct MemRange {
 
 bool mem_init(u64 physical_bytes);
 
-// Whether the system can still commit `bytes` and keep MEM_COMMIT_RESERVE for everything else. Commit
-// (RAM and pagefile) is shared with every process, and Windows charges video memory allocations to it
-// too; title memory that takes the last of it makes the whole system fail, so growing title memory
-// stops the title first (a title's crash handler reading all of its memory gets there).
-#define MEM_COMMIT_RESERVE GiB(4)
+// Whether the system can commit `bytes` more right now. Commit (RAM and pagefile) is shared with every
+// process, and Windows charges video memory allocations to it too.
 bool mem_commit_available(u64 bytes);
 
 // Physical page frames ------------------------------------------------------------------------
@@ -162,6 +159,11 @@ bool mem_frames_at(const void* va, u64 count, u64* pfns);
 
 // Whether every page of [addr, addr + size) is tracked and has memory: committed, or mapped frames.
 bool mem_is_mapped(const void* addr, u64 size);
+
+// Whether any page of [addr, addr + size) shows a frame that isn't bound to memory yet (see
+// mem_map_physical): nothing has written it through any address, so it reads as zero. Readers that only need its contents (texture uploads)
+// take zeros instead of touching it, which would back the frames of its whole slice.
+bool mem_any_pending(const void* addr, u64 size);
 
 // Called after page mappings change in [base, base + size) of a tracked range, or when the range is
 // released. Called without memory locks held, possibly from any thread; must be cheap. Listeners are

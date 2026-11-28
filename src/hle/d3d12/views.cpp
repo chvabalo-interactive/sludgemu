@@ -29,9 +29,23 @@ struct TargetMarker {
 };
 static_assert(sizeof(TargetMarker) <= CONSOLE_DESCRIPTOR_SIZE_RTV, "target marker fits");
 
-static void finish_write(const DescriptorSlot& slot) {
-    SlotMarker marker = {SLOT_MARKER_MAGIC, (u32)slot.type, slot.cpu.ptr};
+// Resource slots also get the view's kind and the console descriptor (`bits`: a buffer descriptor's 4
+// dwords, with `image` an image descriptor's 8; nullptr: none) for the descriptor shadow, which
+// publishing the slot writes. The slot has room for dwords 0-3 after the marker; the heap keeps an
+// image descriptor's dwords 4-7.
+static void finish_write(const DescriptorSlot& slot, ShadowViewKind kind = SHADOW_VIEW_NONE,
+                         const u32* bits = nullptr, bool image = false) {
+    u32 type_word = (u32)slot.type | (u32)kind << 8 | (image ? DESCRIPTOR_MARKER_IMAGE : 0u);
+    SlotMarker marker = {SLOT_MARKER_MAGIC, type_word, slot.cpu.ptr};
     memcpy(slot.console, &marker, sizeof(marker)); // every console descriptor is at least 16 bytes
+    if (slot.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        static const u32 k_none[4] = {};
+        memcpy(slot.console + DESCRIPTOR_MARKER_BITS, bits ? bits : k_none, sizeof(k_none));
+        if (image) {
+            ImageWords words = {{bits[4], bits[5], bits[6], bits[7]}};
+            console_descriptor_set_image_words(slot, words);
+        }
+    }
     console_descriptor_publish(slot, 1);
 }
 
@@ -133,6 +147,24 @@ static u32 buffer_element_bytes(DXGI_FORMAT format, u32 structure_stride, bool r
     if (structure_stride)
         return structure_stride;
     return buffer_format_bytes(format);
+}
+
+// The console buffer descriptor's dwords 0-3 for a buffer view of `buffer_address` as the title
+// described it (before its desktop translation): the first element's address, the stride of
+// structured and typed views, and records counting bytes in raw views and elements in the others.
+// Views desktop can't make (null views) get no records, which programs testing the count see as empty.
+// Typed views keep their format in the desktop view only (see shadow_buffer_descriptor).
+static void buffer_descriptor_bits(u64 buffer_address, u64 first_element, u32 num_elements,
+                                   DXGI_FORMAT format, u32 structure_stride, bool raw, bool viewed,
+                                   u32 out[4]) {
+    u32 element_bytes = buffer_element_bytes(format, structure_stride, raw);
+    u64 records = raw ? (u64)num_elements * 4 : num_elements;
+    if (!viewed)
+        records = 0;
+    else if (records > 0xFFFFFFFFu)
+        records = 0xFFFFFFFFu;
+    shadow_buffer_descriptor(buffer_address + first_element * element_bytes, raw ? 0 : element_bytes,
+                             (u32)records, out);
 }
 
 static D3D12_SHADER_RESOURCE_VIEW_DESC null_srv(D3D12_SRV_DIMENSION dimension);
@@ -464,8 +496,8 @@ void write_constant_buffer_view(u64 address, u64 size, D3D12_CPU_DESCRIPTOR_HAND
     d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     ID3D12Resource* desktop = nullptr;
     if (address && size && size / 4 <= 0xFFFFFFFFu)
-        desktop =
-            apply_buffer_view(buffer_view(address, 0, (u32)(size / 4), DXGI_FORMAT_UNKNOWN, 0, true, GPU_READ), &d);
+        desktop = apply_buffer_view(
+            buffer_view(address, 0, (u32)(size / 4), DXGI_FORMAT_UNKNOWN, 0, true, GPU_READ), &d);
     if (!desktop)
         d = null_srv(D3D12_SRV_DIMENSION_BUFFER);
     gpu_device()->CreateShaderResourceView(desktop, &d, dest);
@@ -533,6 +565,8 @@ static void note_view_mips(ConsoleResource* r, const D3D12_SHADER_RESOURCE_VIEW_
         mip = d.Texture2D.MostDetailedMip;
     else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
         mip = d.Texture2DArray.MostDetailedMip;
+    else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) // cube views too (srv_cube_as_array)
+        mip = d.TextureCubeArray.MostDetailedMip;
     else
         return;
     // Views of one texture are made by one thread at a time in practice; a lost update only leaves a
@@ -545,6 +579,41 @@ static void note_view_mips(ConsoleResource* r, const D3D12_SHADER_RESOURCE_VIEW_
     }
 }
 
+// Console shaders read cube and cube array views with the same cube instructions, so the translator
+// declares every cube resource a TextureCubeArray: cube views become cube arrays of one cube. Applied
+// where a description comes in, so null views written for it later have the array dimension too.
+static void srv_cube_as_array(D3D12_SHADER_RESOURCE_VIEW_DESC* d) {
+    if (d->ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE)
+        return;
+    D3D12_TEXCUBE_SRV cube = d->TextureCube; // the union's fields differ from the third on
+    d->ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+    d->TextureCubeArray.MostDetailedMip = cube.MostDetailedMip;
+    d->TextureCubeArray.MipLevels = cube.MipLevels;
+    d->TextureCubeArray.First2DArrayFace = 0;
+    d->TextureCubeArray.NumCubes = 1;
+    d->TextureCubeArray.ResourceMinLODClamp = cube.ResourceMinLODClamp;
+}
+
+// Desktop removes the device for a cube view its texture can't take: it must be a square 2D texture
+// with the faces and mips the view names.
+static bool cube_view_ok(const ConsoleResource* r, ID3D12Resource* desktop,
+                         const D3D12_SHADER_RESOURCE_VIEW_DESC& d) {
+    D3D12_RESOURCE_DESC t = desktop->GetDesc();
+    const D3D12_TEXCUBE_ARRAY_SRV& v = d.TextureCubeArray;
+    u64 faces = (u64)v.First2DArrayFace + 6ull * v.NumCubes;
+    bool ok = t.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && t.SampleDesc.Count == 1 &&
+              t.Width == t.Height && v.NumCubes != 0 && faces <= t.DepthOrArraySize &&
+              v.MostDetailedMip < t.MipLevels &&
+              (v.MipLevels == (UINT)-1 || (u64)v.MostDetailedMip + v.MipLevels <= t.MipLevels);
+    if (!ok)
+        LOG_W_ONCE("d3d12",
+                   "cube view (faces %u + 6 x %u, mips %u + %u) of a texture of dimension %d, %llux%u, %u "
+                   "slices, %u mips, %u samples (format %d): writing null views",
+                   v.First2DArrayFace, v.NumCubes, v.MostDetailedMip, v.MipLevels, t.Dimension, t.Width,
+                   t.Height, t.DepthOrArraySize, t.MipLevels, t.SampleDesc.Count, r->desc.Format);
+    return ok;
+}
+
 static ID3D12Resource* texture_srv(ConsoleDevice* self, const ConsoleResource* r,
                                    D3D12_SHADER_RESOURCE_VIEW_DESC* d) {
     if (r && r->first_mip && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
@@ -555,6 +624,8 @@ static ID3D12Resource* texture_srv(ConsoleDevice* self, const ConsoleResource* r
     }
     ID3D12Resource* desktop = texture_view_target(r);
     if (desktop && !texture_plane_ok(self->desktop, r, desktop, srv_plane(*d), d->Format))
+        desktop = nullptr;
+    if (desktop && d->ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY && !cube_view_ok(r, desktop, *d))
         desktop = nullptr;
     if (!desktop || !texture_view_format(r, d->Format, true, &d->Format)) {
         *d = null_srv(d->ViewDimension);
@@ -571,22 +642,33 @@ void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resour
         return;
     ID3D12Resource* desktop;
     D3D12_SHADER_RESOURCE_VIEW_DESC d;
+    u32 bits[8] = {};
+    bool image = false;
     if (is_buffer(resource)) {
         const ConsoleResource* r = (const ConsoleResource*)resource;
         d = desc ? *desc : whole_buffer_srv(r);
+        bool raw = (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
+        D3D12_SHADER_RESOURCE_VIEW_DESC console = d;
         desktop = apply_buffer_view(buffer_view(r->gpu_address, d.Buffer.FirstElement, d.Buffer.NumElements,
-                                                d.Format, d.Buffer.StructureByteStride,
-                                                (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0, GPU_READ),
+                                                d.Format, d.Buffer.StructureByteStride, raw, GPU_READ),
                                     &d);
+        buffer_descriptor_bits(r->gpu_address, console.Buffer.FirstElement, console.Buffer.NumElements,
+                               console.Format, console.Buffer.StructureByteStride, raw, desktop != nullptr,
+                               bits);
     } else {
         const ConsoleResource* r = (const ConsoleResource*)resource;
         if (!r && !desc)
             return; // the console API requires one or the other
         d = desc ? *desc : whole_texture_srv(r->desc);
+        // A view without a texture is a null descriptor, zeros.
+        image = r != nullptr;
+        if (image)
+            shadow_texture_srv(r->desc, r->gpu_address, d, 0, bits);
+        srv_cube_as_array(&d);
         desktop = texture_srv(self, r, &d);
     }
     self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
-    finish_write(slot);
+    finish_write(slot, SHADOW_VIEW_SRV, bits, image);
 }
 
 void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resource, void* counter,
@@ -597,13 +679,19 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
     ID3D12Resource* desktop;
     ID3D12Resource* desktop_counter = nullptr;
     D3D12_UNORDERED_ACCESS_VIEW_DESC d;
+    u32 bits[8] = {};
+    bool image = false;
     if (is_buffer(resource)) {
         const ConsoleResource* r = (const ConsoleResource*)resource;
         d = desc ? desktop_uav_desc(desc) : whole_buffer_uav(r);
+        bool raw = (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC console = d;
         desktop = apply_buffer_view(buffer_view(r->gpu_address, d.Buffer.FirstElement, d.Buffer.NumElements,
-                                                d.Format, d.Buffer.StructureByteStride,
-                                                (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0, GPU_WRITE),
+                                                d.Format, d.Buffer.StructureByteStride, raw, GPU_WRITE),
                                     &d);
+        buffer_descriptor_bits(r->gpu_address, console.Buffer.FirstElement, console.Buffer.NumElements,
+                               console.Format, console.Buffer.StructureByteStride, raw, desktop != nullptr,
+                               bits);
         // Raw views have no counters: translated shaders reach the counter memory themselves.
         if (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)
             counter = nullptr;
@@ -622,6 +710,9 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
         if (!r && !desc)
             return;
         d = desc ? desktop_uav_desc(desc) : whole_texture_uav(r->desc);
+        image = r != nullptr;
+        if (image)
+            shadow_texture_uav(r->desc, r->gpu_address, d, bits);
         desktop = texture_view_target(r);
         // Some console textures lose UAV access on desktop (depth ones).
         if (desktop && (!(desktop->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
@@ -633,7 +724,7 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
         }
     }
     self->desktop->CreateUnorderedAccessView(desktop, desktop_counter, &d, slot.cpu);
-    finish_write(slot);
+    finish_write(slot, SHADOW_VIEW_UAV, bits, image);
 }
 
 void WINAPI device_create_render_target_view(ConsoleDevice* self, void* resource,
@@ -697,9 +788,13 @@ static void copy_range(ConsoleDevice* self, u64 dest, u64 src, u32 count, D3D12_
         return;
     }
     self->desktop->CopyDescriptorsSimple(count, d.cpu, s.cpu, d.type);
+    // The console slots first (and the image descriptor dwords the sources keep): publishing writes the
+    // shadow records from them.
+    memmove(d.console, s.console, (usize)count * console_descriptor_size(type));
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        console_descriptor_copy_image_words(d, s, count);
     console_descriptor_publish(d, count);
     console_descriptor_copy_keepers(d, s, count);
-    memmove(d.console, s.console, (usize)count * console_descriptor_size(type));
 }
 
 void WINAPI device_copy_descriptors_simple(ConsoleDevice* self, UINT count, D3D12_CPU_DESCRIPTOR_HANDLE dest,
@@ -765,28 +860,44 @@ static void unsupported_placed_texture_view(const char* kind) {
               kind);
 }
 
+u64 console_view_location_x(const void* desc, bool unordered_access) {
+    return unordered_access ? ((const ConsoleUavDescX*)desc)->location
+                            : ((const ConsoleSrvDescX*)desc)->location;
+}
+
 void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESOURCE_DESC* resource_desc,
                                            const ConsoleSrvDescX* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     DescriptorSlot slot;
     if (!resource_desc || !desc || !console_descriptor_slots(dest.ptr, 1, &slot))
         return;
     D3D12_SHADER_RESOURCE_VIEW_DESC d = desc->view;
+    srv_cube_as_array(&d);
     ID3D12Resource* desktop = nullptr;
     ConsoleResource* texture = nullptr;
+    u32 bits[8] = {};
+    bool image = false;
     if (resource_desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         d.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+        bool raw = (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
         desktop = apply_buffer_view(buffer_view(desc->location, d.Buffer.FirstElement, d.Buffer.NumElements,
-                                                d.Format, d.Buffer.StructureByteStride,
-                                                (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0, GPU_READ),
+                                                d.Format, d.Buffer.StructureByteStride, raw, GPU_READ),
                                     &d);
+        const D3D12_SHADER_RESOURCE_VIEW_DESC& console = desc->view;
+        buffer_descriptor_bits(desc->location, console.Buffer.FirstElement, console.Buffer.NumElements,
+                               console.Format, console.Buffer.StructureByteStride, raw, desktop != nullptr,
+                               bits);
     } else if (resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         if (desc->image_format)
             LOG_W_ONCE("d3d12",
                        "views of placed textures with a hardware format (%u) read the texture's own format",
                        desc->image_format);
+        // The console descriptor is the title's description as it is, the hardware format it names too.
+        D3D12_RESOURCE_DESC1 console = console_desc1_from_desc(*resource_desc);
+        shadow_texture_srv(console, desc->location, desc->view, desc->image_format, bits);
+        image = true;
         // Its desktop texture holds the mips the view reads (titles stream textures in by mip).
         u32 first_mip = d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D ? d.Texture2D.MostDetailedMip : 0;
-        texture = console_placed_texture(desc->location, console_desc1_from_desc(*resource_desc), first_mip);
+        texture = console_placed_texture(desc->location, console, first_mip);
         if (texture && texture_sync_traced(texture->desc))
             LOG_I("d3d12",
                   "texture trace: %p view at 0x%llx: dimension %d, format %d, most detailed mip %u, mips %u, "
@@ -803,7 +914,7 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
         d = null_srv(d.ViewDimension);
     }
     self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
-    finish_write(slot);
+    finish_write(slot, SHADOW_VIEW_SRV, bits, image);
     if (texture) {
         console_descriptor_keep(slot, texture);
         console_release(texture);
@@ -818,12 +929,18 @@ void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESO
     D3D12_UNORDERED_ACCESS_VIEW_DESC d = desktop_uav_desc(desc->view);
     ID3D12Resource* desktop = nullptr;
     ID3D12Resource* desktop_counter = nullptr;
+    u32 bits[8] = {};
+    bool image = false;
     if (resource_desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         d.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        bool raw = (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC console = d;
         desktop = apply_buffer_view(buffer_view(desc->location, d.Buffer.FirstElement, d.Buffer.NumElements,
-                                                d.Format, d.Buffer.StructureByteStride,
-                                                (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0, GPU_WRITE),
+                                                d.Format, d.Buffer.StructureByteStride, raw, GPU_WRITE),
                                     &d);
+        buffer_descriptor_bits(desc->location, console.Buffer.FirstElement, console.Buffer.NumElements,
+                               console.Format, console.Buffer.StructureByteStride, raw, desktop != nullptr,
+                               bits);
         if (desktop && desc->counter_location && !(d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) {
             GpuAddress c;
             if (gpu_translate(desc->counter_location + d.Buffer.CounterOffsetInBytes, 4, GPU_WRITE, &c)) {
@@ -833,14 +950,19 @@ void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESO
                 desktop = nullptr;
             }
         }
-    } else {
+    } else if (resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        // No desktop view yet, but programs reading the descriptor's bits see the title's texture.
         unsupported_placed_texture_view("unordered access");
+        shadow_texture_uav(console_desc1_from_desc(*resource_desc), desc->location, d, bits);
+        image = true;
+        d = null_uav(d.ViewDimension);
+    } else {
         d = null_uav(d.ViewDimension);
     }
     if (!desktop_counter)
         d.Buffer.CounterOffsetInBytes = 0;
     self->desktop->CreateUnorderedAccessView(desktop, desktop_counter, &d, slot.cpu);
-    finish_write(slot);
+    finish_write(slot, SHADOW_VIEW_UAV, bits, image);
 }
 
 // --- console sampler descriptions --------------------------------------------------------------------

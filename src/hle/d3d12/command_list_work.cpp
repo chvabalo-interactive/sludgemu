@@ -3,6 +3,8 @@
 
 #include "common/log.h"
 #include "gpu/formats.h"
+#include "hle/d3d12/barriers.h"
+#include "hle/d3d12/command_args.h"
 #include "hle/d3d12/command_list.h"
 
 static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAccess access, GpuAddress* out) {
@@ -15,17 +17,31 @@ static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAccess acce
 
 // --- draws and dispatches ----------------------------------------------------------------------------
 
-// The desktop pipeline and user data for a draw or dispatch. Draws are skipped while the pipeline's
-// translation is being built (or when it failed).
+// The desktop pipeline and user data for a draw or dispatch, waiting for the pipeline to be made if
+// it is not yet. Draws are skipped when it can't be made, or isn't made within the wait budget.
 static bool prepare(ConsoleCommandList* self, bool graphics) {
     ListState& s = self->state;
     ID3D12RootSignature* signature = nullptr;
     PipelineOutputs outputs = s.outputs;
     outputs.rect_list = s.topology == CONSOLE_TOPOLOGY_RECT_LIST;
+    // A sample mask from OMSetSampleMaskX makes a variant only where it differs from the pipeline's
+    // in the samples the targets have.
+    outputs.sample_mask_override = 0;
+    outputs.unused = 0;
+    outputs.sample_mask = 0;
+    u16 mask;
+    if (graphics && s.has_sample_mask_x && s.pipeline &&
+        console_sample_mask_override(s.sample_mask_x, s.pipeline->fixed.sample_mask, outputs.sample_count,
+                                     &mask)) {
+        outputs.sample_mask_override = 1;
+        outputs.sample_mask = mask;
+    }
+    bool building = false;
     ID3D12PipelineState* desktop =
-        console_pipeline_desktop(s.pipeline, graphics ? &outputs : nullptr, &signature);
+        console_pipeline_desktop(s.pipeline, graphics ? &outputs : nullptr, &signature, &building);
     if (!desktop) {
-        console_pipeline_report_skip(s.pipeline, graphics);
+        if (!building)
+            console_pipeline_report_skip(s.pipeline, graphics);
         self->skipped_draws++;
         return false;
     }
@@ -43,6 +59,8 @@ static bool prepare(ConsoleCommandList* self, bool graphics) {
         s.bound = desktop;
     }
     list_flush_user_data(self, graphics);
+    if (gpu_options().removal_reports)
+        console_pipeline_marker(s.pipeline, self->desktop);
     return true;
 }
 
@@ -150,6 +168,31 @@ static void WINAPI list_copy_resource(ConsoleCommandList* self, void* dst, void*
         self->desktop->CopyResource(d, s);
 }
 
+// The X copies add console copy flags. Most manage console compression metadata around the copy, which
+// desktop drivers do on their own (CONSOLE_COPY_FLAGS_METADATA); copies of depth or stencil samples
+// into color channels are copies between a depth and a color format, which desktop copies refuse
+// (recording one would invalidate the list), so those are skipped.
+static bool copy_flags_supported(u32 flags, const char* entry) {
+    u32 unsupported = console_copy_flags_unsupported(flags);
+    if (unsupported)
+        LOG_W_ONCE("d3d12", "%s with copy flags 0x%x (0x%x have no desktop equivalent) skipped", entry, flags,
+                   unsupported);
+    return !unsupported;
+}
+
+static void WINAPI list_copy_texture_region_x(ConsoleCommandList* self,
+                                              const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z,
+                                              const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box,
+                                              UINT flags) {
+    if (copy_flags_supported(flags, "CopyTextureRegionX"))
+        list_copy_texture_region(self, dst, x, y, z, src, box);
+}
+
+static void WINAPI list_copy_resource_x(ConsoleCommandList* self, void* dst, void* src, UINT flags) {
+    if (copy_flags_supported(flags, "CopyResourceX"))
+        list_copy_resource(self, dst, src);
+}
+
 static void WINAPI list_resolve_subresource(ConsoleCommandList* self, void* dst, UINT dst_subresource,
                                             void* src, UINT src_subresource, DXGI_FORMAT format) {
     u64 base;
@@ -157,6 +200,69 @@ static void WINAPI list_resolve_subresource(ConsoleCommandList* self, void* dst,
     ID3D12Resource* s = list_resource(src, &base, GPU_READ);
     if (d && s && format_desktop(format) != DXGI_FORMAT_UNKNOWN)
         self->desktop->ResolveSubresource(d, dst_subresource, s, src_subresource, format_desktop(format));
+}
+
+static void WINAPI list_resolve_subresource_region(ConsoleCommandList* self, void* dst, UINT dst_subresource,
+                                                   UINT x, UINT y, void* src, UINT src_subresource,
+                                                   D3D12_RECT* rect, DXGI_FORMAT format,
+                                                   D3D12_RESOLVE_MODE mode) {
+    u64 base;
+    ID3D12Resource* d = list_resource(dst, &base, GPU_WRITE);
+    ID3D12Resource* s = list_resource(src, &base, GPU_READ);
+    if (!d || !s || format_desktop(format) == DXGI_FORMAT_UNKNOWN) {
+        LOG_W_ONCE("d3d12", "ResolveSubresourceRegion without desktop textures or format %d skipped", format);
+        return;
+    }
+    self->desktop->ResolveSubresourceRegion(d, dst_subresource, x, y, s, src_subresource, rect,
+                                            format_desktop(format), mode);
+}
+
+// Atomic copies name the resources whose writes they publish; buffers are ranges of desktop buffers,
+// so their byte ranges move by where each buffer starts.
+static void atomic_copy(ConsoleCommandList* self, bool wide, void* dst, u64 dst_offset, void* src,
+                        u64 src_offset, UINT count, void* const* dependents,
+                        const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) {
+    ID3D12Resource* resources[16];
+    D3D12_SUBRESOURCE_RANGE_UINT64 moved[16];
+    u64 dst_base, src_base;
+    ID3D12Resource* d = list_resource(dst, &dst_base, GPU_WRITE);
+    ID3D12Resource* s = list_resource(src, &src_base, GPU_READ);
+    if (!d || !s || count > ARRAY_COUNT(resources)) {
+        LOG_W_ONCE("d3d12", "AtomicCopyBuffer with %u dependent resources or unbacked buffers skipped",
+                   count);
+        return;
+    }
+    for (UINT i = 0; i < count; i++) {
+        u64 base;
+        resources[i] = list_resource(dependents[i], &base, GPU_READ);
+        if (!resources[i]) {
+            LOG_W_ONCE("d3d12", "AtomicCopyBuffer dependent resource without desktop backing; skipped");
+            return;
+        }
+        moved[i] = ranges[i];
+        moved[i].Range.Begin += base;
+        moved[i].Range.End += base;
+    }
+    if (wide)
+        self->desktop->AtomicCopyBufferUINT64(d, dst_base + dst_offset, s, src_base + src_offset, count,
+                                              resources, moved);
+    else
+        self->desktop->AtomicCopyBufferUINT(d, dst_base + dst_offset, s, src_base + src_offset, count,
+                                            resources, moved);
+}
+
+static void WINAPI list_atomic_copy_buffer_uint(ConsoleCommandList* self, void* dst, UINT64 dst_offset,
+                                                void* src, UINT64 src_offset, UINT count,
+                                                void* const* dependents,
+                                                const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) {
+    atomic_copy(self, false, dst, dst_offset, src, src_offset, count, dependents, ranges);
+}
+
+static void WINAPI list_atomic_copy_buffer_uint64(ConsoleCommandList* self, void* dst, UINT64 dst_offset,
+                                                  void* src, UINT64 src_offset, UINT count,
+                                                  void* const* dependents,
+                                                  const D3D12_SUBRESOURCE_RANGE_UINT64* ranges) {
+    atomic_copy(self, true, dst, dst_offset, src, src_offset, count, dependents, ranges);
 }
 
 static void WINAPI list_copy_memory_to_memory_x(ConsoleCommandList* self, UINT64 dst, UINT64 src, UINT64 size,
@@ -270,6 +376,24 @@ static void WINAPI list_write_64bit_bottom_of_pipe_x(ConsoleCommandList* self, U
     write_bottom_of_pipe(self, dst, value, 2);
 }
 
+// The sync flags say which caches and stages to wait for: all of them, on desktop.
+static void WINAPI list_write_32bit_bottom_of_pipe_2x(ConsoleCommandList* self, UINT64 dst, UINT value, UINT,
+                                                      UINT, UINT) {
+    write_bottom_of_pipe(self, dst, value, 1);
+}
+
+static void WINAPI list_write_64bit_bottom_of_pipe_2x(ConsoleCommandList* self, UINT64 dst, UINT64 value,
+                                                      UINT, UINT, UINT) {
+    write_bottom_of_pipe(self, dst, value, 2);
+}
+
+// A write once one shader stage of earlier work is done: once all of it is, a little later than the
+// console but never early.
+static void WINAPI list_write_32bit_bottom_of_shader_x(ConsoleCommandList* self, UINT64 dst, UINT value,
+                                                       UINT) {
+    write_bottom_of_pipe(self, dst, value, 1);
+}
+
 static void WINAPI list_write_32bit_top_of_pipe_x(ConsoleCommandList* self, UINT64 dst, UINT value, UINT) {
     write_values(self, dst, &value, 1, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN);
 }
@@ -288,17 +412,38 @@ static void WINAPI list_write_buffer_immediate(ConsoleCommandList* self, UINT co
     }
 }
 
-// Fills up to what immediate writes cover; larger fills need a compute pass.
+// Fills of up to FILL_IMMEDIATE_BYTES are immediate writes, like other value writes. Larger ones write
+// the pattern once and then double the filled part with copies inside the destination (each copy
+// waits for the one before), so a fill of n bytes takes log2(n / FILL_IMMEDIATE_BYTES) copies.
+#define FILL_IMMEDIATE_BYTES 256
+
 static void fill(ConsoleCommandList* self, u64 dst, u64 size, const u32* pattern, u32 pattern_words) {
-    u32 values[64];
-    u64 words = size / 4;
-    if (size % 4 || words > ARRAY_COUNT(values)) {
-        LOG_W_ONCE("d3d12", "memory fill of %llu bytes is not supported yet; skipped", size);
+    u32 values[FILL_IMMEDIATE_BYTES / 4];
+    if (size % 4 || dst % 4) {
+        LOG_W_ONCE("d3d12", "memory fill of %llu bytes at 0x%llx isn't dword aligned; skipped", size, dst);
         return;
     }
-    for (u64 i = 0; i < words; i++)
-        values[i] = pattern[i % pattern_words];
-    write_values(self, dst, values, (u32)words, D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT);
+    u64 words = size / 4;
+    if (words <= ARRAY_COUNT(values)) {
+        for (u64 i = 0; i < words; i++)
+            values[i] = pattern[i % pattern_words];
+        write_values(self, dst, values, (u32)words, D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT);
+        return;
+    }
+    GpuAddress d;
+    if (!translate(dst, size, GPU_WRITE, &d))
+        return;
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[ARRAY_COUNT(values)];
+    for (u32 i = 0; i < ARRAY_COUNT(values); i++)
+        params[i] = {d.desktop_address + i * 4, pattern[i % pattern_words]};
+    self->desktop->WriteBufferImmediate(ARRAY_COUNT(params), params, nullptr);
+    // The filled part is always a whole number of patterns (FILL_IMMEDIATE_BYTES and its doublings are
+    // multiples of 16 bytes), so each copy continues the pattern in phase.
+    for (u64 filled = FILL_IMMEDIATE_BYTES; filled < size; filled *= 2) {
+        console_record_full_barrier(self->desktop);
+        u64 bytes = filled < size - filled ? filled : size - filled;
+        self->desktop->CopyBufferRegion(d.buffer, d.offset + filled, d.buffer, d.offset, bytes);
+    }
 }
 
 static void WINAPI list_fill_32bit_x(ConsoleCommandList* self, UINT64 dst, UINT64 size, UINT value, UINT) {
@@ -308,6 +453,10 @@ static void WINAPI list_fill_32bit_x(ConsoleCommandList* self, UINT64 dst, UINT6
 static void WINAPI list_fill_64bit_x(ConsoleCommandList* self, UINT64 dst, UINT64 size, UINT64 value, UINT) {
     u32 halves[2] = {(u32)value, (u32)(value >> 32)};
     fill(self, dst, size, halves, 2);
+}
+
+static void WINAPI list_fill_128bit_x(ConsoleCommandList* self, UINT64 dst, UINT64 size, UINT* value, UINT) {
+    fill(self, dst, size, value, 4);
 }
 
 // --- queries and predication -------------------------------------------------------------------------
@@ -364,13 +513,22 @@ const ConsoleEntry k_list_work_entries[] = {
     CONSOLE_ENTRY(62, list_copy_memory_to_memory_x),
     CONSOLE_ENTRY(63, list_fill_32bit_x),
     CONSOLE_ENTRY(64, list_fill_64bit_x),
+    CONSOLE_ENTRY(65, list_fill_128bit_x),
     CONSOLE_ENTRY(71, list_write_32bit_bottom_of_pipe_x),
     CONSOLE_ENTRY(72, list_write_64bit_bottom_of_pipe_x),
     CONSOLE_ENTRY(80, list_dispatch_x),
     CONSOLE_ENTRY(83, list_draw_indexed_x),
+    CONSOLE_ENTRY(85, list_copy_texture_region_x),
+    CONSOLE_ENTRY(86, list_copy_resource_x),
     CONSOLE_ENTRY(90, list_write_32bit_top_of_pipe_x),
     CONSOLE_ENTRY(91, list_write_64bit_top_of_pipe_x),
+    CONSOLE_ENTRY(92, list_write_32bit_bottom_of_shader_x),
+    CONSOLE_ENTRY(107, list_atomic_copy_buffer_uint),
+    CONSOLE_ENTRY(108, list_atomic_copy_buffer_uint64),
+    CONSOLE_ENTRY(111, list_resolve_subresource_region),
     CONSOLE_ENTRY(113, list_write_buffer_immediate),
+    CONSOLE_ENTRY(137, list_write_32bit_bottom_of_pipe_2x),
+    CONSOLE_ENTRY(138, list_write_64bit_bottom_of_pipe_2x),
 };
 
 const u32 k_list_work_entry_count = ARRAY_COUNT(k_list_work_entries);
