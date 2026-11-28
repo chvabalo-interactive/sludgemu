@@ -1,17 +1,23 @@
 // amd_fidelityfx_loader_xbox.dll: AMD FidelityFX upscaler HLE.
 //
-// Translates console FidelityFX calls to the host PC amd_fidelityfx_upscaler_dx12.dll when present
-// (next to sludgemu.exe or in SLUDGE_FIDELITYFX_DIR), substituting the desktop ID3D12Device,
-// desktop ID3D12GraphicsCommandList, desktop ID3D12Resource textures, and desktop resource states.
-// If no host upscaler DLL is installed, queries return valid FSR parameters so the title does not
-// divide by zero on uninitialized query outputs.
+// Translates console FidelityFX calls to the desktop FidelityFX SDK DLLs (copied next to
+// sludgemu.exe at build time), substituting the desktop ID3D12Device, ID3D12GraphicsCommandList,
+// desktop ID3D12Resource textures, and desktop resource states.
 
 #include <windows.h>
 
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <ffx_api.h>
+#include <ffx_api_dx12.h>
+#ifndef _WINDOWS
+#define _WINDOWS
+#endif
+#include <ffx_api_loader.h>
+#include <ffx_api_types.h>
+#include <ffx_upscale.h>
 
 #include "common/log.h"
 #include "common/types.h"
@@ -21,143 +27,17 @@
 #include "hle/d3d12/texture_sync.h"
 #include "hle/hle.h"
 
-#define FFX_OK                   0u
-#define FFX_ERROR_UNKNOWN_TYPE   2u
-#define FFX_NO_PROVIDER          4u
-#define FFX_ERROR_PARAMETER      6u
+// Legacy Xbox console backend descriptor ID seen in title chains.
+#define FFX_DESC_CONSOLE_BACKEND 0x1000002ull
 
-#define FFX_DESC_GET_VERSIONS              4ull
-#define FFX_DESC_OVERRIDE_VERSION          5ull
-#define FFX_DESC_GET_PROVIDER_VERSION      6ull
-#define FFX_DESC_HOST_BACKEND              2ull
-#define FFX_DESC_CONSOLE_BACKEND           0x1000002ull
-#define FFX_DESC_CREATE_UPSCALE            0x10000ull
-#define FFX_DESC_DISPATCH_UPSCALE          0x10001ull
-#define FFX_DESC_GET_UPSCALE_RATIO         0x10002ull
-#define FFX_DESC_GET_RENDER_RESOLUTION     0x10003ull
-#define FFX_DESC_GET_JITTER_PHASE_COUNT    0x10004ull
-#define FFX_DESC_GET_JITTER_OFFSET         0x10005ull
-#define FFX_DESC_MEMORY_USAGE_WITH_DEVICE  0x10009ull
-
-#define FFX_STATE_COMMON       0x1u
-#define FFX_STATE_UAV          0x2u
-#define FFX_STATE_COMPUTE_READ 0x4u
-#define FFX_STATE_PIXEL_READ   0x8u
-#define FFX_STATE_COPY_SRC     0x10u
-#define FFX_STATE_COPY_DEST    0x20u
-#define FFX_STATE_PRESENT      0x80u
-#define FFX_STATE_RENDER_TARGET 0x100u
-#define FFX_STATE_DEPTH_WRITE  0x200u
-
-struct FfxHeader {
-    u64 type;
-    FfxHeader* next;
-};
-
-struct FfxCreateUpscale {
-    FfxHeader header;
-    u32 flags;
-    u32 max_render[2];
-    u32 max_output[2];
-    u64 message_cb;
-};
-
-struct FfxBackend {
-    FfxHeader header;
-    void* device;
-};
-
-struct FfxOverrideVersion {
-    FfxHeader header;
-    u64 id;
-};
-
-struct FfxProviderVersion {
-    FfxHeader header;
-    u64 id;
-    const char* name;
-};
-
-struct FfxGetVersions {
-    FfxHeader header;
-    u64 create_type;
-    void* device;
-    u64* count;
-    u64* ids;
-    const char** names;
-};
-
-struct FfxMemoryUsageWithDevice {
-    FfxHeader header;
-    void* device;
-    u32 max_render[2];
-    u32 max_output[2];
-    u32 flags;
-    void* usage;
-};
-
-struct FfxResource {
-    void* resource;
-    u32 description[8];
-    u32 state;
-};
-
-struct FfxDispatchUpscale {
-    FfxHeader header;
-    void* command_list;
-    FfxResource resources[7]; // color, depth, motion, exposure, reactive, transparency, output
-    f32 jitter[2];
-    f32 motion_scale[2];
-    u32 render_size[2];
-    u32 upscale_size[2];
-    u32 settings[10];
-};
-
-struct FfxQueryUpscaleRatio {
-    FfxHeader header;
-    u32 quality_mode;
-    f32* out_ratio;
-};
-
-struct FfxQueryRenderResolution {
-    FfxHeader header;
-    u32 display_width;
-    u32 display_height;
-    u32 quality_mode;
-    u32* out_render_width;
-    u32* out_render_height;
-};
-
-struct FfxQueryJitterPhaseCount {
-    FfxHeader header;
-    s32 render_width;
-    s32 display_width;
-    s32* out_phase_count;
-};
-
-struct FfxQueryJitterOffset {
-    FfxHeader header;
-    s32 index;
-    s32 phase_count;
-    f32* out_x;
-    f32* out_y;
-};
-
-static_assert(sizeof(FfxCreateUpscale) == 0x30, "FfxCreateUpscale layout");
-static_assert(sizeof(FfxResource) == 0x30, "FfxResource layout");
-static_assert(sizeof(FfxDispatchUpscale) == 0x1B0, "FfxDispatchUpscale layout");
-
-typedef u32 (*PfnFfxCreateContext)(void** context, FfxHeader* desc, const void* mem_cb);
-typedef u32 (*PfnFfxDestroyContext)(void** context, const void* mem_cb);
-typedef u32 (*PfnFfxCall)(void** context, FfxHeader* desc);
+// Console FidelityFX titles share the same descriptor ABI layout as the desktop FidelityFX SDK.
+static_assert(sizeof(ffxCreateContextDescUpscale) == 0x30, "ffxCreateContextDescUpscale layout");
+static_assert(sizeof(FfxApiResource) == 0x30, "FfxApiResource layout");
+static_assert(sizeof(ffxDispatchDescUpscale) == 0x1B0, "ffxDispatchDescUpscale layout");
 
 struct FfxHost {
     HMODULE dll;
-    PfnFfxCreateContext create;
-    PfnFfxDestroyContext destroy;
-    PfnFfxCall configure;
-    PfnFfxCall query;
-    PfnFfxCall dispatch;
+    ffxFunctions fn;
     ID3D12Device13* device;
     u64 provider_id;
     char provider_name[64];
@@ -166,10 +46,10 @@ struct FfxHost {
 
 // FidelityFX keeps pointers in the create descriptor chain until destroy.
 struct FfxContextEntry {
-    void* handle;
-    FfxCreateUpscale create;
-    FfxBackend backend;
-    FfxOverrideVersion version;
+    ffxContext handle;
+    ffxCreateContextDescUpscale create;
+    ffxCreateBackendDX12Desc backend;
+    ffxOverrideVersion version;
     FfxContextEntry* next;
 };
 
@@ -192,16 +72,16 @@ static bool is_fsr412(const char* name) {
     return name && strncmp(name, "4.1.2", 5) == 0 && (name[5] < '0' || name[5] > '9');
 }
 
-static bool select_provider(PfnFfxCall query_fn, ID3D12Device13* device, u64* out_id, char* out_name,
+static bool select_provider(PfnFfxQuery query_fn, ID3D12Device13* device, u64* out_id, char* out_name,
                             usize out_cap) {
     u64 count = 0;
-    FfxGetVersions q = {};
-    q.header.type = FFX_DESC_GET_VERSIONS;
-    q.create_type = FFX_DESC_CREATE_UPSCALE;
+    ffxQueryDescGetVersions q = {};
+    q.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     q.device = device;
-    q.count = &count;
-    u32 code = query_fn(nullptr, &q.header);
-    if (code != FFX_OK || count == 0) {
+    q.outputCount = &count;
+    ffxReturnCode_t code = query_fn(nullptr, &q.header);
+    if (code != FFX_API_RETURN_OK || count == 0) {
         LOG_W("ffx", "host upscaler reports no providers for this GPU (code %u, count %llu)", code, count);
         return false;
     }
@@ -209,10 +89,10 @@ static bool select_provider(PfnFfxCall query_fn, ID3D12Device13* device, u64* ou
         count = 64;
     u64 ids[64] = {};
     const char* names[64] = {};
-    q.ids = ids;
-    q.names = names;
+    q.versionIds = ids;
+    q.versionNames = names;
     code = query_fn(nullptr, &q.header);
-    if (code != FFX_OK) {
+    if (code != FFX_API_RETURN_OK) {
         LOG_W("ffx", "host upscaler failed version query (code %u)", code);
         return false;
     }
@@ -245,51 +125,42 @@ static bool select_provider(PfnFfxCall query_fn, ID3D12Device13* device, u64* ou
     return true;
 }
 
-static HMODULE load_upscaler_dll() {
+static HMODULE load_loader_dll() {
     wchar_t path[MAX_PATH] = {};
-    DWORD env_len = GetEnvironmentVariableW(L"SLUDGE_FIDELITYFX_DIR", path, MAX_PATH);
-    if (env_len > 0 && env_len < MAX_PATH - 40) {
-        wcscat_s(path, L"\\amd_fidelityfx_upscaler_dx12.dll");
-        HMODULE m = LoadLibraryExW(path, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-        if (m)
-            return m;
-    }
     DWORD exe_len = GetModuleFileNameW(nullptr, path, MAX_PATH);
     if (exe_len > 0 && exe_len < MAX_PATH) {
         wchar_t* slash = wcsrchr(path, L'\\');
-        if (slash && (usize)(slash - path + 38) < MAX_PATH) {
-            wcscpy_s(slash + 1, (usize)MAX_PATH - (usize)(slash - path + 1), L"amd_fidelityfx_upscaler_dx12.dll");
-            HMODULE m = LoadLibraryExW(path, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        if (slash && (usize)(slash - path + 36) < MAX_PATH) {
+            wcscpy_s(slash + 1, (usize)MAX_PATH - (usize)(slash - path + 1), L"amd_fidelityfx_loader_dx12.dll");
+            HMODULE m =
+                LoadLibraryExW(path, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
             if (m)
                 return m;
         }
     }
-    return LoadLibraryW(L"amd_fidelityfx_upscaler_dx12.dll");
+    return LoadLibraryW(L"amd_fidelityfx_loader_dx12.dll");
 }
 
 static BOOL CALLBACK init_host_once(PINIT_ONCE, PVOID, PVOID*) {
     ID3D12Device13* device = gpu_device();
     if (!device)
         return TRUE;
-    HMODULE dll = load_upscaler_dll();
+    HMODULE dll = load_loader_dll();
     if (!dll) {
-        LOG_W("ffx", "amd_fidelityfx_upscaler_dx12.dll not found; FSR dispatch disabled (queries emulated)");
+        LOG_W("ffx", "amd_fidelityfx_loader_dx12.dll not found; FidelityFX disabled");
         return TRUE;
     }
     g_host.dll = dll;
-    g_host.create = (PfnFfxCreateContext)GetProcAddress(dll, "ffxCreateContext");
-    g_host.destroy = (PfnFfxDestroyContext)GetProcAddress(dll, "ffxDestroyContext");
-    g_host.configure = (PfnFfxCall)GetProcAddress(dll, "ffxConfigure");
-    g_host.query = (PfnFfxCall)GetProcAddress(dll, "ffxQuery");
-    g_host.dispatch = (PfnFfxCall)GetProcAddress(dll, "ffxDispatch");
+    ffxLoadFunctions(&g_host.fn, dll);
     g_host.device = device;
-    if (!g_host.create || !g_host.destroy || !g_host.configure || !g_host.query || !g_host.dispatch) {
-        LOG_W("ffx", "amd_fidelityfx_upscaler_dx12.dll is missing expected exports");
+    if (!g_host.fn.CreateContext || !g_host.fn.DestroyContext || !g_host.fn.Configure || !g_host.fn.Query ||
+        !g_host.fn.Dispatch) {
+        LOG_W("ffx", "amd_fidelityfx_loader_dx12.dll is missing expected exports");
         FreeLibrary(dll);
         g_host.dll = nullptr;
         return TRUE;
     }
-    if (!select_provider(g_host.query, device, &g_host.provider_id, g_host.provider_name,
+    if (!select_provider(g_host.fn.Query, device, &g_host.provider_id, g_host.provider_name,
                          sizeof(g_host.provider_name))) {
         FreeLibrary(dll);
         g_host.dll = nullptr;
@@ -307,32 +178,32 @@ static const FfxHost* ffx_host() {
 
 static bool map_host_state(u32 ffx_state, u32* d3d_state) {
     switch (ffx_state) {
-    case FFX_STATE_COMMON:
-    case FFX_STATE_PRESENT:
+    case FFX_API_RESOURCE_STATE_COMMON:
+    case FFX_API_RESOURCE_STATE_PRESENT:
         *d3d_state = 0; // D3D12_RESOURCE_STATE_COMMON
         return true;
-    case FFX_STATE_UAV:
+    case FFX_API_RESOURCE_STATE_UNORDERED_ACCESS:
         *d3d_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         return true;
-    case FFX_STATE_COMPUTE_READ:
+    case FFX_API_RESOURCE_STATE_COMPUTE_READ:
         *d3d_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         return true;
-    case FFX_STATE_PIXEL_READ:
+    case FFX_API_RESOURCE_STATE_PIXEL_READ:
         *d3d_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         return true;
-    case FFX_STATE_COMPUTE_READ | FFX_STATE_PIXEL_READ:
+    case FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ:
         *d3d_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         return true;
-    case FFX_STATE_COPY_SRC:
+    case FFX_API_RESOURCE_STATE_COPY_SRC:
         *d3d_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
         return true;
-    case FFX_STATE_COPY_DEST:
+    case FFX_API_RESOURCE_STATE_COPY_DEST:
         *d3d_state = D3D12_RESOURCE_STATE_COPY_DEST;
         return true;
-    case FFX_STATE_RENDER_TARGET:
+    case FFX_API_RESOURCE_STATE_RENDER_TARGET:
         *d3d_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         return true;
-    case FFX_STATE_DEPTH_WRITE:
+    case FFX_API_RESOURCE_STATE_DEPTH_ATTACHMENT:
         *d3d_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
         return true;
     default:
@@ -340,106 +211,43 @@ static bool map_host_state(u32 ffx_state, u32* d3d_state) {
     }
 }
 
-static f32 quality_ratio(u32 mode) {
-    switch (mode) {
-    case 0: return 1.0f;  // NativeAA
-    case 1: return 1.5f;  // Quality
-    case 2: return 1.7f;  // Balanced
-    case 3: return 2.0f;  // Performance
-    case 4: return 3.0f;  // Ultra Performance
-    default: return 1.5f;
-    }
+static bool is_console_backend_desc(const ffxApiHeader* h) {
+    return h->type == FFX_DESC_CONSOLE_BACKEND || (h->type & FFX_API_BACKEND_MASK) == FFX_API_BACKEND_ID_XBOX;
 }
 
-static f32 halton(s32 index, s32 base) {
-    f32 f = 1.0f;
-    f32 r = 0.0f;
-    s32 i = index;
-    while (i > 0) {
-        f /= (f32)base;
-        r += f * (f32)(i % base);
-        i /= base;
-    }
-    return r;
-}
-
-static u32 emulate_query(FfxHeader* desc) {
-    switch (desc->type) {
-    case FFX_DESC_GET_UPSCALE_RATIO: {
-        FfxQueryUpscaleRatio* q = (FfxQueryUpscaleRatio*)desc;
-        if (!q->out_ratio)
-            return FFX_ERROR_PARAMETER;
-        *q->out_ratio = quality_ratio(q->quality_mode);
-        return FFX_OK;
-    }
-    case FFX_DESC_GET_RENDER_RESOLUTION: {
-        FfxQueryRenderResolution* q = (FfxQueryRenderResolution*)desc;
-        if (!q->out_render_width || !q->out_render_height || !q->display_width || !q->display_height)
-            return FFX_ERROR_PARAMETER;
-        f32 ratio = quality_ratio(q->quality_mode);
-        u32 rw = (u32)roundf((f32)q->display_width / ratio);
-        u32 rh = (u32)roundf((f32)q->display_height / ratio);
-        *q->out_render_width = rw ? rw : 1;
-        *q->out_render_height = rh ? rh : 1;
-        return FFX_OK;
-    }
-    case FFX_DESC_GET_JITTER_PHASE_COUNT: {
-        FfxQueryJitterPhaseCount* q = (FfxQueryJitterPhaseCount*)desc;
-        if (!q->out_phase_count || q->render_width <= 0 || q->display_width <= 0)
-            return FFX_ERROR_PARAMETER;
-        f32 ratio = (f32)q->display_width / (f32)q->render_width;
-        s32 phases = (s32)ceilf(8.0f * ratio * ratio);
-        *q->out_phase_count = phases > 0 ? phases : 8;
-        return FFX_OK;
-    }
-    case FFX_DESC_GET_JITTER_OFFSET: {
-        FfxQueryJitterOffset* q = (FfxQueryJitterOffset*)desc;
-        if (!q->out_x || !q->out_y || q->phase_count <= 0)
-            return FFX_ERROR_PARAMETER;
-        s32 idx = (q->index % q->phase_count);
-        if (idx < 0)
-            idx += q->phase_count;
-        idx += 1;
-        *q->out_x = halton(idx, 2) - 0.5f;
-        *q->out_y = halton(idx, 3) - 0.5f;
-        return FFX_OK;
-    }
-    default:
-        return FFX_NO_PROVIDER;
-    }
-}
-
-static u32 ffxCreateContext(void** context, FfxHeader* desc, const void* mem_cb) {
+static ffxReturnCode_t ffx_create_context(ffxContext* context, ffxCreateContextDescHeader* desc,
+                                          const ffxAllocationCallbacks* mem_cb) {
     const FfxHost* host = ffx_host();
     if (!host)
-        return FFX_NO_PROVIDER;
+        return FFX_API_RETURN_NO_PROVIDER;
     if (!context || !desc)
-        return FFX_ERROR_PARAMETER;
-    if (desc->type != FFX_DESC_CREATE_UPSCALE) {
+        return FFX_API_RETURN_ERROR_PARAMETER;
+    if (desc->type != FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE) {
         LOG_W_ONCE("ffx", "unsupported FidelityFX context type 0x%llx refused", desc->type);
-        return FFX_NO_PROVIDER;
+        return FFX_API_RETURN_NO_PROVIDER;
     }
 
     FfxContextEntry* entry = (FfxContextEntry*)calloc(1, sizeof(FfxContextEntry));
     if (!entry)
-        return FFX_NO_PROVIDER;
-    entry->create = *(const FfxCreateUpscale*)desc;
+        return FFX_API_RETURN_NO_PROVIDER;
+    entry->create = *(const ffxCreateContextDescUpscale*)desc;
 
-    FfxHeader* after = entry->create.header.next;
-    FfxHeader* tail = (after && after->type == FFX_DESC_CONSOLE_BACKEND) ? after->next : after;
-    entry->version.header.type = FFX_DESC_OVERRIDE_VERSION;
-    entry->version.header.next = tail;
-    entry->version.id = host->provider_id;
-    entry->backend.header.type = FFX_DESC_HOST_BACKEND;
-    entry->backend.header.next = &entry->version.header;
+    ffxApiHeader* tail = entry->create.header.pNext;
+    while (tail && is_console_backend_desc(tail))
+        tail = tail->pNext;
+    entry->version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    entry->version.header.pNext = tail;
+    entry->version.versionId = host->provider_id;
+    entry->backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+    entry->backend.header.pNext = &entry->version.header;
     entry->backend.device = host->device;
-    entry->create.header.next = &entry->backend.header;
+    entry->create.header.pNext = &entry->backend.header;
 
-    u32 code = host->create(context, &entry->create.header, mem_cb);
-    if (code != FFX_OK) {
+    ffxReturnCode_t code = host->fn.CreateContext(context, &entry->create.header, mem_cb);
+    if (code != FFX_API_RETURN_OK) {
         LOG_E("ffx", "host ffxCreateContext failed (code %u, render %ux%u, output %ux%u, flags 0x%x)", code,
-              entry->create.max_render[0], entry->create.max_render[1], entry->create.max_output[0],
-              entry->create.max_output[1], entry->create.flags);
+              entry->create.maxRenderSize.width, entry->create.maxRenderSize.height,
+              entry->create.maxUpscaleSize.width, entry->create.maxUpscaleSize.height, entry->create.flags);
         free(entry);
         return code;
     }
@@ -451,19 +259,19 @@ static u32 ffxCreateContext(void** context, FfxHeader* desc, const void* mem_cb)
     ReleaseSRWLockExclusive(&g_ctx_lock);
 
     LOG_I("ffx", "created upscaler context %p (render %ux%u -> output %ux%u, flags 0x%x)", *context,
-          entry->create.max_render[0], entry->create.max_render[1], entry->create.max_output[0],
-          entry->create.max_output[1], entry->create.flags);
-    return FFX_OK;
+          entry->create.maxRenderSize.width, entry->create.maxRenderSize.height,
+          entry->create.maxUpscaleSize.width, entry->create.maxUpscaleSize.height, entry->create.flags);
+    return FFX_API_RETURN_OK;
 }
 
-static u32 ffxDestroyContext(void** context, const void* mem_cb) {
+static ffxReturnCode_t ffx_destroy_context(ffxContext* context, const ffxAllocationCallbacks* mem_cb) {
     const FfxHost* host = ffx_host();
     if (!host)
-        return FFX_NO_PROVIDER;
+        return FFX_API_RETURN_NO_PROVIDER;
     if (!context || !*context)
-        return FFX_ERROR_PARAMETER;
+        return FFX_API_RETURN_ERROR_PARAMETER;
 
-    void* handle = *context;
+    ffxContext handle = *context;
     AcquireSRWLockExclusive(&g_ctx_lock);
     FfxContextEntry** prev = &g_contexts;
     FfxContextEntry* found = nullptr;
@@ -477,111 +285,114 @@ static u32 ffxDestroyContext(void** context, const void* mem_cb) {
     }
     ReleaseSRWLockExclusive(&g_ctx_lock);
     if (!found)
-        return FFX_ERROR_PARAMETER;
+        return FFX_API_RETURN_ERROR_PARAMETER;
 
     gpu_wait_idle();
-    u32 code = host->destroy(context, mem_cb);
+    ffxReturnCode_t code = host->fn.DestroyContext(context, mem_cb);
     free(found);
     return code;
 }
 
-static u32 ffxConfigure(void** context, FfxHeader* desc) {
+static ffxReturnCode_t ffx_configure(ffxContext* context, const ffxConfigureDescHeader* desc) {
     const FfxHost* host = ffx_host();
-    return host ? host->configure(context, desc) : FFX_NO_PROVIDER;
+    return host ? host->fn.Configure(context, desc) : FFX_API_RETURN_NO_PROVIDER;
 }
 
-static u32 ffxQuery(void** context, FfxHeader* desc) {
+static ffxReturnCode_t ffx_query(ffxContext* context, ffxQueryDescHeader* desc) {
     if (!desc)
-        return FFX_ERROR_PARAMETER;
+        return FFX_API_RETURN_ERROR_PARAMETER;
     const FfxHost* host = ffx_host();
     if (!host)
-        return emulate_query(desc);
+        return FFX_API_RETURN_NO_PROVIDER;
 
-    if (desc->type == FFX_DESC_GET_VERSIONS) {
-        FfxGetVersions q = *(const FfxGetVersions*)desc;
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_GET_VERSIONS) {
+        ffxQueryDescGetVersions q = *(const ffxQueryDescGetVersions*)desc;
         q.device = host->device;
-        return host->query(context, &q.header);
+        return host->fn.Query(context, &q.header);
     }
-    if (desc->type == FFX_DESC_MEMORY_USAGE_WITH_DEVICE) {
-        FfxMemoryUsageWithDevice q = *(const FfxMemoryUsageWithDevice*)desc;
+    if (desc->type == FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2) {
+        ffxQueryDescUpscaleGetGPUMemoryUsageV2 q = *(const ffxQueryDescUpscaleGetGPUMemoryUsageV2*)desc;
         q.device = host->device;
-        return host->query(context, &q.header);
+        return host->fn.Query(context, &q.header);
     }
-    return host->query(context, desc);
+    return host->fn.Query(context, desc);
 }
 
-static u32 ffxDispatch(void** context, FfxHeader* desc) {
+static ffxReturnCode_t ffx_dispatch(ffxContext* context, const ffxDispatchDescHeader* desc) {
     const FfxHost* host = ffx_host();
     if (!host)
-        return FFX_NO_PROVIDER;
+        return FFX_API_RETURN_NO_PROVIDER;
     if (!context || !*context || !desc)
-        return FFX_ERROR_PARAMETER;
-    if (desc->type != FFX_DESC_DISPATCH_UPSCALE) {
+        return FFX_API_RETURN_ERROR_PARAMETER;
+    if (desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
         LOG_W_ONCE("ffx", "unsupported FidelityFX dispatch type 0x%llx refused", desc->type);
-        return FFX_ERROR_UNKNOWN_TYPE;
+        return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     }
 
-    FfxDispatchUpscale d = *(const FfxDispatchUpscale*)desc;
-    ConsoleCommandList* list = (ConsoleCommandList*)d.command_list;
+    ffxDispatchDescUpscale d = *(const ffxDispatchDescUpscale*)desc;
+    ConsoleCommandList* list = (ConsoleCommandList*)d.commandList;
     if (!list || !list->recording || !list->desktop) {
         LOG_W_ONCE("ffx", "ffxDispatch called without a recording command list");
-        return FFX_ERROR_PARAMETER;
+        return FFX_API_RETURN_ERROR_PARAMETER;
     }
 
-    for (u32 i = 0; i < ARRAY_COUNT(d.resources); i++) {
-        if (!d.resources[i].resource) {
+    FfxApiResource* resources[] = {&d.color,    &d.depth, &d.motionVectors,            &d.exposure,
+                                   &d.reactive, &d.transparencyAndComposition, &d.output};
+    for (u32 i = 0; i < ARRAY_COUNT(resources); i++) {
+        FfxApiResource* r = resources[i];
+        if (!r->resource) {
             if (i == 0 || i == 1 || i == 2 || i == 6) {
                 LOG_W_ONCE("ffx", "ffxDispatch missing required texture %u", i);
-                return FFX_ERROR_PARAMETER;
+                return FFX_API_RETURN_ERROR_PARAMETER;
             }
             continue;
         }
-        ConsoleResource* cr = (ConsoleResource*)d.resources[i].resource;
+        ConsoleResource* cr = (ConsoleResource*)r->resource;
         if (cr->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             LOG_W_ONCE("ffx", "ffxDispatch resource %u is a buffer", i);
-            return FFX_ERROR_PARAMETER;
+            return FFX_API_RETURN_ERROR_PARAMETER;
         }
         u64 offset = 0;
-        ID3D12Resource* tex = console_resource_desktop(cr, &offset, i == 6 ? GPU_WRITE : GPU_READ);
+        ID3D12Resource* tex = console_resource_desktop(cr, &offset, r == &d.output ? GPU_WRITE : GPU_READ);
         if (!tex) {
             LOG_W_ONCE("ffx", "ffxDispatch texture %u has no desktop backing", i);
-            return FFX_ERROR_PARAMETER;
+            return FFX_API_RETURN_ERROR_PARAMETER;
         }
         u32 host_state = 0;
-        if (!map_host_state(d.resources[i].state, &host_state)) {
-            LOG_W_ONCE("ffx", "ffxDispatch resource %u has unsupported state 0x%x", i, d.resources[i].state);
-            return FFX_ERROR_PARAMETER;
+        if (!map_host_state(r->state, &host_state)) {
+            LOG_W_ONCE("ffx", "ffxDispatch resource %u has unsupported state 0x%x", i, r->state);
+            return FFX_API_RETURN_ERROR_PARAMETER;
         }
         // Keep read-only texture-sync or no-UAV-on-desktop textures aligned with barriers.cpp's layout.
         if (texture_sync_tracks(cr->desc) ||
             (console_texture_loses_uav(cr->desc) && host_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
             host_state = 0;
-        d.resources[i].resource = tex;
-        d.resources[i].state = host_state;
+        r->resource = tex;
+        r->state = host_state;
     }
 
-    d.command_list = list->desktop;
-    u32 code = host->dispatch(context, &d.header);
+    d.commandList = list->desktop;
+    ffxReturnCode_t code = host->fn.Dispatch(context, &d.header);
     list_restore_state(list);
-    if (code == FFX_OK) {
+    if (code == FFX_API_RETURN_OK) {
         static volatile long s_first_dispatch = 0;
         if (log_once_flag(&s_first_dispatch)) {
-            LOG_I("ffx", "first FSR dispatch succeeded (%ux%u -> %ux%u)", d.render_size[0], d.render_size[1],
-                  d.upscale_size[0], d.upscale_size[1]);
+            LOG_I("ffx", "first FSR dispatch succeeded (%ux%u -> %ux%u)", d.renderSize.width, d.renderSize.height,
+                  d.upscaleSize.width, d.upscaleSize.height);
         }
     } else {
         LOG_W_ONCE("ffx", "host ffxDispatch returned error %u (render %ux%u -> output %ux%u)", code,
-                   d.render_size[0], d.render_size[1], d.upscale_size[0], d.upscale_size[1]);
+                   d.renderSize.width, d.renderSize.height, d.upscaleSize.width, d.upscaleSize.height);
     }
     return code;
 }
 
 static const HleExport k_ffx_exports[] = {
-    HLE_EXPORT(ffxConfigure),
-    HLE_EXPORT(ffxCreateContext),
-    HLE_EXPORT(ffxDestroyContext),
-    HLE_EXPORT(ffxDispatch),
-    HLE_EXPORT(ffxQuery),
+    HLE_EXPORT_AS(ffx_configure, "ffxConfigure"),
+    HLE_EXPORT_AS(ffx_create_context, "ffxCreateContext"),
+    HLE_EXPORT_AS(ffx_destroy_context, "ffxDestroyContext"),
+    HLE_EXPORT_AS(ffx_dispatch, "ffxDispatch"),
+    HLE_EXPORT_AS(ffx_query, "ffxQuery"),
 };
 
 extern const HleModule g_hle_module_ffx_loader = {

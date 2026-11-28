@@ -144,6 +144,21 @@ set(SLUDGE_DXC_DLLS
     ${dxc_pkg_SOURCE_DIR}/build/native/bin/x64/dxcompiler.dll
     ${dxc_pkg_SOURCE_DIR}/build/native/bin/x64/dxil.dll)
 
+# AMD FidelityFX SDK: host C headers and signed DX12 upscaler DLLs (FSR 3 / FSR 4).
+FetchContent_Declare(fidelityfx_sdk
+    URL https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/archive/refs/tags/v2.4.0.tar.gz
+    URL_HASH SHA256=111f9b19c0c9b8a1f24d2a5104095b8e626f12deb4eca53cd0c29921aa1fd43a
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(fidelityfx_sdk)
+add_library(fidelityfx INTERFACE)
+target_include_directories(fidelityfx INTERFACE
+    ${fidelityfx_sdk_SOURCE_DIR}/Kits/FidelityFX/api/include
+    ${fidelityfx_sdk_SOURCE_DIR}/Kits/FidelityFX/api/include/dx12
+    ${fidelityfx_sdk_SOURCE_DIR}/Kits/FidelityFX/upscalers/include)
+set(SLUDGE_FIDELITYFX_DLLS
+    ${fidelityfx_sdk_SOURCE_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_loader_dx12.dll
+    ${fidelityfx_sdk_SOURCE_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll)
+
 add_subdirectory(src)
 add_subdirectory(tools)
 
