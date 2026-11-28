@@ -72,7 +72,8 @@ set(CMAKE_MT "${llvm_bin}/llvm-mt.exe")
 set(CMAKE_RC_FLAGS_INIT "/I \"${msvc_dir}/include\" /I \"${SLUDGE_WINSDK_DIR}/Include/${SLUDGE_WINSDK_VERSION}/um\" /I \"${SLUDGE_WINSDK_DIR}/Include/${SLUDGE_WINSDK_VERSION}/shared\"")
 
 set(sysroot_compile "/vctoolsdir \"${msvc_dir}\" /winsdkdir \"${SLUDGE_WINSDK_DIR}\" /winsdkversion ${SLUDGE_WINSDK_VERSION}")
-set(sysroot_link "\"/vctoolsdir:${msvc_dir}\" \"/winsdkdir:${SLUDGE_WINSDK_DIR}\" /winsdkversion:${SLUDGE_WINSDK_VERSION}")
+# /lldignoreenv: a LIB variable left by another installation's developer prompt must not win.
+set(sysroot_link "/lldignoreenv \"/vctoolsdir:${msvc_dir}\" \"/winsdkdir:${SLUDGE_WINSDK_DIR}\" /winsdkversion:${SLUDGE_WINSDK_VERSION}")
 set(CMAKE_C_FLAGS_INIT "${sysroot_compile}")
 set(CMAKE_CXX_FLAGS_INIT "${sysroot_compile}")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "${sysroot_link}")
