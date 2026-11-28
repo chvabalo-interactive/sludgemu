@@ -3,7 +3,7 @@
 // against what the console computes. Covers the lane mapping of wave64 programs onto desktop waves
 // (see shader/translate.h): cross-lane reads and writes across the halves, whole-mask queries, masks
 // written as data, DPP row masks, LDS append and atomics, 16-bit three-operand minimum, maximum and
-// median, console wave numbering in groups of several waves. And
+// median, spill VGPRs reused for ordinary values, console wave numbering in groups of several waves. And
 // control flow as the translator structures it: EXEC skip-overs, if/else on EXEC, scalar loops,
 // waterfall loops, loops lanes leave one by one, jumps out of several loops, and the dispatcher that
 // takes the graphs it can't structure; random graphs of scalar jumps against a walk on the CPU. And the
@@ -508,6 +508,34 @@ static const u32 k_alu16_lds_program[] = {
     0xbf810000,                         // 0x1b8: s_endpgm
 };
 
+// Program J: one console wave of 64 lanes, regions as in program A. A spill VGPR (v10) that holds an
+// ordinary value before the spills and others after the reloads, as register allocators reuse them:
+// SGPRs parked in a lane of each half come back, and the ordinary values (one of them DPP) stay whole.
+static const u32 k_spill_reuse_program[] = {
+    0xbe8203c1,             // 0x0: s_mov_b32 s2, -1
+    0xbe830380,             // 0x4: s_mov_b32 s3, 0
+    0xd7650001, 0x020100c1, // 0x8: v_mbcnt_lo_u32_b32 v1, -1, 0
+    0xd7660001, 0x020202c1, // 0x10: v_mbcnt_hi_u32_b32 v1, -1, v1
+    0x34040282,             // 0x18: v_lshlrev_b32 v2, 2, v1
+    0x4a1402ff, 0x00000064, // 0x1c: v_add_nc_u32 v10, 0x64, v1
+    0xe0701000, 0x80000a02, // 0x24: buffer_store_dword v10, v2, s[0:3], 0 offen
+    0xb0041111,             // 0x2c: s_movk_i32 s4, 0x1111
+    0xb0052222,             // 0x30: s_movk_i32 s5, 0x2222
+    0xd761000a, 0x02010a04, // 0x34: v_writelane_b32 v10, s4, 5
+    0xd761000a, 0x02015005, // 0x3c: v_writelane_b32 v10, s5, 40
+    0xbe840380,             // 0x44: s_mov_b32 s4, 0
+    0xbe850380,             // 0x48: s_mov_b32 s5, 0
+    0xd7600006, 0x02010b0a, // 0x4c: v_readlane_b32 s6, v10, 5
+    0xd7600007, 0x0201510a, // 0x54: v_readlane_b32 s7, v10, 40
+    0x7e140206,             // 0x5c: v_mov_b32 v10, s6
+    0x4a141407,             // 0x60: v_add_nc_u32 v10, s7, v10
+    0x4a14030a,             // 0x64: v_add_nc_u32 v10, v10, v1
+    0xe0701100, 0x80000a02, // 0x68: buffer_store_dword v10, v2, s[0:3], 0 offen offset:256
+    0x7e1402fa, 0xff091101, // 0x70: v_mov_b32_dpp v10, v1 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1
+    0xe0701200, 0x80000a02, // 0x78: buffer_store_dword v10, v2, s[0:3], 0 offen offset:512
+    0xbf810000,             // 0x80: s_endpgm
+};
+
 #define UNWRITTEN    0xDEADBEEFu // what the output buffer starts with
 #define OUTPUT_BYTES 4096
 
@@ -667,6 +695,20 @@ static u32 alu16_lds_expected(u32 r, u32 i) {
         return (i & 1) ? 500 + i : i;
     case 12: // ds_cmpst_b32 comparing with 500 + i: the odd lanes store 7
         return (i & 1) ? 7 : i;
+    default:
+        return UNWRITTEN;
+    }
+}
+
+// What program J stores in region `r` for lane `i`.
+static u32 spill_reuse_expected(u32 r, u32 i) {
+    switch (r) {
+    case 0: // the ordinary value before the spills
+        return 100 + i;
+    case 1: // the two parked SGPRs, 0x1111 + 0x2222, plus the lane
+        return 0x3333 + i;
+    case 2: // row_shr:1 with bound_ctrl: the first lane of each row of 16 reads 0
+        return (i & 15) ? i - 1 : 0;
     default:
         return UNWRITTEN;
     }
@@ -1568,6 +1610,23 @@ void test_shader_lanes() {
     } else {
         g_failures++;
     }
+    // The spill lanes keep variables of their own: v10 stays an ordinary register.
+    static const char* const k_spill_lanes[] = {"spill0_5 = ", "spill0_40 = ", nullptr};
+    if (run_program(b, k_spill_reuse_program, sizeof(k_spill_reuse_program), compute_info(64, 0), out,
+                    k_spill_lanes)) {
+        for (u32 r = 0; r < 16; r++)
+            for (u32 i = 0; i < 64; i++) {
+                u32 want = spill_reuse_expected(r, i);
+                if (out[r * 64 + i] != want) {
+                    printf("FAIL shader lanes: program J region %u lane %u: 0x%x, expected 0x%x\n", r, i,
+                           out[r * 64 + i], want);
+                    g_failures++;
+                    break;
+                }
+            }
+    } else {
+        g_failures++;
+    }
     // Programs F: the first GRAPH_PROGRAMS random graphs that end.
     static u32 code[16 + GRAPH_MAX_BLOCKS * GRAPH_BLOCK_WORDS + 8];
     u32 graphs = 0;
@@ -1620,7 +1679,7 @@ void test_shader_lanes() {
             break;
         }
     }
-    printf("shader lanes: %u programs run on the GPU (waves of %u-%u lanes)\n", 8 + graphs + maskings,
+    printf("shader lanes: %u programs run on the GPU (waves of %u-%u lanes)\n", 9 + graphs + maskings,
            b.target.wave_min, b.target.wave_max);
     bench_release(b);
 }
