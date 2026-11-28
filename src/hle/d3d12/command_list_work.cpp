@@ -24,7 +24,10 @@ static bool prepare(ConsoleCommandList* self, bool graphics) {
     ID3D12RootSignature* signature = nullptr;
     PipelineOutputs outputs = s.outputs;
     outputs.rect_list = s.topology == CONSOLE_TOPOLOGY_RECT_LIST;
-    outputs.dropped_samples = s.dropped_samples;
+    // Only samples the targets have: a mask leaving out samples of more samples than that is the full
+    // mask for these targets, and must not make a pipeline variant of its own.
+    u32 samples = outputs.sample_count ? outputs.sample_count : 1;
+    outputs.dropped_samples = (u16)(s.dropped_samples & ((1u << samples) - 1));
     bool building = false;
     ID3D12PipelineState* desktop =
         console_pipeline_desktop(s.pipeline, graphics ? &outputs : nullptr, &signature, &building);
