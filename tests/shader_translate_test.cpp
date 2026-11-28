@@ -106,6 +106,7 @@ enum : u32 {
     SMEM_LOAD_DWORD = 0,
     SMEM_LOAD_DWORDX4 = 2,
     SMEM_LOAD_DWORDX8 = 3,
+    SMEM_LOAD_DWORDX16 = 4,
     MIMG_SAMPLE_LZ = 39,
     MIMG_SAMPLE_C_LZ = 47,
     VOPC_CMP_EQ_U32 = 0xC2,
@@ -732,6 +733,28 @@ static void test_descriptor_values() {
         CHECK(hlsl_has("g_descriptor_info.Load(shadow_at(s11))"));
         CHECK(hlsl_has("(g_descriptor_info.Load(shadow_at(s12)) & 0x00001fffu)"));
         CHECK(hlsl_has("ResourceDescriptorHeap[s8 >> 5]")); // the descriptor itself is unchanged
+    }
+    {
+        // Two neighbouring image descriptors loaded at once, as compilers do with s_load_dwordx16: the
+        // second one's dwords are the next slot's, which the shadow keeps after the first one's record
+        // (heap byte 40, dword 2 of slot 1, is shadow byte 36 + 8), and its kind is that slot's.
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, 2, 0);
+        a.sop1(SOP1_MOV_B32, 3, ZERO);
+        a.smem(SMEM_LOAD_DWORDX16, 8, 2, 0);
+        a.sop2(SOP2_AND_B32, 30, 18, LIT, 0x3FFFu);
+        a.sop2(SOP2_BFE_U32, 31, 11, LIT, 0x4000Cu);
+        a.mimg(MIMG_LOAD, 4, 0, 8, 0, 0x1);
+        a.mimg(MIMG_LOAD, 5, 0, 16, 0, 0x1);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("s18 = a_ + 40u;"));
+        CHECK(hlsl_has("(g_descriptor_info.Load(shadow_at(s18)) & 0x00003fffu)"));
+        CHECK(hlsl_has("g_descriptor_info.Load(shadow_at(s11))"));
+        CHECK(hlsl_has("ResourceDescriptorHeap[s8 >> 5]"));
+        CHECK(hlsl_has("ResourceDescriptorHeap[s16 >> 5]"));
+        u32 a40 = 40;
+        CHECK(a40 + a40 / SHADER_SHADOW_DESCRIPTOR_BYTES * 4 == SHADER_SHADOW_RECORD_BYTES + 8);
     }
     {
         // A descriptor picked per lane: the address is the table's plus a scaled index, with a high
