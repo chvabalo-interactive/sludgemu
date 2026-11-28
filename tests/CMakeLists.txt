@@ -22,6 +22,7 @@ add_executable(sludgemu_tests
     ${PROJECT_SOURCE_DIR}/src/gpu/shader_schedule.cpp
     ${PROJECT_SOURCE_DIR}/src/gpu/reuse_order.cpp
     ${PROJECT_SOURCE_DIR}/src/gpu/ring_space.cpp
+    ${PROJECT_SOURCE_DIR}/src/hle/d3d12/queue_backlog.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/dstorage/bcpack.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/d3d12/descriptor_shadow.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xapu.cpp

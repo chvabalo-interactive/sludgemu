@@ -465,6 +465,17 @@ static HRESULT WINAPI list_reset_x(ConsoleCommandList* self, ConsoleCommandAlloc
     if (self->recording)
         self->desktop->Close();
     release_segment_fences(self);
+    // A queue may still hold the last recording back (it references the desktop lists itself); the new
+    // recording goes to new desktop lists. Resetting the old ones while they run is fine otherwise.
+    if (self->held_back) {
+        for (u32 i = 0; i < self->segment_capacity; i++) {
+            gpu_retire(self->segments[i].list);
+            self->segments[i].list = nullptr;
+        }
+        self->held_back = false;
+    }
+    // A new recording: desktop D3D12 lets it run while the last one still does.
+    self->submitted_slot = GPU_NO_QUEUE;
     memset(&self->state, 0, sizeof(self->state));
     self->table_count = 0;
     memset(self->relocations, 0, sizeof(self->relocations));

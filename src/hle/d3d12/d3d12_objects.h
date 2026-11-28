@@ -6,9 +6,11 @@
 
 #include "gpu/gpu_ring.h"
 #include "gpu/gpu_window.h"
+#include "gpu/list_pool.h"
 #include "gpu/tile_pool.h"
 #include "hle/d3d12/console_object.h"
 #include "hle/d3d12/descriptor_shadow.h"
+#include "hle/d3d12/queue_backlog.h"
 
 // Console D3D12 object types and their creation functions (one source file per type).
 
@@ -37,33 +39,23 @@ struct ConsoleDevice {
     ID3D12Device13* desktop;
 };
 
-// Small desktop lists that write fence values to memory when the queue signals a fence, and that
-// upload texture contents before a submission: several, so recording one doesn't wait for the GPU
-// to finish the last.
-#define QUEUE_SIGNAL_WRITERS 4
-#define QUEUE_UPLOADERS      4
-
-struct QueueSignalWriter {
-    ID3D12CommandAllocator* allocator;
-    ID3D12GraphicsCommandList8* list;
-    u64 submission; // the queue submission that last ran it
-};
-
 struct ConsoleCommandQueue {
     ConsoleObjectHeader header;
     D3D12_COMMAND_LIST_TYPE type;
 
     ID3D12CommandQueue* desktop;
-    u32 slot; // submission tracking (gpu_queue_register)
-    SRWLOCK writer_lock;
-    u32 next_writer;
-    QueueSignalWriter writers[QUEUE_SIGNAL_WRITERS];
-    // Texture uploads (texture_sync.h), and detiled texture data on its way into textures; writer_lock
-    // guards them too.
-    u32 next_uploader;
-    QueueSignalWriter uploaders[QUEUE_UPLOADERS];
-    GpuRing scratch;
+    u32 slot;       // submission tracking (gpu_queue_register)
+    u32 generation; // of the slot (gpu_queue_generation)
+    // Guards everything below and keeps the queue's work in order: titles may submit to a queue from
+    // several threads, and held-back work reaches the desktop queue from a thread pool thread.
+    SRWLOCK lock;
+    // Our own lists: fence value writes run when the queue signals a fence, texture uploads
+    // (texture_sync.h) before a submission. Taken from pools that grow rather than wait for the GPU.
+    GpuListPool writers;
+    GpuListPool uploaders;
+    GpuRing scratch; // detiled texture data on its way into textures
     GpuRing staging; // an upload ring
+    QueueBacklog backlog;
 };
 
 // Console fences also have a GPU address holding their value, which command lists write to signal
@@ -212,10 +204,14 @@ struct ConsoleCommandList {
     ListSegment* segments; // segment_capacity desktop lists, reused across resets
     u32 segment_count;
     u32 segment_capacity;
-    // The queue submission that last ran it (submitted_slot GPU_NO_QUEUE: none): console lists may run
-    // again while still running, desktop lists can't.
+    // The queue submission that last ran this recording (submitted_slot GPU_NO_QUEUE: none, cleared by
+    // Reset): console lists may run again while still running, desktop lists can't.
     u32 submitted_slot;
+    u32 submitted_generation; // of the slot
     u64 submitted_number;
+    // A queue holds the desktop lists back (queue_backlog.h): a Reset records into new ones, since
+    // resetting these would lose the held-back recording.
+    bool held_back;
     ConsoleCommandAllocator* allocator; // the allocator of the current recording
     ID3D12Device13* device;
     bool recording;

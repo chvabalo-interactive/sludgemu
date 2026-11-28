@@ -1,10 +1,12 @@
 // The bookkeeping that keeps submissions from waiting for the GPU: list pools that grow instead of
-// waiting (gpu/reuse_order.h) and rings that grow instead of waiting (gpu/ring_space.h).
+// waiting (gpu/reuse_order.h), rings that grow instead of waiting (gpu/ring_space.h) and the console
+// queue backlog's order (hle/d3d12/queue_backlog.h).
 
 #include "test.h"
 
 #include "gpu/reuse_order.h"
 #include "gpu/ring_space.h"
+#include "hle/d3d12/queue_backlog.h"
 
 // A pool with a GPU that finishes `completed` submissions: entries come back only once theirs did.
 static void test_reuse_order() {
@@ -126,7 +128,41 @@ static void test_ring_space() {
     CHECK(s.count == 1 && s.uses[s.first].submission == 0);
 }
 
+static void test_backlog_order() {
+    QueueBacklog b = {};
+    CHECK(!backlog_front(&b));
+
+    // Ops come out in the order they went in, across wrap-arounds and growth.
+    u64 pushed = 0, popped = 0;
+    for (u32 round = 0; round < 6; round++) {
+        u32 push = 5 + round * 9; // grows past 16 and 32 ops while some are held
+        for (u32 i = 0; i < push; i++) {
+            BacklogOp* op = backlog_push(&b);
+            CHECK(op && op->kind == BACKLOG_EXECUTE && op->count == 0 && !op->fence); // zeroed
+            if (op)
+                op->number = ++pushed;
+        }
+        u32 pop = push - 2;
+        for (u32 i = 0; i < pop; i++) {
+            BacklogOp* op = backlog_front(&b);
+            CHECK(op && op->number == ++popped);
+            backlog_pop(&b);
+        }
+    }
+    CHECK(b.count == pushed - popped);
+    while (BacklogOp* op = backlog_front(&b)) {
+        CHECK(op->number == ++popped);
+        backlog_pop(&b);
+    }
+    CHECK(popped == pushed && b.count == 0);
+    backlog_pop(&b); // popping an empty backlog does nothing
+    CHECK(b.count == 0);
+    backlog_free(&b);
+    CHECK(!b.ops && !b.capacity);
+}
+
 void test_submission() {
     test_reuse_order();
     test_ring_space();
+    test_backlog_order();
 }
