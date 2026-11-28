@@ -185,6 +185,7 @@ struct Translator {
     bool far_jumps;         // the control flow jumps through go_ (see translate_flow.cpp)
     u32 ps_input_vgpr[16];  // pixel shaders: first VGPR of each SPI_PS_INPUT_ADDR input, or ~0u
     u8 attribute_modes[32]; // pixel shaders: interpolations each attribute is read with (1 << mode)
+    u32 attribute_halves;   // pixel shaders: attributes interpolated as 16-bit halves of their dwords
     u8 vs_fetch_components[SHADER_MAX_VERTEX_ELEMENTS]; // vertex shaders: dwords fetched per element
     bool fetch_typed[SHADER_MAX_VERTEX_ELEMENTS];
     u8 fetch_class[SHADER_MAX_VERTEX_ELEMENTS]; // typed fetches: 0 float, 1 uint, 2 sint

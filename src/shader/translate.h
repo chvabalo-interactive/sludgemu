@@ -178,7 +178,7 @@ struct TranslatedShader {
     u32 vertex_element_mask; // vertex shaders: input layout elements the shader reads (by index)
     u32 vs_param_mask;       // vertex shaders: exported parameters
     u32 ps_attribute_mask;   // pixel shaders: attributes read
-    u32 ps_mixed_mask;       // pixel shaders: attributes read both flat and interpolated
+    u32 ps_mixed_mask;       // pixel shaders: attributes declared flat, interpolated in the shader
     u32 ps_target_mask;      // pixel shaders: render targets written
     bool ps_writes_depth;
     bool ps_discards;

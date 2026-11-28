@@ -505,11 +505,17 @@ usize rdna_disassemble(const RdnaInst& in, char* out, usize size) {
             put_operand(t, in.dst[i]);
             first = false;
         }
+        bool interpolation =
+            in.op == OP_V_INTERP_P1LL_F16 || in.op == OP_V_INTERP_P1LV_F16 || in.op == OP_V_INTERP_P2_F16;
         for (u32 i = 0; i < in.num_src; i++) {
             t.put(first ? "" : ", ");
             put_operand(t, in.src[i]);
             first = false;
+            if (interpolation && i == 0)
+                t.put(", attr%u.%c", in.attr, "xyzw"[in.attr_chan & 3]);
         }
+        if (interpolation && in.attr_high)
+            t.put(" high");
         if (in.has_dpp)
             put_dpp(t, in);
         if (in.has_sdwa)

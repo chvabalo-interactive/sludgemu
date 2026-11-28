@@ -1385,6 +1385,92 @@ static void test_wave64_emission() {
     }
 }
 
+// --- 16-bit interpolation ------------------------------------------------------------------------------
+
+// A pixel shader with perspective center barycentrics (v0 = I, v1 = J).
+static ShaderInfo pixel_info() {
+    ShaderInfo info = {};
+    info.stage = SHADER_PIXEL;
+    info.resource_heap_sgpr = NO_HEAP_SGPR;
+    info.sampler_heap_sgpr = NO_HEAP_SGPR;
+    info.ps_input_addr = 1u << 1;
+    return info;
+}
+
+static void put_words(Asm& a, const u32* w, u32 count) {
+    for (u32 i = 0; i < count; i++)
+        a.put(w[i]);
+}
+
+// Attributes holding two 16-bit values per dword: each half is interpolated from the vertices' values
+// (the attribute is declared flat), next to an attribute interpolated as 32-bit floats as declared.
+static void test_half_interpolation() {
+    static const u32 k_program[] = {
+        0xd7420002, 0x02020043, // v_interp_p1ll_f16 v2, v0, attr3.y
+        0xd75a0002, 0x040a0243, // v_interp_p2_f16 v2, v1, attr3.y, v2
+        0xd7420003, 0x02020143, // v_interp_p1ll_f16 v3, v0, attr3.y high
+        0xd75a8003, 0x040e0343, // v_interp_p2_f16 v3, v1, attr3.y, v3 high clamp
+        0xc8101000,             // v_interp_p1_f32 v4, v0, attr4.x
+        0xc8111001,             // v_interp_p2_f32 v4, v1, attr4.x
+        0xf800180f, 0x04040302, // exp mrt0, v2, v3, v4, v4 done vm
+        0xbf810000,             // s_endpgm
+    };
+    ShaderInfo info = pixel_info();
+    {
+        Asm a = {};
+        put_words(a, k_program, ARRAY_COUNT(k_program));
+        CHECK(translate(a, info));
+        CHECK(g_out.ps_attribute_mask == ((1u << 3) | (1u << 4)));
+        CHECK(g_out.ps_mixed_mask == 1u << 3);
+        CHECK(hlsl_has("    nointerpolation float4 p3 : P3;"));
+        CHECK(hlsl_has("    float4 p4 : P4;"));
+        CHECK(hlsl_has("    float3 barycentrics : SV_Barycentrics;"));
+        CHECK(hlsl_has("#define attr3_center_half(c, s) ("
+                       "f16tof32(asuint(GetAttributeAtVertex(input.p3, 0).c) >> s) * input.barycentrics.x + "));
+        CHECK(hlsl_has("#define attr4_center input.p4"));
+        // The low half written, the high half kept; the clamp saturates.
+        CHECK(hlsl_has("((v2 & 0xffff0000u) | f32tof16(attr3_center_half(y, 0)))"));
+        CHECK(hlsl_has("((v3 & 0xffff0000u) | f32tof16(saturate(attr3_center_half(y, 16))))"));
+        CHECK(hlsl_has("asuint(attr4_center.x)"));
+    }
+    {
+        // The decoder takes the attribute from the src0 field.
+        RdnaInst in;
+        CHECK(rdna_decode(k_program, ARRAY_COUNT(k_program), 0x18, &in));
+        CHECK(in.op == OP_V_INTERP_P2_F16 && in.attr == 3 && in.attr_chan == 1 && in.attr_high && in.clamp);
+        CHECK(in.num_src == 2 && in.src[0].kind == OPND_VGPR && in.src[0].reg == 1 && in.src[1].reg == 3);
+        char text[128];
+        rdna_disassemble(in, text, sizeof(text));
+        CHECK(strstr(text, "v3, v1, attr3.y, v3 high clamp") != nullptr);
+    }
+    {
+        // P0 from a VGPR (16-bank LDS) is not folded into the second step.
+        static const u32 k_p1lv[] = {
+            0xd7430002, 0x04160043, // v_interp_p1lv_f16 v2, v0, attr3.y, v5
+            0xd75a0002, 0x040a0243, // v_interp_p2_f16 v2, v1, attr3.y, v2
+            0xf800180f, 0x02020202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xbf810000,             // s_endpgm
+        };
+        Asm a = {};
+        put_words(a, k_p1lv, ARRAY_COUNT(k_p1lv));
+        CHECK(!translate(a, info));
+        CHECK(error_has("v_interp_p1lv_f16"));
+    }
+    {
+        // A negated J changes the arithmetic the desktop interpolation does.
+        static const u32 k_negated[] = {
+            0xd7420002, 0x02020043, // v_interp_p1ll_f16 v2, v0, attr3.y
+            0xd75a0002, 0x440a0243, // v_interp_p2_f16 v2, -v1, attr3.y, v2
+            0xf800180f, 0x02020202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xbf810000,             // s_endpgm
+        };
+        Asm a = {};
+        put_words(a, k_negated, ARRAY_COUNT(k_negated));
+        CHECK(!translate(a, info));
+        CHECK(error_has("source modifiers"));
+    }
+}
+
 void test_shader_translate() {
     rdna_init();
     test_constant_sampler_in_vcc();
@@ -1402,5 +1488,6 @@ void test_shader_translate() {
     test_descriptors_on_paths();
     test_descriptor_shadow_records();
     test_wave64_emission();
+    test_half_interpolation();
     g_out.hlsl.release();
 }

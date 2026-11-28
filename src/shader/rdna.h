@@ -190,8 +190,10 @@ struct RdnaInst {
 
     s32 simm16; // SOPP/SOPK immediate; for branches the target byte offset (see branch_target)
     u32 branch_target;
-    // VINTRP
+    // VINTRP, and the 16-bit interpolation instructions (VOP3): the attribute and channel, and for
+    // 16-bit ones which half of each attribute dword holds the value
     u8 attr, attr_chan;
+    bool attr_high;
 
     RdnaMemory mem;
     RdnaExport exp;
