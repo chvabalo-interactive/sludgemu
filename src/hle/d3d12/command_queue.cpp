@@ -248,33 +248,6 @@ static void fence_op(ConsoleCommandQueue* self, BacklogKind kind, ID3D12Fence* f
         backlog_run(self); // covered meanwhile, or the wait arms
 }
 
-void console_queues_report_backlogs(GpuFenceNamer name) {
-    AcquireSRWLockShared(&g_slot_queues_lock);
-    for (u32 s = 0; s < GPU_MAX_QUEUES; s++) {
-        ConsoleCommandQueue* q = g_slot_queues[s];
-        if (!q || !TryAcquireSRWLockExclusive(&q->lock))
-            continue; // (one busy now isn't stuck; waiting could deadlock with wake_held_waits)
-        if (const BacklogOp* op = backlog_front(&q->backlog)) {
-            if (op->kind == BACKLOG_WAIT) {
-                char fence_name[160];
-                name(op->fence, fence_name, sizeof(fence_name));
-                LOG_W(
-                    "d3d12",
-                    "  queue slot %u holds back %u ops; the first waits for %s to reach %llu (it is at %llu)",
-                    s, q->backlog.count, fence_name, op->value, op->fence->GetCompletedValue());
-            } else if (op->kind == BACKLOG_EXECUTE && op->after_slot != GPU_NO_QUEUE) {
-                LOG_W("d3d12",
-                      "  queue slot %u holds back %u ops; the first waits for submission %llu of slot %u", s,
-                      q->backlog.count, op->after, op->after_slot);
-            } else {
-                LOG_W("d3d12", "  queue slot %u holds back %u ops", s, q->backlog.count);
-            }
-        }
-        ReleaseSRWLockExclusive(&q->lock);
-    }
-    ReleaseSRWLockShared(&g_slot_queues_lock);
-}
-
 static void queue_destroy(void* object) {
     ConsoleCommandQueue* queue = (ConsoleCommandQueue*)object;
     if (queue->slot != GPU_NO_QUEUE) {

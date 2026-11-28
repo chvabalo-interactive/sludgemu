@@ -9,11 +9,10 @@
 // The desktop D3D12 device everything is translated to (Agility SDK runtime).
 
 struct GpuOptions {
-    bool debug_layer;     // D3D12 debug layer + GPU-based validation off (too slow for a title)
-    bool removal_reports; // DRED: where the GPU stopped when the device goes (implied by debug_layer)
-    bool warp;            // use the software rasterizer instead of the GPU
-    bool serialize;       // every title submission waits for the GPU to finish it (diagnostics)
-    bool frame_stats;     // log presents per second and the longest frame interval (diagnostics)
+    bool debug_layer; // D3D12 debug layer + GPU-based validation off (too slow for a title)
+    bool warp;        // use the software rasterizer instead of the GPU
+    bool serialize;   // every title submission waits for the GPU to finish it (diagnostics)
+    bool frame_stats; // log presents per second and the longest frame interval (diagnostics)
 };
 
 void gpu_set_options(const GpuOptions& options);
@@ -39,10 +38,6 @@ bool gpu_video_memory(GpuVideoMemory* out);
 // True if `hr` says the device is lost. The first time, logs why (DRED details with the debug
 // layer). The removal is also reported on its own once the runtime notices it.
 bool gpu_device_lost(HRESULT hr);
-// With removal reports: removes the device on purpose, so DRED reports where every queue stopped (the
-// markers of the operations around it included). Without them, logs that they would. For GPU work
-// that never finishes, which the driver keeps running when it can preempt it.
-void gpu_remove_device(const char* why);
 
 // Command queues running translated work. Registering gives a queue a slot whose fence counts its
 // submissions; call gpu_queue_submitted after every ExecuteCommandLists. Unregistering waits for
@@ -82,8 +77,7 @@ void gpu_queue_wait(u32 slot, u64 number);
 // The fence counting the queue's submissions, for other queues to wait on (alive as long as the slot).
 ID3D12Fence* gpu_queue_fence(u32 slot);
 
-// Fence waits and signals on a queue, in order with its submissions. A registered queue remembers
-// its recent ones for stall reports (gpu_queue_report_stall).
+// Fence waits and signals on a queue, in order with its submissions.
 void gpu_queue_wait_on(ID3D12CommandQueue* queue, ID3D12Fence* fence, u64 value);
 void gpu_queue_signal_on(ID3D12CommandQueue* queue, ID3D12Fence* fence, u64 value);
 
@@ -92,21 +86,6 @@ void gpu_queue_signal_on(ID3D12CommandQueue* queue, ID3D12Fence* fence, u64 valu
 // desktop queue: the video memory manager may wait for queued work (making memory resident, for one)
 // on the very thread that would submit what ends the wait.
 bool gpu_fence_wait_covered(ID3D12Fence* fence, u64 value);
-
-// How far a queue got: submissions numbered (held-back ones included), handed to the desktop queue,
-// and finished by the GPU. False for a free slot.
-struct GpuQueueProgress {
-    u64 numbered;
-    u64 executed;
-    u64 completed;
-};
-bool gpu_queue_progress(u32 slot, GpuQueueProgress* out);
-
-// Logs where every queue is and what holds it: the fence wait in front of the submission it is
-// stuck at, and which queued signal (if any) would release it. `name` describes a fence (a title
-// counter, say) into `out`; nullptr names fences by address.
-typedef void (*GpuFenceNamer)(ID3D12Fence* fence, char* out, u32 size);
-void gpu_queue_report_stall(GpuFenceNamer name);
 
 // Names a desktop object for the debug layer's messages (printf-style); nothing without the layer.
 void gpu_set_name(ID3D12Object* object, const char* format, ...);

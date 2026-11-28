@@ -340,7 +340,6 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
         console_set_device(g_device);
         console_command_queue_init();
         console_fence_init();
-        console_stall_watch_start();
         console_command_allocator_init();
         console_command_list_init();
         gpu_window_init();
