@@ -95,6 +95,7 @@ enum : u32 {
     SOP2_XOR_B64 = 19,
     SOP2_BFM_B32 = 36,
     SOP2_BFM_B64 = 37,
+    SOP2_BFE_U32 = 39,
     SOP1_MOV_B32 = 3,
     SOP1_MOV_B64 = 4,
     SOP1_CMOV_B64 = 6,
@@ -105,6 +106,7 @@ enum : u32 {
     SMEM_LOAD_DWORD = 0,
     SMEM_LOAD_DWORDX4 = 2,
     SMEM_LOAD_DWORDX8 = 3,
+    SMEM_LOAD_DWORDX16 = 4,
     MIMG_SAMPLE_LZ = 39,
     MIMG_SAMPLE_C_LZ = 47,
     VOPC_CMP_EQ_U32 = 0xC2,
@@ -498,7 +500,7 @@ static void test_swapped_heap_sampler() {
 
 // Translated code keeps a loaded descriptor's heap address only, so what changes a descriptor (or puts
 // one together) must fail rather than read the unchanged one. Reading a dword the descriptor shadow
-// doesn't hold (samplers', images') as a value fails where it is read.
+// doesn't hold (samplers') as a value fails where it is read.
 static void test_changed_descriptors() {
     ShaderInfo info = compute_info();
     {
@@ -543,11 +545,11 @@ static void test_changed_descriptors() {
     {
         Asm a = {};
         load_descriptors(a, true);
-        a.sop2(SOP2_OR_B32, 13, 13, LIT, 0x1000u);
+        a.sop2(SOP2_OR_B32, 13, 13, LIT, 0x1000u); // read from the shadow, then a value
         sample(a, 16);
         a.end();
         CHECK(!translate(a, info));
-        CHECK(error_has("image descriptor dword read as a value"));
+        CHECK(error_has("image descriptor changed after loading"));
     }
     {
         Asm a = {};
@@ -628,7 +630,7 @@ static void load_buffer_descriptor(Asm& a, u32 slot) {
     a.smem(SMEM_LOAD_DWORDX4, 8, 2, slot * 32);
 }
 
-static const char k_shadow_kind_branch[] = "if (g_descriptor_info.Load((s8 & ~31u) + 16u) == 2u) {";
+static const char k_shadow_kind_branch[] = "if (g_descriptor_info.Load(shadow_at(s8 & ~31u) + 32u) == 2u) {";
 
 // Root signature ranges don't decide what a slot holds: what the program does through it does, and a
 // slot it only reads takes the kind the descriptor shadow records.
@@ -644,9 +646,10 @@ static void test_view_kinds() {
         a.end();
         CHECK(translate(a, info));
         CHECK(hlsl_has("RWByteAddressBuffer b_ = ResourceDescriptorHeap[(s8 >> 5)];"));
-        CHECK(hlsl_has("uint a_ = v5 * ((g_descriptor_info.Load(s9) >> 16) & 0x3fffu)"));
+        CHECK(hlsl_has("uint a_ = v5 * ((g_descriptor_info.Load(shadow_at(s9)) >> 16) & 0x3fffu)"));
         CHECK(hlsl_has("InterlockedAdd(a_, v6, o_)"));
         CHECK(hlsl_has("ByteAddressBuffer g_descriptor_info : register(t0, space101);"));
+        CHECK(hlsl_has("uint shadow_at(uint a) { return a + a / 32u * 4u; }"));
         CHECK(!hlsl_has(k_shadow_kind_branch));
     }
     {
@@ -710,17 +713,48 @@ static void test_descriptor_values() {
         a.sop2(SOP2_ADD_U32, 21, 20, ZERO + 1);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("(g_descriptor_info.Load(s10) & 0x0001ffffu)"));
-        CHECK(!hlsl_has("Load(s20)")); // s20 holds the value itself
+        CHECK(hlsl_has("(g_descriptor_info.Load(shadow_at(s10)) & 0x0001ffffu)"));
+        CHECK(!hlsl_has("shadow_at(s20)")); // s20 holds the value itself
     }
     {
-        // Image descriptors' bits aren't in the shadow.
+        // An image descriptor's size fields, the way compilers compute a texture's size: the width
+        // (dwords 1 and 2), the base level (dword 3) and the depth (dword 4), all from the shadow.
         Asm a = {};
         load_descriptors(a, false);
-        a.sop2(SOP2_AND_B32, 20, 10, LIT, 0x3FFFu);
+        a.sop2(SOP2_BFE_U32, 20, 9, LIT, 0x2001Eu);
+        a.sop2(SOP2_AND_B32, 21, 10, LIT, 0x3FFFu);
+        a.sop2(SOP2_BFE_U32, 22, 11, LIT, 0x4000Cu);
+        a.sop2(SOP2_AND_B32, 23, 12, LIT, 0x1FFFu);
+        a.mimg(MIMG_LOAD, 4, 0, 8, 0, 0x1);
         a.end();
-        CHECK(!translate(a, info));
-        CHECK(error_has("image descriptor dword read as a value"));
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("g_descriptor_info.Load(shadow_at(s9))"));
+        CHECK(hlsl_has("(g_descriptor_info.Load(shadow_at(s10)) & 0x00003fffu)"));
+        CHECK(hlsl_has("g_descriptor_info.Load(shadow_at(s11))"));
+        CHECK(hlsl_has("(g_descriptor_info.Load(shadow_at(s12)) & 0x00001fffu)"));
+        CHECK(hlsl_has("ResourceDescriptorHeap[s8 >> 5]")); // the descriptor itself is unchanged
+    }
+    {
+        // Two neighbouring image descriptors loaded at once, as compilers do with s_load_dwordx16: the
+        // second one's dwords are the next slot's, which the shadow keeps after the first one's record
+        // (heap byte 40, dword 2 of slot 1, is shadow byte 36 + 8), and its kind is that slot's.
+        Asm a = {};
+        a.sop1(SOP1_MOV_B32, 2, 0);
+        a.sop1(SOP1_MOV_B32, 3, ZERO);
+        a.smem(SMEM_LOAD_DWORDX16, 8, 2, 0);
+        a.sop2(SOP2_AND_B32, 30, 18, LIT, 0x3FFFu);
+        a.sop2(SOP2_BFE_U32, 31, 11, LIT, 0x4000Cu);
+        a.mimg(MIMG_LOAD, 4, 0, 8, 0, 0x1);
+        a.mimg(MIMG_LOAD, 5, 0, 16, 0, 0x1);
+        a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("s18 = a_ + 40u;"));
+        CHECK(hlsl_has("(g_descriptor_info.Load(shadow_at(s18)) & 0x00003fffu)"));
+        CHECK(hlsl_has("g_descriptor_info.Load(shadow_at(s11))"));
+        CHECK(hlsl_has("ResourceDescriptorHeap[s8 >> 5]"));
+        CHECK(hlsl_has("ResourceDescriptorHeap[s16 >> 5]"));
+        u32 a40 = 40;
+        CHECK(a40 + a40 / SHADER_SHADOW_DESCRIPTOR_BYTES * 4 == SHADER_SHADOW_RECORD_BYTES + 8);
     }
     {
         // A descriptor picked per lane: the address is the table's plus a scaled index, with a high
@@ -733,18 +767,29 @@ static void test_descriptor_values() {
         a.global_load(GLOBAL_LOAD_DWORD, 4, 2, 8);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("v4 = g_descriptor_info.Load((EXEC ? v2 + 0x8u : 0u));"));
+        CHECK(hlsl_has("v4 = g_descriptor_info.Load(shadow_at(EXEC ? v2 + 0x8u : 0u));"));
     }
     {
-        // The second half of a slot is an image descriptor's dwords 4-7.
+        // The second half of a slot: an image descriptor's dwords 4-7.
         Asm a = {};
         a.vop2(VOP2_LSHLREV_B32, 2, ZERO + 5, 0);
         a.vop1(VOP1_MOV_B32, 3, ZERO);
         a.vop2(VOP2_ADD_NC_U32, 2, 0, 2);
         a.global_load(GLOBAL_LOAD_DWORD, 4, 2, 20);
         a.end();
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("v4 = g_descriptor_info.Load(shadow_at(EXEC ? v2 + 0x14u : 0u));"));
+    }
+    {
+        // Dwords of two slots at once: the shadow keeps the next slot's after this one's record.
+        Asm a = {};
+        a.vop2(VOP2_LSHLREV_B32, 2, ZERO + 5, 0);
+        a.vop1(VOP1_MOV_B32, 3, ZERO);
+        a.vop2(VOP2_ADD_NC_U32, 2, 0, 2);
+        a.global_load(GLOBAL_LOAD_DWORDX2, 4, 2, 28);
+        a.end();
         CHECK(!translate(a, info));
-        CHECK(error_has("image descriptor dwords 4-7"));
+        CHECK(error_has("reads across two descriptor slots"));
     }
     {
         // A dword loaded on one path and a value on the other, read after they join: the path holding
@@ -757,7 +802,7 @@ static void test_descriptor_values() {
         a.sop2(SOP2_AND_B32, 20, 10, LIT, 0x1FFFFu);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("s10 = g_descriptor_info.Load(s10);"));
+        CHECK(hlsl_has("s10 = g_descriptor_info.Load(shadow_at(s10));"));
         CHECK(hlsl_has("(s10 & 0x0001ffffu)"));
     }
     {
@@ -769,20 +814,19 @@ static void test_descriptor_values() {
         a.sop2(SOP2_AND_B32, 20, 10, LIT, 0x1FFFFu);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("scc = g_descriptor_info.Load(s10) != 0x00000000u;"));
-        CHECK(hlsl_has("(g_descriptor_info.Load(s10) & 0x0001ffffu)"));
+        CHECK(hlsl_has("scc = g_descriptor_info.Load(shadow_at(s10)) != 0x00000000u;"));
+        CHECK(hlsl_has("(g_descriptor_info.Load(shadow_at(s10)) & 0x0001ffffu)"));
     }
     {
-        // A dword of a slot the program samples through, loaded on its own: an image descriptor's,
-        // which the shadow doesn't hold.
+        // A dword of a slot the program samples through, loaded on its own: an image descriptor's.
         Asm a = {};
         load_descriptors(a, true);
         a.smem(SMEM_LOAD_DWORD, 20, 2, 4);
         sample(a, 16);
         a.sop2(SOP2_AND_B32, 21, 20, LIT, 0x3FFFu);
         a.end();
-        CHECK(!translate(a, info));
-        CHECK(error_has("image descriptor dword read as a value"));
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("(g_descriptor_info.Load(shadow_at(s20)) & 0x00003fffu)"));
     }
     {
         // A loaded dword in a vector register, read as a value: lanes outside EXEC read the first record.
@@ -792,7 +836,7 @@ static void test_descriptor_values() {
         a.vop2(VOP2_ADD_NC_U32, 7, V0 + 6, 0);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("g_descriptor_info.Load(EXEC ? v6 : 0u)"));
+        CHECK(hlsl_has("g_descriptor_info.Load(shadow_at(EXEC ? v6 : 0u))"));
     }
     {
         // Stored as it is, it would reach memory as its heap address.
@@ -814,7 +858,7 @@ static void test_descriptor_values() {
         a.global_load(GLOBAL_LOAD_DWORDX2, 2, 2, 4);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("{ uint a_ = (EXEC ? v2 + 0x4u : 0u);"));
+        CHECK(hlsl_has("{ uint a_ = shadow_at(EXEC ? v2 + 0x4u : 0u);"));
         CHECK(hlsl_has("v3 = g_descriptor_info.Load2(a_).y;"));
     }
     {
@@ -831,7 +875,7 @@ static void test_descriptor_values() {
         a.end();
         CHECK(translate(a, info));
         CHECK(hlsl_has("RWByteAddressBuffer b_ = ResourceDescriptorHeap[(s16 >> 5)];"));
-        CHECK(!hlsl_has("if (g_descriptor_info.Load((s16 & ~31u) + 16u) == 2u) {"));
+        CHECK(!hlsl_has("if (g_descriptor_info.Load(shadow_at(s16 & ~31u) + 32u) == 2u) {"));
     }
 }
 
@@ -1186,7 +1230,7 @@ static void test_descriptors_on_paths() {
         a.end();
         CHECK(translate(a, info));
         CHECK(hlsl_has("Texture2D<float4> tex_ = ResourceDescriptorHeap[s8 >> 5];"));
-        CHECK(hlsl_has("if (g_descriptor_info.Load((s8 & ~31u) + 16u) == 2u) {"));
+        CHECK(hlsl_has("if (g_descriptor_info.Load(shadow_at(s8 & ~31u) + 32u) == 2u) {"));
     }
     {
         // A table address and a sampler table's are of different heaps: nothing to place.
@@ -1230,10 +1274,10 @@ static void test_descriptors_on_paths() {
         a.sop2(SOP2_ADD_U32, 21, 20, ZERO + 1);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("uint r0_ = scc ? g_descriptor_info.Load(s10) : 0x00000000u;"));
+        CHECK(hlsl_has("uint r0_ = scc ? g_descriptor_info.Load(shadow_at(s10)) : 0x00000000u;"));
     }
     {
-        // An image descriptor selected against constants reads its dwords as values, which it can't.
+        // An image descriptor selected against constants reads its dwords as values: no descriptor.
         Asm a = {};
         load_descriptors(a, false);
         a.sopc(SOPC_CMP_EQ_U32, 4, ZERO);
@@ -1242,7 +1286,7 @@ static void test_descriptors_on_paths() {
         a.mimg(MIMG_LOAD, 4, 0, 24, 0, 0x1);
         a.end();
         CHECK(!translate(a, info));
-        CHECK(error_has("image descriptor dword read as a value at 0x14"));
+        CHECK(error_has("resource not from a descriptor table (written at 0x14 by s_cselect_b64)"));
     }
     {
         // A descriptor on one path only says where it went.
@@ -1282,10 +1326,22 @@ static void test_descriptors_on_paths() {
 
 // --- descriptor shadow records -------------------------------------------------------------------------
 
+#define RECORD_DWORDS (SHADER_SHADOW_RECORD_BYTES / 4)
+#define KIND_DWORD    (SHADER_SHADOW_KIND_OFFSET / 4)
+
 // What the runtime writes into the shadow for a slot, read back the way translated programs read it.
 static void test_descriptor_shadow_records() {
     u8 slot[32];
-    u32 record[8];
+    u32 record[RECORD_DWORDS];
+    // Translated code finds the dword at heap byte address a at shadow_at(a) = a + a / 32 * 4: dword j
+    // of slot i's record.
+    bool mapped = true;
+    for (u32 i = 0; i < 3; i++)
+        for (u32 j = 0; j < 8; j++) {
+            u32 a = i * 32 + j * 4;
+            mapped &= a + a / 32 * 4 == i * SHADER_SHADOW_RECORD_BYTES + j * 4;
+        }
+    CHECK(mapped);
     {
         // A raw view of 0x1234 bytes at 0x2_8000_0100: no stride, records count bytes.
         u32 bits[4];
@@ -1293,13 +1349,14 @@ static void test_descriptor_shadow_records() {
         u64 marker[2] = {DESCRIPTOR_MARKER_MAGIC | (u64)(2 | SHADOW_VIEW_UAV << 8) << 32, 0x1000};
         memcpy(slot, marker, 16);
         memcpy(slot + DESCRIPTOR_MARKER_BITS, bits, 16);
-        shadow_record(slot, record);
+        u32 stale[4] = {1, 2, 3, 4}; // what an image view left in the slot before: not an image now
+        shadow_record(slot, stale, record);
         u64 base = record[0] | (u64)(record[1] & 0xFFFF) << 32;
         CHECK(base == 0x280000100ull);
         CHECK(((record[1] >> 16) & 0x3FFF) == 0);
         CHECK(record[2] == 0x1234 && (record[2] & ~15u) != 0);
-        CHECK(record[4] == SHADOW_VIEW_UAV);
-        CHECK(record[5] == 0 && record[6] == 0 && record[7] == 0);
+        CHECK(record[4] == 0 && record[5] == 0 && record[6] == 0 && record[7] == 0);
+        CHECK(record[KIND_DWORD] == SHADOW_VIEW_UAV);
     }
     {
         // A structured view of 100 elements of 24 bytes, rewritten the way compilers make a raw
@@ -1317,19 +1374,224 @@ static void test_descriptor_shadow_records() {
         u64 native[2] = {0x80B3FF00ull | NATIVE_CBV_STRIDE_BITS << 48, 64 | NATIVE_CBV_FORMAT_BITS << 32};
         memcpy(slot, native, 16);
         memset(slot + 16, 0xEE, 16);
-        shadow_record(slot, record);
+        shadow_record(slot, nullptr, record);
         CHECK(record[0] == 0x80B3FF00u && record[1] == 0x00100000u);
         CHECK(((record[1] >> 16) & 0x3FFF) == 16 && record[2] == 64);
-        CHECK(record[4] == SHADOW_VIEW_CBV);
+        CHECK(record[4] == 0 && record[KIND_DWORD] == SHADOW_VIEW_CBV);
     }
     {
         // Memory never written as a descriptor: a null view's record.
         memset(slot, 0x5A, sizeof(slot));
-        shadow_record(slot, record);
+        shadow_record(slot, nullptr, record);
         bool zero = true;
-        for (u32 i = 0; i < 8; i++)
+        for (u32 i = 0; i < RECORD_DWORDS; i++)
             zero &= record[i] == 0;
         CHECK(zero);
+    }
+    {
+        // An image view's slot: dwords 0-3 after the marker, dwords 4-7 where the view was made.
+        u32 bits[8] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17};
+        u64 marker[2] = {DESCRIPTOR_MARKER_MAGIC | (u64)(2 | SHADOW_VIEW_SRV << 8 | DESCRIPTOR_MARKER_IMAGE)
+                                                       << 32,
+                         0x1000};
+        memcpy(slot, marker, 16);
+        memcpy(slot + DESCRIPTOR_MARKER_BITS, bits, 16);
+        shadow_record(slot, bits + 4, record);
+        CHECK(memcmp(record, bits, sizeof(bits)) == 0);
+        CHECK(record[KIND_DWORD] == SHADOW_VIEW_SRV);
+        // Where the dwords 4-7 are gone (the heap that made the view), they read as zeros.
+        shadow_record(slot, nullptr, record);
+        CHECK(record[3] == 0x13 && record[4] == 0 && record[7] == 0);
+    }
+}
+
+// An image descriptor's fields, read the way compiled programs compute a texture's size from them.
+struct ImageFields {
+    u64 address;
+    u32 format, width, height, depth, base_level, last_level, type, first_slice, array_pitch, max_mip;
+    u32 select[4];
+    u32 swizzle_mode, border_swizzle;
+    bool null; // programs take a descriptor whose dword 1 is zero for a null view
+};
+
+static ImageFields image_fields(const u32 d[8]) {
+    ImageFields f;
+    f.address = ((u64)d[0] | (u64)(d[1] & 0xFF) << 32) << 8;
+    f.format = (d[1] >> 20) & 0x1FF;
+    f.width = ((d[2] & 0x3FFF) << 2 | d[1] >> 30) + 1;
+    f.height = ((d[2] >> 14) & 0xFFFF) + 1;
+    for (u32 c = 0; c < 4; c++)
+        f.select[c] = (d[3] >> (3 * c)) & 7;
+    f.base_level = (d[3] >> 12) & 15;
+    f.last_level = (d[3] >> 16) & 15;
+    f.swizzle_mode = (d[3] >> 20) & 31;
+    f.border_swizzle = (d[3] >> 25) & 7;
+    f.type = d[3] >> 28;
+    f.depth = (d[4] & 0x1FFF) + 1;
+    f.first_slice = (d[4] >> 16) & 0x3FFF;
+    f.array_pitch = d[5] & 15;
+    f.max_mip = (d[5] >> 4) & 15;
+    f.null = d[1] == 0;
+    return f;
+}
+
+static D3D12_RESOURCE_DESC1 texture_desc(D3D12_RESOURCE_DIMENSION dimension, u64 width, u32 height, u32 depth,
+                                         u32 mips, DXGI_FORMAT format) {
+    D3D12_RESOURCE_DESC1 r = {};
+    r.Dimension = dimension;
+    r.Width = width;
+    r.Height = height;
+    r.DepthOrArraySize = (UINT16)depth;
+    r.MipLevels = (UINT16)mips;
+    r.Format = format;
+    r.SampleDesc.Count = 1;
+    return r;
+}
+
+// Image descriptors of texture views, as the console runtime makes them.
+static void test_image_descriptors() {
+    u32 d[8];
+    {
+        // A sampled 2D texture viewed from its third mip on: sizes of mip 0, the mips viewed, the
+        // format's hardware number, the console's swizzle for sampled textures (4 KiB standard).
+        D3D12_RESOURCE_DESC1 r = texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1920, 1080, 1, 11,
+                                              DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+        D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+        v.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture2D.MostDetailedMip = 2;
+        v.Texture2D.MipLevels = (UINT)-1;
+        v.Texture2D.ResourceMinLODClamp = 1.5f;
+        shadow_texture_srv(r, 0x345678900ull, v, 0, d);
+        ImageFields f = image_fields(d);
+        CHECK(f.address == 0x345678900ull && !f.null);
+        CHECK(f.format == 0x82);
+        CHECK(f.width == 1920 && f.height == 1080);
+        CHECK(f.width >> f.base_level == 480);
+        CHECK(f.base_level == 2 && f.last_level == 10 && f.max_mip == 10);
+        CHECK(f.type == 9 && f.depth == 1 && f.first_slice == 0 && f.array_pitch == 0);
+        CHECK(f.select[0] == 4 && f.select[1] == 5 && f.select[2] == 6 && f.select[3] == 7);
+        CHECK(f.swizzle_mode == 5 && f.border_swizzle == 0);
+        CHECK(((d[1] >> 8) & 0xFFF) == 0x180); // the minimum LOD, 4.8 fixed point
+        CHECK((d[2] >> 31) == 1 && d[6] == 0 && d[7] == 0);
+    }
+    {
+        // Blue in the low bits takes the channels swizzled; a view's own mapping picks among them.
+        D3D12_RESOURCE_DESC1 r =
+            texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 64, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM);
+        D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture2D.MipLevels = 1;
+        shadow_texture_srv(r, 0x100000, v, 0, d);
+        ImageFields f = image_fields(d);
+        CHECK(f.format == 56);
+        CHECK(f.select[0] == 6 && f.select[1] == 5 && f.select[2] == 4 && f.select[3] == 7);
+        CHECK(f.border_swizzle == 4);
+        v.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        v.Shader4ComponentMapping =
+            D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2,
+                                                    D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+                                                    D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+                                                    D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
+        shadow_texture_srv(r, 0x100000, v, 0, d);
+        f = image_fields(d);
+        CHECK(f.select[0] == 4 && f.select[1] == 0 && f.select[2] == 6 && f.select[3] == 1);
+    }
+    {
+        // A 1x1 texture still reads as a view (its format is in dword 1); a format without a hardware
+        // number the title names itself is taken as it is.
+        D3D12_RESOURCE_DESC1 r =
+            texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, 1, 1, 1, DXGI_FORMAT_R8_UNORM);
+        D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture2D.MipLevels = 1;
+        shadow_texture_srv(r, 0, v, 0, d);
+        CHECK(!image_fields(d).null && image_fields(d).format == 1 && image_fields(d).width == 1);
+        CHECK(image_fields(d).select[1] == 0 && image_fields(d).select[3] == 1);
+        shadow_texture_srv(r, 0, v, 0x1C0, d);
+        CHECK(image_fields(d).format == 0x1C0);
+    }
+    {
+        // A 3D texture sampled whole: depth of mip 0, scaled by the base level where programs need it.
+        D3D12_RESOURCE_DESC1 r =
+            texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 64, 64, 32, 0, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.Texture3D.MostDetailedMip = 1;
+        v.Texture3D.MipLevels = (UINT)-1;
+        shadow_texture_srv(r, 0x200000, v, 0, d);
+        ImageFields f = image_fields(d);
+        CHECK(f.type == 10 && f.format == 71);
+        CHECK(f.depth == 32 && f.array_pitch == 0 && f.first_slice == 0);
+        CHECK(f.base_level == 1 && f.last_level == 6 && f.max_mip == 6); // a full chain of 64: 7 mips
+    }
+    {
+        // A 3D unordered access view of one mip's slices from the fifth: the slice range, which
+        // programs size as depth - first slice.
+        D3D12_RESOURCE_DESC1 r =
+            texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 64, 64, 32, 3, DXGI_FORMAT_R32_FLOAT);
+        r.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC v = {};
+        v.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        v.Texture3D.MipSlice = 1;
+        v.Texture3D.FirstWSlice = 4;
+        v.Texture3D.WSize = (UINT)-1;
+        shadow_texture_uav(r, 0x200000, v, d);
+        ImageFields f = image_fields(d);
+        CHECK(f.type == 10 && f.format == 22);
+        CHECK(f.array_pitch == 1 && f.first_slice == 4 && f.depth - f.first_slice == 12);
+        CHECK(f.base_level == 1 && f.last_level == 1 && f.max_mip == 2);
+        // A mip deeper than the volume halves: one slice, not a range running past the end.
+        r.MipLevels = 7;
+        v.Texture3D.MipSlice = 6;
+        v.Texture3D.FirstWSlice = 0;
+        shadow_texture_uav(r, 0x200000, v, d);
+        f = image_fields(d);
+        CHECK(f.first_slice == 0 && f.depth == 1);
+        CHECK(f.base_level == 6 && f.last_level == 6 && f.max_mip == 6);
+    }
+    {
+        // Arrays and cubes: the slices viewed, the last one in the depth field.
+        D3D12_RESOURCE_DESC1 r =
+            texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 128, 128, 24, 1, DXGI_FORMAT_BC7_UNORM);
+        D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        v.TextureCubeArray.MipLevels = 1;
+        v.TextureCubeArray.First2DArrayFace = 6;
+        v.TextureCubeArray.NumCubes = 2;
+        shadow_texture_srv(r, 0x200000, v, 0, d);
+        ImageFields f = image_fields(d);
+        CHECK(f.type == 11 && f.format == 0xB5);
+        CHECK(f.first_slice == 6 && f.depth == 18); // faces 6..17
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        v.Texture2DArray.MostDetailedMip = 0;
+        v.Texture2DArray.MipLevels = 1;
+        v.Texture2DArray.FirstArraySlice = 3;
+        v.Texture2DArray.ArraySize = (UINT)-1;
+        shadow_texture_srv(r, 0x200000, v, 0, d);
+        f = image_fields(d);
+        CHECK(f.type == 13 && f.first_slice == 3 && f.depth == 24 && f.depth - f.first_slice == 21);
+    }
+    {
+        // Multisampled: log2 of the sample count where mips would be; render targets' swizzle.
+        D3D12_RESOURCE_DESC1 r =
+            texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 3840, 2160, 1, 1, DXGI_FORMAT_R11G11B10_FLOAT);
+        r.SampleDesc.Count = 4;
+        r.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+        v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        shadow_texture_srv(r, 0x200000, v, 0, d);
+        ImageFields f = image_fields(d);
+        CHECK(f.type == 14 && f.format == 36);
+        CHECK(f.base_level == 0 && f.last_level == 2 && f.max_mip == 2);
+        CHECK(f.swizzle_mode == 27); // 64 KiB render target, XOR
+        CHECK(f.select[3] == 1);     // no alpha: one
     }
 }
 
@@ -1354,8 +1616,8 @@ static void test_wave64_emission() {
         a.vop2(VOP2_ADD_NC_U32, 7, V0 + 6, 0);
         a.end();
         CHECK(translate(a, info));
-        CHECK(hlsl_has("g_descriptor_info.Load(EXEC0 ? v6_0 : 0u)"));
-        CHECK(hlsl_has("g_descriptor_info.Load(EXEC1 ? v6_1 : 0u)"));
+        CHECK(hlsl_has("g_descriptor_info.Load(shadow_at(EXEC0 ? v6_0 : 0u))"));
+        CHECK(hlsl_has("g_descriptor_info.Load(shadow_at(EXEC1 ? v6_1 : 0u))"));
         CHECK(!hlsl_tests_one_exec());
     }
     {
@@ -1600,6 +1862,7 @@ void test_shader_translate() {
     test_gathers_at_a_mip();
     test_descriptors_on_paths();
     test_descriptor_shadow_records();
+    test_image_descriptors();
     test_wave64_emission();
     test_half_interpolation();
     test_spills_apart();

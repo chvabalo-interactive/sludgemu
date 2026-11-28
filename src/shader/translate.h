@@ -33,10 +33,10 @@
 //   hold the byte address of each dword instead of descriptor bits, so translation fails where a
 //   program changes a loaded descriptor or puts one together (except buffer descriptor fields a raw
 //   desktop view ignores). Where a program reads a descriptor's dwords as values, translated code
-//   reads them from the descriptor shadow (below) at that address.
-// - The descriptor shadow: a buffer laid out like console resource heap memory, one 32-byte record per
-//   desktop heap slot holding the console descriptor's first four dwords (buffer descriptors whole)
-//   and the kind of the desktop view in the slot. Root signature ranges don't say reliably what a slot
+//   reads them from the descriptor shadow (below) for that address.
+// - The descriptor shadow: a record per desktop heap slot holding the console descriptor as console
+//   heap memory would (image descriptors' eight dwords, buffer descriptors' four), followed by the kind
+//   of the desktop view in the slot. Root signature ranges don't say reliably what a slot
 //   holds (titles label them loosely, and console hardware never looks), so a program's own accesses
 //   decide: a slot written through is an unordered access view, one sampled through a shader resource
 //   view, and one only read takes the kind the shadow records.
@@ -159,11 +159,13 @@ struct InlineSampler {
 #define SHADER_INLINE_SAMPLER_SPACE 103 // register s<i> holds inline sampler i
 
 // The descriptor shadow (see the model above): a raw buffer at register t0 of this space, a record per
-// desktop resource heap slot. Dwords 0-3: the console descriptor's dwords 0-3; dword 4: the desktop
-// view's kind; dwords 5-7: zero.
+// desktop resource heap slot. Dwords 0-7: the console descriptor (an image descriptor whole; a buffer
+// descriptor in dwords 0-3, zeros after); dword 8: the desktop view's kind. The dword at console heap
+// byte address A (a slot's 32 bytes, then the next slot's) is at A + A / 32 * 4 in the shadow.
 #define SHADER_DESCRIPTOR_SHADOW_SPACE 101
-#define SHADER_SHADOW_RECORD_BYTES     32
-#define SHADER_SHADOW_KIND_OFFSET      16
+#define SHADER_SHADOW_DESCRIPTOR_BYTES 32
+#define SHADER_SHADOW_RECORD_BYTES     36
+#define SHADER_SHADOW_KIND_OFFSET      32
 
 enum ShadowViewKind : u32 {
     SHADOW_VIEW_NONE = 0, // a null view or nothing written

@@ -64,8 +64,7 @@ static DescriptorOrigin descriptor_origin(const Translator& t, u32 reg, u32 dwor
         if (!heap_loaded(tag))
             return ORIGIN_MODIFIED;
         // The same table; the same slot where known.
-        u32 compared = HEAP_MODIFIED | HEAP_IMAGE;
-        if ((tag & ~compared) != (first & ~compared) ||
+        if ((tag & ~HEAP_MODIFIED) != (first & ~HEAP_MODIFIED) ||
             (slot != NO_DESCRIPTOR && d != NO_DESCRIPTOR && d != slot))
             return ORIGIN_ASSEMBLED;
         if (tag_payload(tag) & HEAP_MODIFIED)
@@ -118,7 +117,8 @@ enum ViewAccess {
     VIEW_BY_SHADOW,
 };
 
-u8 slot_use(const Translator& t, Tag tag, u16 index) {
+// What the program does through the descriptor at `index` of the heap tag's table (SLOT_* flags).
+static u8 slot_use(const Translator& t, Tag tag, u16 index) {
     if (index == NO_DESCRIPTOR || !heap_loaded(tag) || (tag_payload(tag) & 1) != HEAP_RESOURCES)
         return 0;
     for (u32 i = 0; i < t.slot_use_count; i++)
@@ -156,8 +156,8 @@ static bool view_access(Translator& t, const RdnaInst& in, u32 reg, bool writes,
 // The kind the shadow records for the slot of the loaded descriptor in `reg`: a uniform value.
 static const char* shadow_kind(Translator& t, u32 reg) {
     t.needs_descriptor_info = true;
-    return fmt(t, "g_descriptor_info.Load((%s & ~%uu) + %uu)", sgpr(t, reg), SHADER_SHADOW_RECORD_BYTES - 1,
-               SHADER_SHADOW_KIND_OFFSET);
+    return fmt(t, "g_descriptor_info.Load(shadow_at(%s & ~%uu) + %uu)", sgpr(t, reg),
+               SHADER_SHADOW_DESCRIPTOR_BYTES - 1, SHADER_SHADOW_KIND_OFFSET);
 }
 
 // Emitting an access for each view it may take: once for a known one; for VIEW_BY_SHADOW a branch on
@@ -1993,8 +1993,8 @@ static u8 access_flags(const RdnaInst& in) {
         return 0;
     ImageForm form = image_form(in.op);
     if (form.store || is_image_atomic(in.op))
-        return SLOT_IMAGE | SLOT_WRITTEN;
-    return SLOT_IMAGE | (form.sample || form.gather || in.op == OP_IMAGE_GET_LOD ? SLOT_SAMPLED : 0);
+        return SLOT_WRITTEN;
+    return form.sample || form.gather || in.op == OP_IMAGE_GET_LOD ? SLOT_SAMPLED : 0;
 }
 
 // --- LDS ---------------------------------------------------------------------------------------------
@@ -2341,20 +2341,20 @@ static void write_global_loaded(Translator& t, const RdnaInst& in, const char* b
 }
 
 // Descriptor heap memory read as data (programs read fields of descriptors they pick per lane): from the
-// descriptor shadow, which holds dwords 0-3 of each slot. The address is a heap address (a table's or
-// the heap's base plus an index scaled by the slot size, which translated code holds as a desktop heap
-// byte offset) with a high dword of zero: console heaps are below 4 GiB.
+// descriptor shadow, which holds each slot's descriptor. The address is a heap address (a table's or the
+// heap's base plus an index scaled by the slot size, which translated code holds as a desktop heap byte
+// offset) with a high dword of zero: console heaps are below 4 GiB.
 static bool emit_heap_global_load(Translator& t, const RdnaInst& in, const char* address) {
     u32 dwords = in.dst[0].count;
-    u32 at = (u32)in.mem.offset % SHADER_SHADOW_RECORD_BYTES;
+    u32 at = (u32)in.mem.offset % SHADER_SHADOW_DESCRIPTOR_BYTES;
     if (!(in.op >= OP_GLOBAL_LOAD_DWORD && in.op <= OP_GLOBAL_LOAD_DWORDX3)) {
         translator_fail(t, "%s at 0x%x to descriptor heap memory", rdna_op_name(in.op), in.offset);
         return false;
     }
-    // Programs address slots whole, so the offset tells the dwords' place in the slot.
-    if (at + 4 * dwords > SHADER_SHADOW_KIND_OFFSET) {
-        translator_fail(t, "%s at 0x%x reads image descriptor dwords 4-7, which the shadow doesn't hold",
-                        rdna_op_name(in.op), in.offset);
+    // Programs address slots whole, so the offset tells the dwords' place in the slot. The shadow keeps
+    // a slot's dwords together, but its record ends with the kind, not the next slot's first dwords.
+    if (at + 4 * dwords > SHADER_SHADOW_DESCRIPTOR_BYTES) {
+        translator_fail(t, "%s at 0x%x reads across two descriptor slots", rdna_op_name(in.op), in.offset);
         return false;
     }
     t.needs_descriptor_info = true;
@@ -2363,8 +2363,8 @@ static bool emit_heap_global_load(Translator& t, const RdnaInst& in, const char*
     // registers hold anything, and the shadow, a root descriptor, has no bounds: they read the first
     // record instead.
     if (t.exact)
-        load_address = fmt(t, "(%s ? %s : 0u)", exec_cond(t), load_address);
-    write_global_loaded(t, in, "g_descriptor_info", load_address);
+        load_address = fmt(t, "%s ? %s : 0u", exec_cond(t), load_address);
+    write_global_loaded(t, in, "g_descriptor_info", fmt(t, "shadow_at(%s)", load_address));
     return true;
 }
 

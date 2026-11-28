@@ -398,7 +398,7 @@ bool emit_join_conversions(Translator& t, s32 next, bool emitting) {
             any = true;
             if (emitting) {
                 t.needs_descriptor_info = true;
-                emit(t, "%s = g_descriptor_info.Load(%s);", sgpr(t, r), sgpr(t, r));
+                emit(t, "%s = g_descriptor_info.Load(shadow_at(%s));", sgpr(t, r), sgpr(t, r));
             }
         } else if (r != SRC_EXEC_LO && r != SRC_EXEC_HI && edge_converts(t, t.tags.sgpr[r], entry.sgpr[r])) {
             any = true;
@@ -415,7 +415,8 @@ bool emit_join_conversions(Translator& t, s32 next, bool emitting) {
                 any = true;
                 if (emitting) {
                     t.needs_descriptor_info = true;
-                    emit(t, "spill%u_%u = g_descriptor_info.Load(spill%u_%u);", slot, lane, slot, lane);
+                    emit(t, "spill%u_%u = g_descriptor_info.Load(shadow_at(spill%u_%u));", slot, lane, slot,
+                         lane);
                 }
             } else if (edge_converts(t, out, in)) {
                 any = true;

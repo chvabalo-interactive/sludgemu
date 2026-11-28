@@ -138,6 +138,8 @@ add_executable(sludgemu WIN32
     gpu/shader_schedule.cpp
     gpu/formats.h
     gpu/formats.cpp
+    gpu/image_formats.h
+    gpu/image_formats.cpp
     gpu/console_layout.h
     gpu/console_layout.cpp
     hle/xg/xg_xs.cpp

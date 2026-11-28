@@ -569,7 +569,7 @@ bool writes_lane_mask(const RdnaInst& in, u32 d) {
 static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 inst_idx);
 
 bool join_converts(Tag tag) {
-    return heap_loaded(tag) && (tag_payload(tag) & (1 | HEAP_MODIFIED | HEAP_IMAGE)) == HEAP_RESOURCES;
+    return heap_loaded(tag) && (tag_payload(tag) & (1 | HEAP_MODIFIED)) == HEAP_RESOURCES;
 }
 
 // Whether two tags don't name different tables (or heaps), which would make their slot indices
@@ -589,8 +589,8 @@ static bool same_table(Tag a, Tag b) {
 // (`converting`: the path holding the address reads the dword from the shadow at the jump, see
 // emit_join_conversions); otherwise it is marked HEAP_MODIFIED, which nothing can use.
 //
-// A dword that can't be converted (one the shadow doesn't hold, an image's or a sampler's, or one
-// already an address on some paths only) joins as a value all the same, holding its heap address on
+// A dword that can't be converted (a sampler's, which no shadow holds, or one already an address on
+// some paths only) joins as a value all the same, holding its heap address on
 // that path, as before the shadow: compilers leave such dwords in registers on paths where they are
 // dead, and liveness over the block graph can't tell (exec-masked skips of a loop's body join with
 // stale registers).
@@ -610,7 +610,7 @@ static Tag merged_tag(Tag a, Tag b, bool converting = false) {
     u32 parameter = la ? heap_parameter(a) : heap_parameter(b);
     if (la && lb && !same_table(a, b))
         parameter = HEAP_NO_TABLE;
-    u32 payload = ((pa | pb) & 1) | parameter << 1 | HEAP_LOADED | ((pa | pb) & (HEAP_MODIFIED | HEAP_IMAGE));
+    u32 payload = ((pa | pb) & 1) | parameter << 1 | HEAP_LOADED | ((pa | pb) & HEAP_MODIFIED);
     if (!la || !lb || ((pa ^ pb) & 1))
         payload |= HEAP_MODIFIED;
     return make_tag(TAG_HEAP, payload);
@@ -1101,22 +1101,6 @@ static void transfer(const Translator& t, TagState& s, const RdnaInst& in, u32 i
             u32 at = descriptor_of(s, in.src[0]);
             if (at != NO_DESCRIPTOR && null_soffset && in.mem.offset >= 0)
                 first = at * slot + (u32)in.mem.offset;
-            // Image descriptors, whose bits the shadow doesn't hold: what is loaded 8 dwords or more at a
-            // time, and what is in the second half of a 32-byte slot. Programs address descriptors by
-            // whole slots, so the base and a register offset are taken to be multiples of the slot size.
-            if (slot == 32) {
-                u32 soffset = 0;
-                constant_of(s, in.src[1], 0, &soffset);
-                bool image = in.dst[0].count >= 8;
-                for (u32 i = 0; i < in.dst[0].count; i++) {
-                    u32 at_byte = (u32)in.mem.offset + soffset + 4 * i;
-                    Tag tag = !image && at_byte % 32 < 16 ? result : (Tag)(result | HEAP_IMAGE);
-                    set_tag(s, in.dst[0], i, tag);
-                    set_descriptor(s, in.dst[0], i,
-                                   first == NO_DESCRIPTOR ? NO_DESCRIPTOR : (first + 4 * i) / slot);
-                }
-                return;
-            }
         } else if (tag_kind(base) == TAG_VB_TABLE && in.src[1].kind == OPND_SPECIAL &&
                    in.src[1].reg == SRC_NULL && in.mem.offset % 16 == 0)
             result = make_tag(TAG_VB_DESC, (u32)in.mem.offset / 16);
