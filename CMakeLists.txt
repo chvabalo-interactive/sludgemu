@@ -28,7 +28,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 # inlining at link time, in parallel and cached), full inlining (CMake's RelWithDebInfo default is
 # /Ob1) and one section per function and variable so the linker can drop unreferenced and fold
 # identical ones (/DEBUG turns that off unless asked for).
-set(SLUDGE_LTO_JOBS "" CACHE STRING "ThinLTO backend threads at link time (empty: one per hardware thread)")
+set(SLUDGE_LTO_JOBS "" CACHE STRING "ThinLTO backend threads at link time (empty: one per physical core)")
 add_compile_options("$<$<NOT:$<CONFIG:Debug>>:-flto=thin;/Ob2;/Gy;/Gw>")
 # /INCREMENTAL:NO: lld-link never links incrementally, and CMake's default /INCREMENTAL for
 # RelWithDebInfo only earns a warning next to /OPT:REF.

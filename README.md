@@ -133,7 +133,7 @@ cmake --build --preset ninja-release
 
 Binaries are written to `build/ninja-<config>/bin/`. The release preset builds the
 `RelWithDebInfo` configuration with ThinLTO. `-DSLUDGE_LTO_JOBS=N` limits the link-time
-optimization threads (default: one per hardware thread).
+optimization threads (default: one per physical core).
 
 <details>
 <summary><b>Building in the Visual Studio IDE</b></summary>
@@ -145,7 +145,7 @@ debugging in the IDE:
 
 ```powershell
 cmake --preset vs2026
-cmake --build --preset vs2026-release     # or vs2026-debug; or open build/vs2026/sludgemu.sln
+cmake --build --preset vs2026-release     # or vs2026-debug; or open build/vs2026/sludgemu.slnx
 ```
 
 Binaries are written to `build/vs2026/bin/<Config>/`.
