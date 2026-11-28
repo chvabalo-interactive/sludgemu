@@ -23,10 +23,11 @@ static void heap_destroy(void* object) {
     xmem_free(self->memory, self->attributes);
 }
 
-// Struct return through a hidden pointer, received before the object.
-static D3D12_HEAP_DESC* WINAPI heap_get_desc(D3D12_HEAP_DESC* ret, ConsoleHeap* self) {
-    *ret = self->desc;
-    return ret;
+// The console entry takes the description's address after the object (its inline GetDesc returns the
+// struct itself), unlike desktop's struct return.
+static void WINAPI heap_get_desc(ConsoleHeap* self, D3D12_HEAP_DESC* desc) {
+    if (desc)
+        *desc = self->desc;
 }
 
 // Console titles have no protected content.
