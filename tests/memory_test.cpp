@@ -316,6 +316,32 @@ static void test_lazy_backing() {
     mem_physical_free(pages, frames);
 }
 
+// Pages showing frames nothing has written are pending until touched; asking doesn't back them.
+static void test_pending_pages() {
+    const u32 pages = 4;
+    MemAddressLimits limits = {};
+    u8* base = (u8*)mem_reserve_placeholder(pages * PAGE, limits, 0, PAGE_READWRITE, 0);
+    CHECK(base != nullptr);
+    if (!base)
+        return;
+    CHECK(!mem_any_pending(base, pages * PAGE)); // nothing mapped
+    u64 frames[pages];
+    CHECK(mem_physical_alloc(pages, frames));
+    CHECK(mem_map_physical(base, pages, frames));
+    CHECK(mem_any_pending(base, pages * PAGE));
+    CHECK(mem_any_pending(base + 3 * PAGE, PAGE));
+    CHECK(mem_physical_bound_pages_at(base, pages * PAGE) == 0);
+    mem_prepare(base, PAGE); // backs the slice: every page here
+    CHECK(!mem_any_pending(base, pages * PAGE));
+    CHECK(mem_physical_bound_pages_at(base, pages * PAGE) == pages);
+    // Remapped pages are pending again.
+    CHECK(mem_map_physical(base + PAGE, 1, &frames[0]));
+    CHECK(mem_any_pending(base, pages * PAGE));
+    CHECK(!mem_any_pending(base + 2 * PAGE, 2 * PAGE));
+    CHECK(mem_release(base));
+    mem_physical_free(pages, frames);
+}
+
 // Large commits are reserved and committed as they're touched, a granule at a time.
 static void test_lazy_commit() {
     MemAddressLimits limits = {};
@@ -811,6 +837,7 @@ int main() {
     test_backed_release();
     test_frames_zeroed_on_reuse();
     test_lazy_backing();
+    test_pending_pages();
     test_lazy_commit();
     test_gpu_section_ranges();
     test_write_watches();

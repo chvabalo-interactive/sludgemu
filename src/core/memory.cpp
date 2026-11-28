@@ -605,6 +605,29 @@ bool mem_is_mapped(const void* addr, u64 size) {
     return ok;
 }
 
+bool mem_any_pending(const void* addr, u64 size) {
+    const u8* p = (const u8*)addr;
+    const u8* end = p + size;
+    bool any = false;
+    AcquireSRWLockShared(&g_mem.range_lock);
+    while (!any && p < end) {
+        RangeSlot* s = find_range_locked(p);
+        if (!s)
+            break;
+        const u8* range_end = s->info.base + s->info.size;
+        const u8* stop = end < range_end ? end : range_end;
+        if ((s->info.flags & MEM_RANGE_PLACEHOLDER) && s->pending) {
+            u32 first = (u32)((u64)(p - s->info.base) >> MEM_PAGE_SHIFT);
+            u32 last = (u32)(((u64)(stop - s->info.base) + MEM_PAGE_SIZE - 1) >> MEM_PAGE_SHIFT);
+            for (u32 page = first; !any && page < last; page++)
+                any = s->pending[page] != MEM_INVALID_PFN;
+        }
+        p = stop;
+    }
+    ReleaseSRWLockShared(&g_mem.range_lock);
+    return any;
+}
+
 void mem_add_mapping_listener(MemMappingListener listener) {
     long n = g_mem.mapping_listener_count;
     if (n == MAX_MAPPING_LISTENERS)

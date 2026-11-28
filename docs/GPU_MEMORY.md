@@ -62,6 +62,9 @@ mapped memory; their contents come from title memory. Render target, depth and U
 desktop textures for now; mapping their tiles onto the frames under them would let aliased memory be
 the same video memory, as on console.
 
+Texture uploads read frames nothing has written yet as zeros without backing them (`mem_any_pending`),
+so memory only the GPU writes, seen through views of placed memory, stays without system memory.
+
 ## Open points
 
 - Page mapping changes a title orders on a queue (`CopyPageMappings` on a command queue) are applied
