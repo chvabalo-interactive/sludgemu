@@ -29,15 +29,22 @@ struct TargetMarker {
 };
 static_assert(sizeof(TargetMarker) <= CONSOLE_DESCRIPTOR_SIZE_RTV, "target marker fits");
 
-// Resource slots also get the view's kind and the console descriptor's first dwords (`bits`, zero if
-// none) for the descriptor shadow, which publishing the slot writes.
+// Resource slots also get the view's kind and the console descriptor (`bits`: a buffer descriptor's 4
+// dwords, with `image` an image descriptor's 8; nullptr: none) for the descriptor shadow, which
+// publishing the slot writes. The slot has room for dwords 0-3 after the marker; the heap keeps an
+// image descriptor's dwords 4-7.
 static void finish_write(const DescriptorSlot& slot, ShadowViewKind kind = SHADOW_VIEW_NONE,
-                         const u32* bits = nullptr) {
-    SlotMarker marker = {SLOT_MARKER_MAGIC, (u32)slot.type | (u32)kind << 8, slot.cpu.ptr};
+                         const u32* bits = nullptr, bool image = false) {
+    u32 type_word = (u32)slot.type | (u32)kind << 8 | (image ? DESCRIPTOR_MARKER_IMAGE : 0u);
+    SlotMarker marker = {SLOT_MARKER_MAGIC, type_word, slot.cpu.ptr};
     memcpy(slot.console, &marker, sizeof(marker)); // every console descriptor is at least 16 bytes
     if (slot.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
         static const u32 k_none[4] = {};
         memcpy(slot.console + DESCRIPTOR_MARKER_BITS, bits ? bits : k_none, sizeof(k_none));
+        if (image) {
+            ImageWords words = {{bits[4], bits[5], bits[6], bits[7]}};
+            console_descriptor_set_image_words(slot, words);
+        }
     }
     console_descriptor_publish(slot, 1);
 }
@@ -483,8 +490,8 @@ void write_constant_buffer_view(u64 address, u64 size, D3D12_CPU_DESCRIPTOR_HAND
     d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     ID3D12Resource* desktop = nullptr;
     if (address && size && size / 4 <= 0xFFFFFFFFu)
-        desktop =
-            apply_buffer_view(buffer_view(address, 0, (u32)(size / 4), DXGI_FORMAT_UNKNOWN, 0, true, GPU_READ), &d);
+        desktop = apply_buffer_view(
+            buffer_view(address, 0, (u32)(size / 4), DXGI_FORMAT_UNKNOWN, 0, true, GPU_READ), &d);
     if (!desktop)
         d = null_srv(D3D12_SRV_DIMENSION_BUFFER);
     gpu_device()->CreateShaderResourceView(desktop, &d, dest);
@@ -629,7 +636,8 @@ void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resour
         return;
     ID3D12Resource* desktop;
     D3D12_SHADER_RESOURCE_VIEW_DESC d;
-    u32 bits[4] = {};
+    u32 bits[8] = {};
+    bool image = false;
     if (is_buffer(resource)) {
         const ConsoleResource* r = (const ConsoleResource*)resource;
         d = desc ? *desc : whole_buffer_srv(r);
@@ -646,11 +654,15 @@ void WINAPI device_create_shader_resource_view(ConsoleDevice* self, void* resour
         if (!r && !desc)
             return; // the console API requires one or the other
         d = desc ? *desc : whole_texture_srv(r->desc);
+        // A view without a texture is a null descriptor, zeros.
+        image = r != nullptr;
+        if (image)
+            shadow_texture_srv(r->desc, r->gpu_address, d, 0, bits);
         srv_cube_as_array(&d);
         desktop = texture_srv(self, r, &d);
     }
     self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
-    finish_write(slot, SHADOW_VIEW_SRV, bits);
+    finish_write(slot, SHADOW_VIEW_SRV, bits, image);
 }
 
 void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resource, void* counter,
@@ -661,7 +673,8 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
     ID3D12Resource* desktop;
     ID3D12Resource* desktop_counter = nullptr;
     D3D12_UNORDERED_ACCESS_VIEW_DESC d;
-    u32 bits[4] = {};
+    u32 bits[8] = {};
+    bool image = false;
     if (is_buffer(resource)) {
         const ConsoleResource* r = (const ConsoleResource*)resource;
         d = desc ? desktop_uav_desc(desc) : whole_buffer_uav(r);
@@ -691,6 +704,9 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
         if (!r && !desc)
             return;
         d = desc ? desktop_uav_desc(desc) : whole_texture_uav(r->desc);
+        image = r != nullptr;
+        if (image)
+            shadow_texture_uav(r->desc, r->gpu_address, d, bits);
         desktop = texture_view_target(r);
         // Some console textures lose UAV access on desktop (depth ones).
         if (desktop && (!(desktop->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
@@ -702,7 +718,7 @@ void WINAPI device_create_unordered_access_view(ConsoleDevice* self, void* resou
         }
     }
     self->desktop->CreateUnorderedAccessView(desktop, desktop_counter, &d, slot.cpu);
-    finish_write(slot, SHADOW_VIEW_UAV, bits);
+    finish_write(slot, SHADOW_VIEW_UAV, bits, image);
 }
 
 void WINAPI device_create_render_target_view(ConsoleDevice* self, void* resource,
@@ -766,8 +782,11 @@ static void copy_range(ConsoleDevice* self, u64 dest, u64 src, u32 count, D3D12_
         return;
     }
     self->desktop->CopyDescriptorsSimple(count, d.cpu, s.cpu, d.type);
-    // The console slots first: publishing writes the shadow records from them.
+    // The console slots first (and the image descriptor dwords the sources keep): publishing writes the
+    // shadow records from them.
     memmove(d.console, s.console, (usize)count * console_descriptor_size(type));
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        console_descriptor_copy_image_words(d, s, count);
     console_descriptor_publish(d, count);
     console_descriptor_copy_keepers(d, s, count);
 }
@@ -844,7 +863,8 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
     srv_cube_as_array(&d);
     ID3D12Resource* desktop = nullptr;
     ConsoleResource* texture = nullptr;
-    u32 bits[4] = {};
+    u32 bits[8] = {};
+    bool image = false;
     if (resource_desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         d.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         bool raw = (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0;
@@ -860,9 +880,13 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
             LOG_W_ONCE("d3d12",
                        "views of placed textures with a hardware format (%u) read the texture's own format",
                        desc->image_format);
+        // The console descriptor is the title's description as it is, the hardware format it names too.
+        D3D12_RESOURCE_DESC1 console = console_desc1_from_desc(*resource_desc);
+        shadow_texture_srv(console, desc->location, desc->view, desc->image_format, bits);
+        image = true;
         // Its desktop texture holds the mips the view reads (titles stream textures in by mip).
         u32 first_mip = d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D ? d.Texture2D.MostDetailedMip : 0;
-        texture = console_placed_texture(desc->location, console_desc1_from_desc(*resource_desc), first_mip);
+        texture = console_placed_texture(desc->location, console, first_mip);
         if (texture && texture_sync_traced(texture->desc))
             LOG_I("d3d12",
                   "texture trace: %p view at 0x%llx: dimension %d, format %d, most detailed mip %u, mips %u, "
@@ -879,7 +903,7 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
         d = null_srv(d.ViewDimension);
     }
     self->desktop->CreateShaderResourceView(desktop, &d, slot.cpu);
-    finish_write(slot, SHADOW_VIEW_SRV, bits);
+    finish_write(slot, SHADOW_VIEW_SRV, bits, image);
     if (texture) {
         console_descriptor_keep(slot, texture);
         console_release(texture);
@@ -894,7 +918,8 @@ void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESO
     D3D12_UNORDERED_ACCESS_VIEW_DESC d = desktop_uav_desc(desc->view);
     ID3D12Resource* desktop = nullptr;
     ID3D12Resource* desktop_counter = nullptr;
-    u32 bits[4] = {};
+    u32 bits[8] = {};
+    bool image = false;
     if (resource_desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
         d.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         bool raw = (d.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) != 0;
@@ -914,14 +939,19 @@ void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESO
                 desktop = nullptr;
             }
         }
-    } else {
+    } else if (resource_desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        // No desktop view yet, but programs reading the descriptor's bits see the title's texture.
         unsupported_placed_texture_view("unordered access");
+        shadow_texture_uav(console_desc1_from_desc(*resource_desc), desc->location, d, bits);
+        image = true;
+        d = null_uav(d.ViewDimension);
+    } else {
         d = null_uav(d.ViewDimension);
     }
     if (!desktop_counter)
         d.Buffer.CounterOffsetInBytes = 0;
     self->desktop->CreateUnorderedAccessView(desktop, desktop_counter, &d, slot.cpu);
-    finish_write(slot, SHADOW_VIEW_UAV, bits);
+    finish_write(slot, SHADOW_VIEW_UAV, bits, image);
 }
 
 // --- console sampler descriptions --------------------------------------------------------------------

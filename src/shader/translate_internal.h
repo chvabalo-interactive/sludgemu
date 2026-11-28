@@ -45,9 +45,7 @@ enum TagKind : u16 {
 //              (see register_data), and the result is a plain value.
 //   bit 8      HEAP_MODIFIED: the register holds a loaded dword's address on some paths only (set only
 //              with HEAP_LOADED, by joins): neither a descriptor nor a value translated code can use
-//   bit 9      HEAP_IMAGE: (on some path) a dword of an image descriptor, whose bits the shadow
-//              doesn't hold: loaded 8 or more at a time, or from the second half of a 32-byte slot
-//   bits 10-11 free
+//   bits 9-11  free
 // The bits travel with the tag through moves, spills and swaps (see tags_merge for joins).
 enum : u16 {
     HEAP_RESOURCES = 0,
@@ -55,7 +53,6 @@ enum : u16 {
     HEAP_NO_TABLE = 0x3F, // the parameter field's value for no table
     HEAP_LOADED = 0x80,
     HEAP_MODIFIED = 0x100,
-    HEAP_IMAGE = 0x200,
 };
 
 inline Tag make_tag(TagKind kind, u32 payload) {
@@ -145,7 +142,6 @@ struct PcPool {
 enum : u8 {
     SLOT_WRITTEN = 1, // stores or atomics through it: it must be an unordered access view
     SLOT_SAMPLED = 2, // sampled through it: it must be a shader resource view
-    SLOT_IMAGE = 4,   // used as an image: the shadow holds none of its bits
 };
 
 struct SlotUse {
@@ -256,17 +252,15 @@ bool copies_tags(const Translator& t, const TagState& s, const RdnaInst& in, u32
 bool join_converts(Tag tag);
 // A register read as a value by the instruction being emitted: `raw` (its HLSL variable), or, for a
 // loaded descriptor dword (which translated code holds the heap address of), the dword from the
-// descriptor shadow. Fails translation where neither is the register's value. `descriptor`: the
-// register's slot where known (see find_slot_uses); `vector`: a vector register, whose lanes outside
-// EXEC hold no address to read.
-const char* register_data(Translator& t, Tag tag, const char* raw, u16 descriptor, bool vector);
+// descriptor shadow. Fails translation where neither is the register's value. `vector`: a vector
+// register, whose lanes outside EXEC hold no address to read.
+const char* register_data(Translator& t, Tag tag, const char* raw, bool vector);
 // An SGPR read as a value (register_data); with exact lanes, a mask reads as its bits.
 const char* sgpr_data(Translator& t, u32 reg);
 const char* vgpr_data(Translator& t, u32 reg);
-// Records which descriptors at known places the program writes, samples or uses as images through, and
-// what it does through the one at `index` of the heap tag's table (SLOT_* flags). translate_memory.cpp
+// Records which descriptors at known places the program writes or samples through (SLOT_* flags), which
+// decides the desktop view of accesses through them. translate_memory.cpp
 void find_slot_uses(Translator& t);
-u8 slot_use(const Translator& t, Tag tag, u16 index);
 // A v_readlane/v_writelane lane operand known at translation time (a literal or inline integer), in the
 // wave's lane range.
 bool constant_lane(const Translator& t, const RdnaOperand& o, u32* lane);

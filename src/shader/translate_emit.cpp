@@ -215,7 +215,7 @@ static const char* operand_u32(Translator& t, const RdnaOperand& o, OperandType 
     }
 }
 
-const char* register_data(Translator& t, Tag tag, const char* raw, u16 descriptor, bool vector) {
+const char* register_data(Translator& t, Tag tag, const char* raw, bool vector) {
     if (!heap_loaded(tag) || t.copying)
         return raw;
     u32 payload = tag_payload(tag);
@@ -224,16 +224,14 @@ const char* register_data(Translator& t, Tag tag, const char* raw, u16 descripto
                         t.inst_offset);
     else if ((payload & 1) == HEAP_SAMPLERS)
         translator_fail(t, "sampler descriptor dword read as a value at 0x%x", t.inst_offset);
-    else if ((payload & HEAP_IMAGE) || (slot_use(t, tag, descriptor) & SLOT_IMAGE))
-        translator_fail(t, "image descriptor dword read as a value at 0x%x (the shadow has buffers' only)",
-                        t.inst_offset);
-    // The shadow lays out each desktop slot's descriptor bits like console heap memory: the dword at
-    // heap byte address A is word A of it. Lanes outside EXEC may hold anything in a vector register,
-    // and the shadow, a root descriptor, has no bounds: they read the first record instead.
+    // The shadow holds each desktop slot's descriptor as console heap memory does, image descriptors'
+    // dwords too (shadow_at finds the dword at a heap byte address). Lanes outside EXEC may hold anything
+    // in a vector register, and the shadow, a root descriptor, has no bounds: they read the first record
+    // instead.
     t.needs_descriptor_info = true;
     if (vector)
-        return fmt(t, "g_descriptor_info.Load(%s ? %s : 0u)", exec_cond(t), raw);
-    return fmt(t, "g_descriptor_info.Load(%s)", raw);
+        return fmt(t, "g_descriptor_info.Load(shadow_at(%s ? %s : 0u))", exec_cond(t), raw);
+    return fmt(t, "g_descriptor_info.Load(shadow_at(%s))", raw);
 }
 
 // With exact lanes a mask is read as its bits too, with a ballot: inline in scalar code, before the
@@ -243,7 +241,7 @@ const char* register_data(Translator& t, Tag tag, const char* raw, u16 descripto
 const char* sgpr_data(Translator& t, u32 reg) {
     reg &= 127;
     if (!t.exact || !sgpr_is_mask(t, reg))
-        return register_data(t, t.tags.sgpr[reg], sgpr(t, reg), t.tags.descriptor[reg], false);
+        return register_data(t, t.tags.sgpr[reg], sgpr(t, reg), false);
     if (!t.in_lane_op)
         return fmt(t, "mask_bits(%s)", sgpr(t, reg));
     for (u32 k = 0; k < t.hoisted_count; k++)
@@ -254,7 +252,7 @@ const char* sgpr_data(Translator& t, u32 reg) {
 }
 
 const char* vgpr_data(Translator& t, u32 reg) {
-    return register_data(t, t.tags.vgpr[reg & 255], vgpr(t, reg), NO_DESCRIPTOR, true);
+    return register_data(t, t.tags.vgpr[reg & 255], vgpr(t, reg), true);
 }
 
 const char* src_u32(Translator& t, const RdnaInst& in, u32 i, OperandType type, u32 part) {
@@ -301,8 +299,8 @@ const char* float_result(Translator& t, const RdnaInst& in, const char* value) {
 // are bounds-checked and contained, and translated code already reads them in every lane.
 static bool computable_in_every_lane(const char* value) {
     static const char* const k_lane_bound[] = {
-        "g_root",   "WaveActive", "WavePrefix", "WaveRead",   "WaveMatch",  "WaveMulti", "QuadRead",
-        "wave_any", "wave_count", "wave_first", "wave_last",  "read_first", "quad_any",  "mask_bits",
+        "g_root",   "WaveActive", "WavePrefix", "WaveRead",      "WaveMatch",   "WaveMulti", "QuadRead",
+        "wave_any", "wave_count", "wave_first", "wave_last",     "read_first",  "quad_any",  "mask_bits",
         "mask_any", "Sample",     "Gather",     "LevelOfDetail", "Interlocked",
     };
     for (u32 i = 0; i < ARRAY_COUNT(k_lane_bound); i++)
@@ -1051,9 +1049,14 @@ static void write_declarations(Translator& t, Text& h) {
         }
         h.put("0u};\n");
     }
-    if (t.needs_descriptor_info)
+    if (t.needs_descriptor_info) {
+        // A record holds a slot's descriptor, then its kind (see SHADER_SHADOW_RECORD_BYTES): the dword
+        // at heap byte address a comes after the kinds of the a / 32 slots before it.
         h.put("ByteAddressBuffer g_descriptor_info : register(t0, space%d);\n",
               SHADER_DESCRIPTOR_SHADOW_SPACE);
+        h.put("uint shadow_at(uint a) { return a + a / %uu * %uu; }\n", SHADER_SHADOW_DESCRIPTOR_BYTES,
+              SHADER_SHADOW_RECORD_BYTES - SHADER_SHADOW_DESCRIPTOR_BYTES);
+    }
     for (u32 i = 0; i < t.out->sampler_count; i++)
         h.put("%s g_sampler%u : register(s%u, space%d);\n",
               t.sampler_compare & (1u << i) ? "SamplerComparisonState" : "SamplerState", i, i,

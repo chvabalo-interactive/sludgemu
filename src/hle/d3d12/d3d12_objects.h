@@ -364,6 +364,11 @@ bool console_translate_coherent(u64 address, u64 size, u64* desktop_address);
 // desktop slot i, and every descriptor write goes to both. Desktop D3D12 cannot read descriptors
 // back from shader-visible heaps, so those also keep a CPU-only copy that writes go to first and
 // copies read from.
+// Dwords 4-7 of an image descriptor (see ConsoleDescriptorHeap::image_words).
+struct ImageWords {
+    u32 dwords[4];
+};
+
 struct ConsoleDescriptorHeap {
     ConsoleObjectHeader header;
 
@@ -396,6 +401,10 @@ struct ConsoleDescriptorHeap {
     // Per slot, the resource without a title reference a view in it keeps (console_descriptor_keep);
     // allocated with the first one.
     ConsoleResource* volatile* keepers;
+    // Resource heaps: per slot, dwords 4-7 of the image descriptor of the view last made in it (the slot
+    // holds dwords 0-3 after its marker, see DESCRIPTOR_MARKER_IMAGE), which copies of the slot take
+    // into the descriptor shadow; allocated with the first image view.
+    ImageWords* volatile image_words;
     // Shader-visible resource heaps: the descriptor shadow translated shaders read descriptor bits
     // and view kinds from (see translate.h), a record per shader-visible slot, written with the slot.
     // In system memory (an upload heap, persistently mapped): reads are few and cached.
@@ -443,6 +452,13 @@ void console_descriptor_keep(const DescriptorSlot& slot, ConsoleResource* resour
 
 // After copying `count` descriptors from `src` to `dest`: the copies keep what the sources keep.
 void console_descriptor_copy_keepers(const DescriptorSlot& dest, const DescriptorSlot& src, u32 count);
+
+// Before publishing an image view written to `slot` (a resource heap's): its descriptor's dwords 4-7.
+void console_descriptor_set_image_words(const DescriptorSlot& slot, const ImageWords& words);
+
+// Before publishing `count` descriptors copied from `src` to `dest`: the image descriptor dwords the
+// sources keep go with them.
+void console_descriptor_copy_image_words(const DescriptorSlot& dest, const DescriptorSlot& src, u32 count);
 
 struct ConsoleQueryHeap {
     ConsoleObjectHeader header;
