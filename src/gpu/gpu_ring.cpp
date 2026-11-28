@@ -16,7 +16,7 @@ void gpu_ring_usage(u64* upload, u64* local) {
 
 // Gives up a ring's buffer, once the GPU is done with it.
 static void retire_buffer(GpuRing* r) {
-    InterlockedAdd64(&g_ring_bytes[r->upload ? 1 : 0], -(s64)r->size);
+    InterlockedAdd64(&g_ring_bytes[r->upload ? 1 : 0], -(s64)r->space.size);
     gpu_retire(r->buffer);
 }
 
