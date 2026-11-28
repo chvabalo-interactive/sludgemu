@@ -77,6 +77,24 @@ void gpu_queue_wait(u32 slot, u64 number);
 // The fence counting the queue's submissions, for other queues to wait on (alive as long as the slot).
 ID3D12Fence* gpu_queue_fence(u32 slot);
 
+// Makes the queue's later work wait on the GPU for `fence` to reach `value`. The slot remembers its
+// last such wait for stall reports.
+void gpu_queue_wait_on(ID3D12CommandQueue* queue, u32 slot, ID3D12Fence* fence, u64 value);
+
+// How far a queue got, for stall reports: submissions numbered (held-back ones included), handed to
+// the desktop queue, and finished by the GPU, and the queue's last wait (gpu_queue_wait_on), which
+// holds back the submissions after `wait_before - 1`. False for a free slot.
+struct GpuQueueProgress {
+    D3D12_COMMAND_LIST_TYPE type;
+    u64 numbered;
+    u64 executed;
+    u64 completed;
+    u64 wait_value;     // 0: no wait yet
+    u64 wait_reached;   // the value the fence it waits on reached
+    u64 wait_before;    // the first submission after the wait
+};
+bool gpu_queue_progress(u32 slot, GpuQueueProgress* out);
+
 // Names a desktop object for the debug layer's messages (printf-style); nothing without the layer.
 void gpu_set_name(ID3D12Object* object, const char* format, ...);
 

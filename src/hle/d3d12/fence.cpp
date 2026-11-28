@@ -253,6 +253,22 @@ static void on_counter_store(u64 base, u64) {
     ReleaseSRWLockExclusive(&g_fence_lock);
 }
 
+// The value in memory tells a store we missed (memory past the fence) from one not made yet.
+void console_counter_report() {
+    AcquireSRWLockShared(&g_fence_lock);
+    for (u32 i = 0; i < COUNTER_CAPACITY; i++) {
+        const CounterFence& c = g_counters[i];
+        if (!c.address)
+            continue;
+        u64 reached = c.fence->GetCompletedValue();
+        if (c.waited > reached)
+            LOG_W("d3d12", "  counter 0x%llx: GPU work waits for %llu, its fence is at %llu, memory reads %llu%s",
+                  c.address, c.waited, reached, *(volatile u64*)c.address,
+                  c.trapped ? "" : " (stores not trapped)");
+    }
+    ReleaseSRWLockShared(&g_fence_lock);
+}
+
 void console_fence_init() {
     mem_set_store_listener(on_counter_store);
     g_fence_table = console_build_table("ID3D12Fence", k_fence_entries, ARRAY_COUNT(k_fence_entries),

@@ -315,8 +315,12 @@ bool gpu_video_memory(GpuVideoMemory* out) {
 struct GpuQueueSlot {
     ID3D12CommandQueue* queue; // nullptr: free slot
     ID3D12Fence* fence;
-    u64 submitted;
+    u64 submitted;  // numbers handed out
+    u64 executed;   // the last number signaled on the queue
     u32 generation; // counts the queues that held the slot
+    ID3D12Fence* wait_fence; // the last fence the queue waited on (a reference), for stall reports
+    u64 wait_value;
+    u64 wait_before;
 };
 
 struct RetiredObject {
@@ -361,7 +365,7 @@ u32 gpu_queue_register(ID3D12CommandQueue* queue) {
     u32 slot = GPU_NO_QUEUE;
     for (u32 q = 0; q < GPU_MAX_QUEUES; q++) {
         if (!g_queues[q].queue) {
-            g_queues[q] = {queue, fence, 0, g_queues[q].generation + 1};
+            g_queues[q] = {queue, fence, 0, 0, g_queues[q].generation + 1, nullptr, 0, 0};
             slot = q;
             break;
         }
@@ -388,6 +392,8 @@ void gpu_queue_unregister(u32 slot) {
     if (q.fence->GetCompletedValue() < q.submitted)
         q.fence->SetEventOnCompletion(q.submitted, nullptr); // blocks until the queue is idle
     q.fence->Release();
+    if (q.wait_fence)
+        q.wait_fence->Release();
 }
 
 u64 gpu_queue_submitted(u32 slot) {
@@ -397,6 +403,7 @@ u64 gpu_queue_submitted(u32 slot) {
     GpuQueueSlot& q = g_queues[slot];
     u64 number = ++q.submitted;
     q.queue->Signal(q.fence, number);
+    q.executed = number;
     collect_locked();
     ReleaseSRWLockExclusive(&g_submit_lock);
     return number;
@@ -414,6 +421,7 @@ u64 gpu_queue_execute(ID3D12CommandQueue* queue, u32 slot, u32 count, ID3D12Comm
         q.queue->ExecuteCommandLists(count, lists);
     u64 number = ++q.submitted;
     q.queue->Signal(q.fence, number);
+    q.executed = number;
     collect_locked();
     ReleaseSRWLockExclusive(&g_submit_lock);
     return number;
@@ -440,6 +448,7 @@ void gpu_queue_execute_reserved(ID3D12CommandQueue* queue, u32 slot, u64 number,
     if (count)
         q.queue->ExecuteCommandLists(count, lists);
     q.queue->Signal(q.fence, number);
+    q.executed = number;
     collect_locked();
     ReleaseSRWLockExclusive(&g_submit_lock);
 }
@@ -495,6 +504,41 @@ ID3D12Fence* gpu_queue_fence(u32 slot) {
     ID3D12Fence* fence = g_queues[slot].fence;
     ReleaseSRWLockShared(&g_submit_lock);
     return fence;
+}
+
+void gpu_queue_wait_on(ID3D12CommandQueue* queue, u32 slot, ID3D12Fence* fence, u64 value) {
+    queue->Wait(fence, value);
+    if (slot >= GPU_MAX_QUEUES)
+        return;
+    fence->AddRef();
+    AcquireSRWLockExclusive(&g_submit_lock);
+    GpuQueueSlot& q = g_queues[slot];
+    ID3D12Fence* old = q.wait_fence;
+    q.wait_fence = fence;
+    q.wait_value = value;
+    q.wait_before = q.executed + 1;
+    ReleaseSRWLockExclusive(&g_submit_lock);
+    if (old)
+        old->Release();
+}
+
+bool gpu_queue_progress(u32 slot, GpuQueueProgress* out) {
+    if (slot >= GPU_MAX_QUEUES)
+        return false;
+    AcquireSRWLockShared(&g_submit_lock);
+    const GpuQueueSlot& q = g_queues[slot];
+    bool used = q.queue != nullptr;
+    if (used) {
+        out->type = q.queue->GetDesc().Type;
+        out->numbered = q.submitted;
+        out->executed = q.executed;
+        out->completed = q.fence->GetCompletedValue();
+        out->wait_value = q.wait_fence ? q.wait_value : 0;
+        out->wait_reached = q.wait_fence ? q.wait_fence->GetCompletedValue() : 0;
+        out->wait_before = q.wait_before;
+    }
+    ReleaseSRWLockShared(&g_submit_lock);
+    return used;
 }
 
 void gpu_set_name(ID3D12Object* object, const char* format, ...) {

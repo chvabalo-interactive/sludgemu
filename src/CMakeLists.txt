@@ -89,6 +89,7 @@ add_executable(sludgemu WIN32
     hle/d3d12/d3d12_objects.h
     hle/d3d12/command_queue.cpp
     hle/d3d12/fence.cpp
+    hle/d3d12/stall_watch.cpp
     hle/d3d12/resource.cpp
     hle/d3d12/resource_cpu.cpp
     hle/d3d12/heap.cpp

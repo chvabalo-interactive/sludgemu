@@ -84,6 +84,10 @@ HRESULT console_fence_signal_cpu(ConsoleFence* fence, u64 value);
 ID3D12Fence* console_sync_fence(u64 address);
 // A queue reaches GPU work waiting for the counter at `address` to reach `value` (see fence.cpp).
 void console_counter_wait(u64 address, u64 value);
+// Logs the counters GPU work waits on beyond what their fences reached (stall reports).
+void console_counter_report();
+// Starts the thread that reports GPU stalls (stall_watch.cpp).
+void console_stall_watch_start();
 
 // The allocation callback lets titles supply console command buffer memory. Recording goes to
 // desktop command lists instead, so it is kept but never called.

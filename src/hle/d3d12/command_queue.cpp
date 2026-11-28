@@ -51,7 +51,7 @@ static void run_op(ConsoleCommandQueue* self, BacklogOp& op) {
         gpu_retire(op.fence);
         break;
     case BACKLOG_WAIT:
-        self->desktop->Wait(op.fence, op.value);
+        gpu_queue_wait_on(self->desktop, self->slot, op.fence, op.value);
         gpu_retire(op.fence);
         break;
     case BACKLOG_PRESENT: {
@@ -200,7 +200,7 @@ static void fence_op(ConsoleCommandQueue* self, BacklogKind kind, ID3D12Fence* f
         if (kind == BACKLOG_SIGNAL)
             self->desktop->Signal(fence, value);
         else
-            self->desktop->Wait(fence, value);
+            gpu_queue_wait_on(self->desktop, self->slot, fence, value);
         return;
     }
     op->kind = kind;
