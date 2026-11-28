@@ -219,7 +219,7 @@ struct ConsoleCommandList {
     ConsoleCommandAllocator* allocator; // the allocator of the current recording
     ID3D12Device13* device;
     bool recording;
-    u32 skipped_draws; // draws and dispatches skipped: their pipeline cannot be made
+    u32 skipped_draws; // draws and dispatches skipped: their pipeline can't be made, or wasn't in time
     ListState state;
 
     // Descriptor tables the recording uses, mirrored again when the list is submitted: titles may
@@ -587,6 +587,8 @@ struct PipelineVariant {
     u32 builder;        // the background job building it ahead (gpu_job_worker), or 0
     ID3D12PipelineState* desktop;
     ID3D12RootSignature* signature; // the desktop signature it was made with (owned by the signature)
+    // A wait for it reached its deadline: draws skip it until it's made.
+    volatile bool wait_ran_out;
 };
 
 // A pipeline state: the console's packet for it (public; title code copies it into command lists)
@@ -618,6 +620,7 @@ struct ConsolePipelineState {
     volatile long variant_count;
     PipelineVariant variants[PIPELINE_MAX_VARIANTS];
     volatile long skip_reported; // why its draws are skipped was logged
+    volatile long late_reported; // draws skipped while it is being made were logged
 };
 
 void console_pipeline_state_init();
@@ -636,10 +639,13 @@ HRESULT console_deserialize_pipeline_state(ConsoleDevice* device, bool compute,
                                            void** out);
 
 // The desktop pipeline for drawing (or dispatching) with `pso` to `outputs`, waiting for its
-// translation and desktop pipeline if they aren't made yet; nullptr if they can't be. For the threads
-// recording command lists: workers never wait for those, so the wait can't deadlock.
+// translation and desktop pipeline if they aren't made yet, within the wait budget (see
+// gpu/shader_schedule.h); nullptr if they can't be made, or with `*building` set if they aren't made
+// by the end of the wait (logged once per pipeline): the draw is skipped, and what it needs is made
+// urgently. For the threads recording command lists: workers never wait for those, so the wait can't
+// deadlock.
 ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs,
-                                              ID3D12RootSignature** signature);
+                                              ID3D12RootSignature** signature, bool* building);
 // Logs, once per pipeline, why draws with it are skipped.
 void console_pipeline_report_skip(ConsolePipelineState* pso, bool graphics);
 
