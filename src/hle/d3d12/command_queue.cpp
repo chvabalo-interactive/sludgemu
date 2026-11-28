@@ -432,7 +432,8 @@ static HRESULT WINAPI queue_wait(ConsoleCommandQueue* self, ConsoleFence* fence,
 }
 
 // Markers only label work for graphics debuggers: while work is held back they are left out rather
-// than held back too.
+// than held back too. An event's end goes where its begin went, so the desktop queue's events stay
+// balanced when the backlog empties or fills between the two.
 static void WINAPI queue_set_marker(ConsoleCommandQueue* self, UINT metadata, const void* data, UINT size) {
     AcquireSRWLockExclusive(&self->lock);
     if (!self->backlog.count)
@@ -442,14 +443,27 @@ static void WINAPI queue_set_marker(ConsoleCommandQueue* self, UINT metadata, co
 
 static void WINAPI queue_begin_event(ConsoleCommandQueue* self, UINT metadata, const void* data, UINT size) {
     AcquireSRWLockExclusive(&self->lock);
-    if (!self->backlog.count)
+    bool send = !self->backlog.count;
+    if (send)
         self->desktop->BeginEvent(metadata, data, size);
+    if (self->event_depth < 64) {
+        u64 bit = 1ull << self->event_depth;
+        self->events_sent = send ? self->events_sent | bit : self->events_sent & ~bit;
+    }
+    self->event_depth++;
     ReleaseSRWLockExclusive(&self->lock);
 }
 
 static void WINAPI queue_end_event(ConsoleCommandQueue* self) {
     AcquireSRWLockExclusive(&self->lock);
-    if (!self->backlog.count)
+    bool send;
+    if (!self->event_depth) {
+        send = !self->backlog.count; // an end without a begin: the title's own imbalance, passed on
+    } else {
+        self->event_depth--;
+        send = self->event_depth < 64 ? (self->events_sent >> self->event_depth) & 1 : !self->backlog.count;
+    }
+    if (send)
         self->desktop->EndEvent();
     ReleaseSRWLockExclusive(&self->lock);
 }

@@ -56,6 +56,10 @@ struct ConsoleCommandQueue {
     GpuRing scratch; // detiled texture data on its way into textures
     GpuRing staging; // an upload ring
     QueueBacklog backlog;
+    // Debug events begun and not ended yet, and which of the innermost 64 reached the desktop queue (bit
+    // per depth): events begun while work is held back are left out, and so must their ends be.
+    u32 event_depth;
+    u64 events_sent;
 };
 
 // Console fences also have a GPU address holding their value, which command lists write to signal
