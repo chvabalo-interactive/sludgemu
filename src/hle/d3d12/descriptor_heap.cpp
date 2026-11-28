@@ -227,6 +227,20 @@ static bool image_words_by_desktop(ConsoleDescriptorHeap* own, u64 desktop, Imag
     return found;
 }
 
+// Whether `desktop` is a CPU-only desktop descriptor of a live heap of `own`'s type: what a slot marker
+// names, unless the title left a stale marker over other data (or the heap it named is gone).
+static bool live_desktop_descriptor(ConsoleDescriptorHeap* own, u64 desktop) {
+    u64 end = own->cpu_start + (u64)own->desc.NumDescriptors * own->desktop_stride;
+    if (desktop >= own->cpu_start && desktop < end)
+        return (desktop - own->cpu_start) % own->desktop_stride == 0;
+    AcquireSRWLockShared(&g_heaps.lock);
+    ConsoleDescriptorHeap* heap = heap_holding(g_heaps.by_desktop, desktop);
+    bool live = heap && heap->desktop_type == own->desktop_type &&
+                (desktop - heap->cpu_start) % heap->desktop_stride == 0;
+    ReleaseSRWLockShared(&g_heaps.lock);
+    return live;
+}
+
 // --- descriptor shadow ---------------------------------------------------------------------------------
 
 // The shadow of a resource heap with `visible_count` shader-visible slots, mapped for good (upload heap
@@ -340,6 +354,12 @@ void console_descriptor_mirror(ConsoleDescriptorHeap* heap, u32 first, u32 count
             continue; // not a descriptor of ours
         if (same_index && source == own)
             continue; // written in place, and published then
+        if (!live_desktop_descriptor(heap, source)) {
+            LOG_W_ONCE("d3d12",
+                       "descriptor slot %u of a table names no live descriptor (0x%llx); left as it was", i,
+                       source);
+            continue;
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE dst = {heap->visible_cpu_start + (u64)d * heap->desktop_stride};
         device->CopyDescriptorsSimple(1, dst, {source}, heap->desktop_type);
         // A title copy of an image view's slot: dwords 4-7 are where the view was made.
