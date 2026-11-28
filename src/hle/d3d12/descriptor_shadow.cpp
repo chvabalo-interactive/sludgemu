@@ -7,6 +7,7 @@
 #include "common/log.h"
 #include "gpu/console_layout.h"
 #include "gpu/formats.h"
+#include "gpu/image_formats.h"
 
 void shadow_buffer_descriptor(u64 base, u32 stride, u32 records, u32 out[4]) {
     out[0] = (u32)base;

@@ -16,6 +16,7 @@ add_executable(sludgemu_tests
     ${PROJECT_SOURCE_DIR}/src/core/memory_tracking.cpp
     ${PROJECT_SOURCE_DIR}/src/gpu/console_layout.cpp
     ${PROJECT_SOURCE_DIR}/src/gpu/formats.cpp
+    ${PROJECT_SOURCE_DIR}/src/gpu/image_formats.cpp
     ${PROJECT_SOURCE_DIR}/src/gpu/shader_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/gpu/shader_schedule.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/dstorage/bcpack.cpp
