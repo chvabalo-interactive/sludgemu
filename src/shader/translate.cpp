@@ -1553,11 +1553,16 @@ static void find_spill_vgprs(Translator& t) {
     bool apart[256] = {};
     if (count)
         find_spills_apart(t, candidates, count, apart); // out of memory: none apart
-    for (u32 r = 0; r < 256; r++) {
-        if (!written[r] || (other[r] && !apart[r]) || t.spill_vgpr_count >= SHADER_MAX_SPILL_VGPRS)
-            continue;
-        t.spill_slot[r] = t.spill_vgpr_count;
-        t.spill_vgprs[t.spill_vgpr_count++] = (u8)r;
+    // Registers only lane accesses touch take the slots first: a register shared with other uses must
+    // not push one of them out (which would lose the tags parked in it).
+    for (u32 pass = 0; pass < 2; pass++) {
+        for (u32 r = 0; r < 256; r++) {
+            bool take = pass == 0 ? written[r] && !other[r] : written[r] && other[r] && apart[r];
+            if (!take || t.spill_vgpr_count >= SHADER_MAX_SPILL_VGPRS)
+                continue;
+            t.spill_slot[r] = t.spill_vgpr_count;
+            t.spill_vgprs[t.spill_vgpr_count++] = (u8)r;
+        }
     }
     for (u32 i = 0; i < p.count; i++) {
         const RdnaInst& in = p.insts[i];

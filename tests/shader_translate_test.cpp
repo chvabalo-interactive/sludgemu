@@ -1515,6 +1515,35 @@ static void test_spills_apart() {
         CHECK(!translate(a, info));
         CHECK(error_has("v_writelane_b32 in a wave64 program"));
     }
+    {
+        // Sixteen registers (all slots) only lane accesses touch, and v10, a lower one with an ordinary
+        // value before its spill: the sixteen keep the slots (v35 the last), v10 goes without.
+        Asm a = {};
+        a.put(0xbe840387); // s_mov_b32 s4, 7
+        a.put(0x7e140300); // v_mov_b32 v10, v0
+        a.put(0x7e16030a); // v_mov_b32 v11, v10
+        a.put(0xd761000a); // v_writelane_b32 v10, s4, 3
+        a.put(0x02010604);
+        for (u32 r = 20; r < 36; r++) {
+            a.put(0xd7610000 | r); // v_writelane_b32 v<r>, s4, 3
+            a.put(0x02010604);
+        }
+        a.put(0xd7600005); // v_readlane_b32 s5, v10, 3
+        a.put(0x0201070a);
+        for (u32 r = 20; r < 36; r++) {
+            a.put(0xd7600005); // v_readlane_b32 s5, v<r>, 3
+            a.put(0x02010700 | r);
+        }
+        a.put(0x7e180205); // v_mov_b32 v12, s5
+        a.put(0xbf810000); // s_endpgm
+        ShaderInfo cs = compute_info();
+        cs.wave_size = 64;
+        CHECK(translate(a, cs));
+        CHECK(hlsl_has("spill15_3 = s4;"));
+        CHECK(hlsl_has("s5 = spill15_3;"));
+        CHECK(hlsl_has("s5 = WaveReadLaneAt(v10_0, 3u);")); // compute: an exact lane read instead
+        CHECK(!hlsl_has("WaveReadLaneAt(v35_0"));
+    }
 }
 
 // --- LDS ---------------------------------------------------------------------------------------------
