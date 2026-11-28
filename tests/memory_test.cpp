@@ -334,11 +334,21 @@ static void test_pending_pages() {
     mem_prepare(base, PAGE); // backs the slice: every page here
     CHECK(!mem_any_pending(base, pages * PAGE));
     CHECK(mem_physical_bound_pages_at(base, pages * PAGE) == pages);
-    // Remapped pages are pending again.
+    // A frame written through one address and shown at another has data there, though that page waits
+    // for its first touch: it isn't read as zeros.
+    base[5] = 42;
     CHECK(mem_map_physical(base + PAGE, 1, &frames[0]));
+    CHECK(!mem_any_pending(base, pages * PAGE));
+    CHECK(base[PAGE + 5] == 42);
+    // A frame nothing has written, mapped over a backed page, is pending.
+    u64 fresh;
+    CHECK(mem_physical_alloc(1, &fresh));
+    CHECK(mem_map_physical(base + 2 * PAGE, 1, &fresh));
     CHECK(mem_any_pending(base, pages * PAGE));
-    CHECK(!mem_any_pending(base + 2 * PAGE, 2 * PAGE));
+    CHECK(mem_any_pending(base + 2 * PAGE, PAGE));
+    CHECK(!mem_any_pending(base + 3 * PAGE, PAGE));
     CHECK(mem_release(base));
+    mem_physical_free(1, &fresh);
     mem_physical_free(pages, frames);
 }
 

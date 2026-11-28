@@ -610,6 +610,7 @@ bool mem_any_pending(const void* addr, u64 size) {
     const u8* end = p + size;
     bool any = false;
     AcquireSRWLockShared(&g_mem.range_lock);
+    AcquireSRWLockShared(&g_mem.phys_lock);
     while (!any && p < end) {
         RangeSlot* s = find_range_locked(p);
         if (!s)
@@ -619,11 +620,16 @@ bool mem_any_pending(const void* addr, u64 size) {
         if ((s->info.flags & MEM_RANGE_PLACEHOLDER) && s->pending) {
             u32 first = (u32)((u64)(p - s->info.base) >> MEM_PAGE_SHIFT);
             u32 last = (u32)(((u64)(stop - s->info.base) + MEM_PAGE_SIZE - 1) >> MEM_PAGE_SHIFT);
-            for (u32 page = first; !any && page < last; page++)
-                any = s->pending[page] != MEM_INVALID_PFN;
+            // A page waits for its first touch here even when its frame is bound already (written
+            // through another address that shows it): only an unbound frame reads as zero.
+            for (u32 page = first; !any && page < last; page++) {
+                u32 id = s->pending[page];
+                any = id != MEM_INVALID_PFN && g_mem.id_to_real[id] == MEM_INVALID_PFN;
+            }
         }
         p = stop;
     }
+    ReleaseSRWLockShared(&g_mem.phys_lock);
     ReleaseSRWLockShared(&g_mem.range_lock);
     return any;
 }
