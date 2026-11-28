@@ -122,6 +122,12 @@ add_executable(sludgemu WIN32
     gpu/gpu.cpp
     gpu/gpu_ring.h
     gpu/gpu_ring.cpp
+    gpu/ring_space.h
+    gpu/ring_space.cpp
+    gpu/reuse_order.h
+    gpu/reuse_order.cpp
+    gpu/list_pool.h
+    gpu/list_pool.cpp
     gpu/texture_untile.h
     gpu/texture_untile.cpp
     gpu/gpu_window.h

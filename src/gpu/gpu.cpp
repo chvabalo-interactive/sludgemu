@@ -419,6 +419,31 @@ u64 gpu_queue_execute(ID3D12CommandQueue* queue, u32 slot, u32 count, ID3D12Comm
     return number;
 }
 
+u64 gpu_queue_reserve(u32 slot) {
+    if (slot >= GPU_MAX_QUEUES)
+        return 0;
+    AcquireSRWLockExclusive(&g_submit_lock);
+    u64 number = ++g_queues[slot].submitted;
+    ReleaseSRWLockExclusive(&g_submit_lock);
+    return number;
+}
+
+void gpu_queue_execute_reserved(ID3D12CommandQueue* queue, u32 slot, u64 number, u32 count,
+                                ID3D12CommandList* const* lists) {
+    if (slot >= GPU_MAX_QUEUES) {
+        if (count)
+            queue->ExecuteCommandLists(count, lists);
+        return;
+    }
+    AcquireSRWLockExclusive(&g_submit_lock);
+    GpuQueueSlot& q = g_queues[slot];
+    if (count)
+        q.queue->ExecuteCommandLists(count, lists);
+    q.queue->Signal(q.fence, number);
+    collect_locked();
+    ReleaseSRWLockExclusive(&g_submit_lock);
+}
+
 u64 gpu_queue_completed(u32 slot) {
     if (slot >= GPU_MAX_QUEUES)
         return 0;
@@ -426,6 +451,26 @@ u64 gpu_queue_completed(u32 slot) {
     u64 completed = g_queues[slot].fence ? g_queues[slot].fence->GetCompletedValue() : 0;
     ReleaseSRWLockShared(&g_submit_lock);
     return completed;
+}
+
+u32 gpu_queue_generation(u32 slot) {
+    if (slot >= GPU_MAX_QUEUES)
+        return 0;
+    AcquireSRWLockShared(&g_submit_lock);
+    u32 generation = g_queues[slot].generation;
+    ReleaseSRWLockShared(&g_submit_lock);
+    return generation;
+}
+
+// A queue that left its slot drained its work first (gpu_queue_unregister).
+bool gpu_queue_reached(u32 slot, u32 generation, u64 number) {
+    if (slot >= GPU_MAX_QUEUES)
+        return true;
+    AcquireSRWLockShared(&g_submit_lock);
+    const GpuQueueSlot& q = g_queues[slot];
+    bool reached = !q.queue || q.generation != generation || q.fence->GetCompletedValue() >= number;
+    ReleaseSRWLockShared(&g_submit_lock);
+    return reached;
 }
 
 void gpu_queue_wait(u32 slot, u64 number) {
@@ -517,12 +562,26 @@ bool gpu_retire_point_reached(const GpuRetirePoint& point) {
 }
 
 void gpu_wait_idle() {
-    AcquireSRWLockExclusive(&g_submit_lock);
+    // Waits without the lock: submissions held back in a queue backlog reach their queue (taking the
+    // lock) while this waits for them.
+    ID3D12Fence* fences[GPU_MAX_QUEUES];
+    u64 values[GPU_MAX_QUEUES];
+    AcquireSRWLockShared(&g_submit_lock);
     for (u32 q = 0; q < GPU_MAX_QUEUES; q++) {
-        GpuQueueSlot& s = g_queues[q];
-        if (s.queue && s.fence->GetCompletedValue() < s.submitted)
-            s.fence->SetEventOnCompletion(s.submitted, nullptr);
+        fences[q] = g_queues[q].queue ? g_queues[q].fence : nullptr;
+        values[q] = g_queues[q].submitted;
+        if (fences[q])
+            fences[q]->AddRef();
     }
+    ReleaseSRWLockShared(&g_submit_lock);
+    for (u32 q = 0; q < GPU_MAX_QUEUES; q++) {
+        if (!fences[q])
+            continue;
+        if (fences[q]->GetCompletedValue() < values[q])
+            fences[q]->SetEventOnCompletion(values[q], nullptr);
+        fences[q]->Release();
+    }
+    AcquireSRWLockExclusive(&g_submit_lock);
     collect_locked();
     ReleaseSRWLockExclusive(&g_submit_lock);
 }
