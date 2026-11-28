@@ -365,13 +365,18 @@ static SRWLOCK g_submit_lock = SRWLOCK_INIT;
 static GpuQueueSlot g_queues[GPU_MAX_QUEUES];
 static SyncOp g_sync_history[GPU_MAX_QUEUES][SYNC_HISTORY];
 
-// The highest value a signal handed to a desktop queue sets each fence to, for gpu_fence_wait_covered:
-// open addressing by fence, entries holding a fence reference. A signal the fence has reached says no
-// more than the fence itself, so such entries go when the table fills. Under g_submit_lock.
+// The highest signal still pending on a desktop queue for each fence, for gpu_fence_wait_covered: open
+// addressing by fence, entries holding a fence reference. A signal is pending until its queue finished
+// the submission after it (`before`); one that ran says no more than the fence itself (which titles may
+// also set lower again), so it covers nothing and its entry goes when the table fills. Under
+// g_submit_lock.
 #define QUEUED_SIGNALS 4096 // power of two
 struct QueuedSignal {
     ID3D12Fence* fence;
     u64 value;
+    u32 slot;
+    u32 generation; // of the slot, when the signal was queued
+    u64 before;
 };
 static QueuedSignal g_queued_signals[QUEUED_SIGNALS];
 static u32 g_queued_signal_count;
@@ -578,7 +583,14 @@ static QueuedSignal* queued_signal_slot(ID3D12Fence* fence) {
     return &g_queued_signals[i];
 }
 
-// Drops the entries of signals their fences have reached. g_submit_lock held exclusively.
+// Whether the signal may not have run yet. Conservative: it ran once its queue finished the submission
+// after it, or once another queue took the slot. g_submit_lock held.
+static bool signal_pending(const QueuedSignal& s) {
+    const GpuQueueSlot& q = g_queues[s.slot];
+    return q.queue && q.generation == s.generation && q.fence->GetCompletedValue() < s.before;
+}
+
+// Drops the entries of signals that ran. g_submit_lock held exclusively.
 static void sweep_queued_signals() {
     static QueuedSignal kept[QUEUED_SIGNALS];
     u32 count = 0;
@@ -586,7 +598,7 @@ static void sweep_queued_signals() {
         QueuedSignal& s = g_queued_signals[i];
         if (!s.fence)
             continue;
-        if (s.fence->GetCompletedValue() >= s.value)
+        if (!signal_pending(s))
             s.fence->Release();
         else
             kept[count++] = s;
@@ -597,12 +609,13 @@ static void sweep_queued_signals() {
     g_queued_signal_count = count;
 }
 
-// g_submit_lock held exclusively.
-static void note_queued_signal(ID3D12Fence* fence, u64 value) {
+// A signal queued on slot `slot` right before its submission `before`. g_submit_lock held exclusively.
+static void note_queued_signal(ID3D12Fence* fence, u64 value, u32 slot, u64 before) {
+    QueuedSignal entry = {fence, value, slot, g_queues[slot].generation, before};
     QueuedSignal* s = queued_signal_slot(fence);
     if (s->fence) {
-        if (value > s->value)
-            s->value = value;
+        if (value >= s->value || !signal_pending(*s))
+            *s = entry; // (keeps the reference it holds)
         return;
     }
     if (g_queued_signal_count >= QUEUED_SIGNALS * 3 / 4) {
@@ -615,7 +628,7 @@ static void note_queued_signal(ID3D12Fence* fence, u64 value) {
         }
     }
     fence->AddRef();
-    *s = {fence, value};
+    *s = entry;
     g_queued_signal_count++;
 }
 
@@ -624,7 +637,7 @@ bool gpu_fence_wait_covered(ID3D12Fence* fence, u64 value) {
         return true;
     AcquireSRWLockShared(&g_submit_lock);
     const QueuedSignal* s = queued_signal_slot(fence);
-    bool queued = s->fence && s->value >= value;
+    bool queued = s->fence && s->value >= value && signal_pending(*s);
     ReleaseSRWLockShared(&g_submit_lock);
     return queued;
 }
@@ -633,13 +646,15 @@ bool gpu_fence_wait_covered(ID3D12Fence* fence, u64 value) {
 // recorded.
 static void sync_op(ID3D12CommandQueue* queue, ID3D12Fence* fence, u64 value, bool wait) {
     AcquireSRWLockExclusive(&g_submit_lock);
+    u32 slot = slot_of(queue);
     if (wait) {
         queue->Wait(fence, value);
     } else {
         queue->Signal(fence, value);
-        note_queued_signal(fence, value);
+        if (slot !=
+            GPU_NO_QUEUE) // (signals of queues without a slot cover nothing: waits wait for the fence)
+            note_queued_signal(fence, value, slot, g_queues[slot].executed + 1);
     }
-    u32 slot = slot_of(queue);
     ID3D12Fence* old = nullptr;
     if (slot != GPU_NO_QUEUE) {
         GpuQueueSlot& q = g_queues[slot];
@@ -689,68 +704,117 @@ static const char* queue_type_name(ID3D12CommandQueue* queue) {
     }
 }
 
-// g_submit_lock held.
-static void name_fence(GpuFenceNamer name, ID3D12Fence* fence, char* out, u32 size) {
-    for (u32 s = 0; s < GPU_MAX_QUEUES; s++) {
-        if (g_queues[s].queue && g_queues[s].fence == fence) {
-            snprintf(out, size, "the submissions of slot %u", s);
-            return;
-        }
-    }
-    if (name)
-        name(fence, out, size);
-    else
-        snprintf(out, size, "fence %p", (void*)fence);
-}
+// What a stall report says about a queue and the unmet waits holding it, gathered under g_submit_lock
+// and logged after it: naming a fence may take locks (a title counter's) that are held while
+// submitting.
+#define STALL_WAITS 8 // per queue
+struct StallWait {
+    ID3D12Fence* fence; // referenced
+    u64 value;
+    u64 reached;
+    u32 fence_slot;  // the slot whose submissions the fence counts, or GPU_NO_QUEUE
+    u32 signal_slot; // the queue holding a signal that reaches `value`, or GPU_NO_QUEUE
+    u64 signal_value;
+    u64 signal_before;
+};
+struct StallQueue {
+    bool used;
+    const char* type;
+    u64 numbered, executed, completed;
+    u32 wait_count;
+    StallWait waits[STALL_WAITS];
+};
 
-// Which queued signal reaches `value` on `fence`: logged, or that none does. g_submit_lock held.
-static void report_signal_for(ID3D12Fence* fence, u64 value) {
+// Which queued signal reaches `value` on `fence`. g_submit_lock held.
+static void find_signal_for(StallWait* w) {
+    w->signal_slot = GPU_NO_QUEUE;
     for (u32 s = 0; s < GPU_MAX_QUEUES; s++) {
         if (!g_queues[s].queue)
             continue;
         for (u32 i = 0; i < SYNC_HISTORY; i++) {
             const SyncOp& op = g_sync_history[s][i];
-            if (op.fence == fence && !op.wait && op.value >= value) {
-                LOG_W("gpu", "      a signal to %llu is queued on slot %u before its submission %llu",
-                      op.value, s, op.before);
+            if (op.fence == w->fence && !op.wait && op.value >= w->value) {
+                w->signal_slot = s;
+                w->signal_value = op.value;
+                w->signal_before = op.before;
                 return;
             }
         }
     }
-    LOG_W("gpu", "      no queued GPU work signals it: CPU code or work not submitted yet must");
 }
 
-void gpu_queue_report_stall(GpuFenceNamer name) {
-    AcquireSRWLockShared(&g_submit_lock);
+// g_submit_lock held.
+static void gather_stall(StallQueue* out) {
     for (u32 s = 0; s < GPU_MAX_QUEUES; s++) {
         const GpuQueueSlot& q = g_queues[s];
-        if (!q.queue)
+        StallQueue& r = out[s];
+        r.used = q.queue != nullptr;
+        if (!r.used)
             continue;
-        u64 completed = q.fence->GetCompletedValue();
-        LOG_W("gpu", "  queue slot %u (%s): numbered %llu, executed %llu, completed %llu", s,
-              queue_type_name(q.queue), q.submitted, q.executed, completed);
-        if (completed >= q.executed)
+        r.type = queue_type_name(q.queue);
+        r.numbered = q.submitted;
+        r.executed = q.executed;
+        r.completed = q.fence->GetCompletedValue();
+        if (r.completed >= q.executed)
             continue;
         // Waits recorded right after submission `completed` hold back the one it is stuck at.
-        bool held = false;
-        for (u32 n = 0; n < SYNC_HISTORY; n++) {
+        for (u32 n = 0; n < SYNC_HISTORY && r.wait_count < STALL_WAITS; n++) {
             const SyncOp& op = g_sync_history[s][(q.sync_next + n) & (SYNC_HISTORY - 1)];
-            if (!op.fence || !op.wait || op.before != completed + 1)
+            if (!op.fence || !op.wait || op.before != r.completed + 1)
                 continue;
             u64 reached = op.fence->GetCompletedValue();
             if (reached >= op.value)
                 continue;
-            char fence_name[160];
-            name_fence(name, op.fence, fence_name, sizeof(fence_name));
-            LOG_W("gpu", "    waits for %s to reach %llu (it is at %llu)", fence_name, op.value, reached);
-            report_signal_for(op.fence, op.value);
-            held = true;
+            StallWait& w = r.waits[r.wait_count++];
+            op.fence->AddRef();
+            w.fence = op.fence;
+            w.value = op.value;
+            w.reached = reached;
+            w.fence_slot = GPU_NO_QUEUE;
+            for (u32 f = 0; f < GPU_MAX_QUEUES; f++) {
+                if (g_queues[f].queue && g_queues[f].fence == op.fence)
+                    w.fence_slot = f;
+            }
+            find_signal_for(&w);
         }
-        if (!held)
-            LOG_W("gpu", "    no unmet fence wait before submission %llu in the history: it runs",
-                  completed + 1);
     }
+}
+
+void gpu_queue_report_stall(GpuFenceNamer name) {
+    static StallQueue queues[GPU_MAX_QUEUES]; // (one report at a time: the stall watch thread's)
+    memset(queues, 0, sizeof(queues));
+    AcquireSRWLockShared(&g_submit_lock);
+    gather_stall(queues);
     ReleaseSRWLockShared(&g_submit_lock);
+    for (u32 s = 0; s < GPU_MAX_QUEUES; s++) {
+        StallQueue& r = queues[s];
+        if (!r.used)
+            continue;
+        LOG_W("gpu", "  queue slot %u (%s): numbered %llu, executed %llu, completed %llu", s, r.type,
+              r.numbered, r.executed, r.completed);
+        if (r.completed >= r.executed)
+            continue;
+        if (!r.wait_count)
+            LOG_W("gpu", "    no unmet fence wait before submission %llu in the history: it runs",
+                  r.completed + 1);
+        for (u32 i = 0; i < r.wait_count; i++) {
+            StallWait& w = r.waits[i];
+            char fence_name[160];
+            if (w.fence_slot != GPU_NO_QUEUE)
+                snprintf(fence_name, sizeof(fence_name), "the submissions of slot %u", w.fence_slot);
+            else if (name)
+                name(w.fence, fence_name, sizeof(fence_name));
+            else
+                snprintf(fence_name, sizeof(fence_name), "fence %p", (void*)w.fence);
+            LOG_W("gpu", "    waits for %s to reach %llu (it is at %llu)", fence_name, w.value, w.reached);
+            if (w.signal_slot != GPU_NO_QUEUE)
+                LOG_W("gpu", "      a signal to %llu is queued on slot %u before its submission %llu",
+                      w.signal_value, w.signal_slot, w.signal_before);
+            else
+                LOG_W("gpu", "      no queued GPU work signals it: CPU code or work not submitted yet must");
+            w.fence->Release();
+        }
+    }
 }
 
 void gpu_set_name(ID3D12Object* object, const char* format, ...) {

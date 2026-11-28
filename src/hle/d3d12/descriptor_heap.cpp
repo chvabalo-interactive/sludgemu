@@ -227,16 +227,23 @@ static bool image_words_by_desktop(ConsoleDescriptorHeap* own, u64 desktop, Imag
     return found;
 }
 
-// Whether `desktop` is a CPU-only desktop descriptor of a live heap of `own`'s type: what a slot marker
-// names, unless the title left a stale marker over other data (or the heap it named is gone).
-static bool live_desktop_descriptor(ConsoleDescriptorHeap* own, u64 desktop) {
+// Copies the descriptor a slot marker names into `dst`, if it is a CPU-only desktop descriptor of a live
+// heap of `own`'s type; false if not (the title left a stale marker over other data, or the heap it
+// named is gone). Another heap stays registered, and so alive, while its descriptor is copied.
+static bool copy_marked_descriptor(ConsoleDescriptorHeap* own, D3D12_CPU_DESCRIPTOR_HANDLE dst, u64 source) {
     u64 end = own->cpu_start + (u64)own->desc.NumDescriptors * own->desktop_stride;
-    if (desktop >= own->cpu_start && desktop < end)
-        return (desktop - own->cpu_start) % own->desktop_stride == 0;
+    if (source >= own->cpu_start && source < end) {
+        if ((source - own->cpu_start) % own->desktop_stride != 0)
+            return false;
+        gpu_device()->CopyDescriptorsSimple(1, dst, {source}, own->desktop_type);
+        return true;
+    }
     AcquireSRWLockShared(&g_heaps.lock);
-    ConsoleDescriptorHeap* heap = heap_holding(g_heaps.by_desktop, desktop);
+    ConsoleDescriptorHeap* heap = heap_holding(g_heaps.by_desktop, source);
     bool live = heap && heap->desktop_type == own->desktop_type &&
-                (desktop - heap->cpu_start) % heap->desktop_stride == 0;
+                (source - heap->cpu_start) % heap->desktop_stride == 0;
+    if (live)
+        gpu_device()->CopyDescriptorsSimple(1, dst, {source}, own->desktop_type);
     ReleaseSRWLockShared(&g_heaps.lock);
     return live;
 }
@@ -336,7 +343,6 @@ void console_descriptor_mirror(ConsoleDescriptorHeap* heap, u32 first, u32 count
     if (count > heap->visible_count - desktop_first)
         count = heap->visible_count - desktop_first;
     bool same_index = first == desktop_first;
-    ID3D12Device* device = gpu_device();
     for (u32 k = 0; k < count; k++) {
         u32 i = first + k, d = desktop_first + k;
         const u8* console = heap->memory + (u64)i * heap->stride;
@@ -354,14 +360,13 @@ void console_descriptor_mirror(ConsoleDescriptorHeap* heap, u32 first, u32 count
             continue; // not a descriptor of ours
         if (same_index && source == own)
             continue; // written in place, and published then
-        if (!live_desktop_descriptor(heap, source)) {
+        D3D12_CPU_DESCRIPTOR_HANDLE dst = {heap->visible_cpu_start + (u64)d * heap->desktop_stride};
+        if (!copy_marked_descriptor(heap, dst, source)) {
             LOG_W_ONCE("d3d12",
                        "descriptor slot %u of a table names no live descriptor (0x%llx); left as it was", i,
                        source);
             continue;
         }
-        D3D12_CPU_DESCRIPTOR_HANDLE dst = {heap->visible_cpu_start + (u64)d * heap->desktop_stride};
-        device->CopyDescriptorsSimple(1, dst, {source}, heap->desktop_type);
         // A title copy of an image view's slot: dwords 4-7 are where the view was made.
         ImageWords words;
         bool image = (type_word & DESCRIPTOR_MARKER_IMAGE) && image_words_by_desktop(heap, source, &words);

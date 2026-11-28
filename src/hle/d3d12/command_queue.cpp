@@ -104,8 +104,20 @@ static void arm(ConsoleCommandQueue* self, const BacklogOp& op) {
             LOG_E("d3d12", "cannot follow a fence for held-back queue work (0x%08lx)", (unsigned long)hr);
         return; // the next call into the queue tries again
     }
+    fence->AddRef(); // (the op holding it may run and let it go before the registration fires)
+    if (b.armed_fence)
+        b.armed_fence->Release();
     b.armed_fence = fence;
     b.armed_value = value;
+}
+
+// The registration arm() made fired: the next arm may register again. Wakeups by wake_held_waits leave
+// a pending one in place, or every signal queued elsewhere would add a registration. Queue lock held.
+static void disarm_if_fired(QueueBacklog& b) {
+    if (b.armed_fence && b.armed_fence->GetCompletedValue() >= b.armed_value) {
+        b.armed_fence->Release();
+        b.armed_fence = nullptr;
+    }
 }
 
 // Hands held-back work to the desktop queue, in order, as far as it can go without waiting. Queue lock
@@ -126,7 +138,7 @@ static void backlog_run(ConsoleCommandQueue* self) {
 static void CALLBACK backlog_wakeup(void* context, BOOLEAN) {
     ConsoleCommandQueue* self = (ConsoleCommandQueue*)context;
     AcquireSRWLockExclusive(&self->lock);
-    self->backlog.armed_fence = nullptr;
+    disarm_if_fired(self->backlog);
     backlog_run(self);
     ReleaseSRWLockExclusive(&self->lock);
 }
@@ -277,6 +289,8 @@ static void queue_destroy(void* object) {
         UnregisterWaitEx(queue->backlog.wait, INVALID_HANDLE_VALUE); // waits for a running wakeup
     if (queue->backlog.event)
         CloseHandle(queue->backlog.event);
+    if (queue->backlog.armed_fence)
+        queue->backlog.armed_fence->Release();
     backlog_free(&queue->backlog);
     gpu_queue_unregister(queue->slot);
     gpu_list_pool_release(&queue->writers);
