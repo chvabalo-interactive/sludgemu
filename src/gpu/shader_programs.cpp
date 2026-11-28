@@ -185,15 +185,20 @@ bool gpu_job_queue_background(void (*run)(void* context), void* context) {
     return queue({nullptr, run, context}, false, 0);
 }
 
-// Something waits for `p`: from here on its compile starts whatever the memory, and if no worker has
-// it, it is queued in the urgent lane. Under g_job_lock, like the worker's decision to put a translated
-// program aside (build_program): one of the two sees the other's change.
+// A draw needs `p`: from here on it is built ahead of the programs merely created, at full speed, and if
+// no worker has it, it is queued in the urgent lane. Its compile starts whatever the memory only while a
+// title thread is blocked on it (`blocked`): draws skip what isn't built once their waits run out, and
+// make every program they skip urgent, so urgent alone may mean many of the largest programs at once
+// (about a gigabyte of compiler memory each). One put aside for memory is queued again only for a
+// blocked thread, to be taken over; for draws that skip it, it stays put aside until it fits. Under
+// g_job_lock, like the worker's decision to put a translated program aside (build_program): one of the
+// two sees the other's change.
 static void hurry(ShaderProgram* p) {
     AcquireSRWLockExclusive(&g_job_lock);
     p->urgent = true;
     u32 state = p->state;
     bool queued = false;
-    if (!p->urgent_queued && (state == PROGRAM_PENDING || state == PROGRAM_TRANSLATED))
+    if (!p->urgent_queued && (state == PROGRAM_PENDING || (state == PROGRAM_TRANSLATED && p->blocked)))
         queued = p->urgent_queued = push_job({p, nullptr, nullptr}, true, 0); // else asked again by the wait
     ReleaseSRWLockExclusive(&g_job_lock);
     if (queued)
@@ -253,6 +258,9 @@ static ShaderPick take_job(ShaderJob* job) {
         *job = g_urgent.jobs[g_urgent.head];
         g_urgent.head = (g_urgent.head + 1) % JOB_CAPACITY;
         g_urgent.count--;
+        // Queued again from here on if it is put aside and a thread blocks on it.
+        if (job->program)
+            job->program->urgent_queued = false;
         break;
     case PICK_BACKGROUND:
         shader_job_heap_pop(&g_background, job);
@@ -316,12 +324,14 @@ u32 shader_wait_ms_left(u64 deadline_us) {
 }
 
 void shader_program_hurry(ShaderProgram* p) {
-    if (is_final(p->state))
+    u32 state = p->state;
+    if (is_final(state))
         return;
-    // Once urgent and queued in the urgent lane (or building), whoever builds it does so at full
-    // speed (start_program), so asking again takes no lock. Read without it: both flags are only ever
-    // set, under the lock, so a stale read only takes the slow way.
-    if (p->urgent && (p->urgent_queued || p->state == PROGRAM_BUILDING))
+    // Once urgent and queued in the urgent lane, building or put aside, whoever builds it does so at full
+    // speed (start_program), and one put aside waits for memory (or for a blocked thread, which hurries
+    // it itself), so asking again takes no lock. Read without it: `urgent` is only ever set, and a stale
+    // `urgent_queued` names a job a worker just took, which builds the program or puts it aside.
+    if (p->urgent && (p->urgent_queued || state == PROGRAM_BUILDING || state == PROGRAM_TRANSLATED))
         return;
     hurry(p);
     // A worker that had it before it was urgent runs it at background speed.
@@ -330,8 +340,8 @@ void shader_program_hurry(ShaderProgram* p) {
         gpu_job_hurry((u32)builder);
 }
 
-ShaderWaitResult shader_program_wait(ShaderProgram* p, u64 deadline_us) {
-    shader_program_hurry(p);
+// The thread blocks on `p` until it is final or `deadline_us` passes; counted in `blocked` meanwhile.
+static ShaderWaitResult wait_blocked(ShaderProgram* p, u64 deadline_us) {
     long boosted = 0;
     for (;;) {
         u32 state = p->state;
@@ -345,8 +355,7 @@ ShaderWaitResult shader_program_wait(ShaderProgram* p, u64 deadline_us) {
         }
         u32 ms = shader_wait_ms_left(deadline_us);
         if (!ms) {
-            if (deadline_us)
-                p->wait_ran_out = true;
+            p->wait_ran_out = true;
             return SHADER_WAIT_LATE;
         }
         // Builders wake every waiter when they start (to be hurried along), when they put a program
@@ -356,6 +365,34 @@ ShaderWaitResult shader_program_wait(ShaderProgram* p, u64 deadline_us) {
             GetLastError() == ERROR_TIMEOUT)
             hurry(p);
     }
+}
+
+static void set_blocked(ShaderProgram* p, bool blocked) {
+    AcquireSRWLockExclusive(&g_job_lock);
+    if (blocked)
+        p->blocked++;
+    else
+        p->blocked--;
+    ReleaseSRWLockExclusive(&g_job_lock);
+}
+
+ShaderWaitResult shader_program_wait(ShaderProgram* p, u64 deadline_us) {
+    u32 state = p->state;
+    if (is_final(state))
+        return state == PROGRAM_READY ? SHADER_WAIT_READY : SHADER_WAIT_FAILED;
+    if (!shader_wait_ms_left(deadline_us)) {
+        shader_program_hurry(p);
+        if (deadline_us)
+            p->wait_ran_out = true;
+        return SHADER_WAIT_LATE;
+    }
+    // Blocked before hurried: one put aside for memory is then taken over by an urgent job, and one
+    // still translating is compiled whatever the memory (build_program reads `blocked` under the lock).
+    set_blocked(p, true);
+    hurry(p);
+    ShaderWaitResult r = wait_blocked(p, deadline_us);
+    set_blocked(p, false);
+    return r;
 }
 
 bool shader_program_then(ShaderProgram* p, void (*run)(void* context), void* context) {
@@ -570,10 +607,14 @@ static void compile_translated(Worker& w, ShaderProgram* p) {
 // that doesn't fit the memory budget is put aside translated (the HLSL is a fraction of the compile's
 // memory), and the worker goes on with other work.
 static void build_program(Worker& w, ShaderProgram* p, bool urgent) {
-    // Urgent jobs take over programs put aside; the compile starts whatever the memory.
+    // Urgent jobs take over programs put aside: compiled now when a thread is blocked on them (whatever
+    // the memory) or when they fit, else left aside until they do.
     if (urgent && p->state == PROGRAM_TRANSLATED) {
+        u64 room = commit_room();
         AcquireSRWLockExclusive(&g_job_lock);
-        bool taken = p->state == PROGRAM_TRANSLATED;
+        bool taken = p->state == PROGRAM_TRANSLATED &&
+                     shader_compile_admitted(g_compile_in_flight, p->compile_cost, g_schedule.compile_budget,
+                                             room, p->blocked != 0);
         if (taken) {
             InterlockedExchange((volatile LONG*)&p->state, PROGRAM_BUILDING);
             reserve_compile(p->compile_cost);
@@ -603,11 +644,11 @@ static void build_program(Worker& w, ShaderProgram* p, bool urgent) {
         return;
     }
     u64 cost = shader_compile_cost(t.hlsl.length);
-    u64 room = urgent ? 0 : commit_room();
+    u64 room = commit_room();
     TranslatedShader* aside = nullptr;
     AcquireSRWLockExclusive(&g_job_lock);
-    bool admitted = shader_compile_admitted(g_compile_in_flight, cost, g_schedule.compile_budget, room,
-                                            urgent || p->urgent);
+    bool admitted =
+        shader_compile_admitted(g_compile_in_flight, cost, g_schedule.compile_budget, room, p->blocked != 0);
     bool short_of_commit = !admitted && g_compile_in_flight + cost > room;
     if (!admitted) {
         aside = (TranslatedShader*)malloc(sizeof(TranslatedShader));
@@ -634,8 +675,8 @@ static void build_program(Worker& w, ShaderProgram* p, bool urgent) {
     } else {
         if (short_of_commit)
             LOG_W_ONCE("gpu",
-                       "shader compiles nothing waits for wait: the system has little commit left (%llu MiB "
-                       "to spare)",
+                       "shader compiles no thread is blocked on wait: the system has little commit left "
+                       "(%llu MiB to spare)",
                        (unsigned long long)(room >> 20));
         WakeByAddressAll((void*)&p->state);
     }

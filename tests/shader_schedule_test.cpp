@@ -62,7 +62,7 @@ static void test_compile_admission() {
     // Up to the budget exactly.
     CHECK(shader_compile_admitted(budget - ordinary, ordinary, budget, ROOM, false));
     CHECK(!shader_compile_admitted(budget - ordinary + 1, ordinary, budget, ROOM, false));
-    // Something waits for it: always.
+    // A title thread is blocked on it: always.
     CHECK(shader_compile_admitted(budget, huge, budget, ROOM, true));
     CHECK(shader_compile_admitted(4 * huge, huge, budget, ROOM, true));
     // The system short of commit: compiles nothing waits for wait even when nothing compiles (a
@@ -72,8 +72,19 @@ static void test_compile_admission() {
     CHECK(!shader_compile_admitted(ordinary, ordinary, budget, 2 * ordinary - 1, false));
     CHECK(shader_compile_admitted(ordinary, ordinary, budget, 2 * ordinary, false));
     CHECK(!shader_compile_admitted(0, ordinary, budget, 0, false));
-    // Something waits for it: whatever the commit.
+    // A title thread is blocked on it: whatever the commit.
     CHECK(shader_compile_admitted(0, huge, budget, 0, true));
+    // Draws that skip what isn't built make each program they skip urgent without blocking on it: many
+    // of the largest at once. Admitted that way they still fit the budget; one past it waits.
+    u64 in_flight = 0;
+    u32 started = 0;
+    for (u32 i = 0; i < SHADER_MAX_WORKERS; i++) {
+        if (!shader_compile_admitted(in_flight, huge, budget32, ROOM, false))
+            continue;
+        in_flight += huge;
+        started++;
+    }
+    CHECK(started == 2 && in_flight <= budget32);
 }
 
 static ShaderJob job_with(uintptr_t id) {

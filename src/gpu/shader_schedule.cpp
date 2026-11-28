@@ -41,8 +41,8 @@ u64 shader_compile_cost(u64 hlsl_bytes) {
     return COMPILE_BASE_BYTES + hlsl_bytes * COMPILE_BYTES_PER_BYTE;
 }
 
-bool shader_compile_admitted(u64 in_flight, u64 cost, u64 budget, u64 commit_room, bool urgent) {
-    if (urgent)
+bool shader_compile_admitted(u64 in_flight, u64 cost, u64 budget, u64 commit_room, bool blocked) {
+    if (blocked)
         return true;
     // The compiles running are counted against the room again, as most of what they will take is not
     // committed yet: a compile grows to its peak over its run.

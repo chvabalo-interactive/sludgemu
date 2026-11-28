@@ -47,8 +47,9 @@ struct ShaderProgram {
     volatile bool wait_ran_out;
 
     // Under the job lock (gpu/shader_programs.cpp):
-    bool urgent;                   // something waits for it: its compile starts whatever the memory
-    bool urgent_queued;            // queued in the urgent lane
+    bool urgent;                   // a draw needs it: built first, at full speed
+    bool urgent_queued;            // a job for it is in the urgent lane
+    u32 blocked;                   // threads blocked on it: its compile starts whatever the memory
     TranslatedShader* translation; // PROGRAM_TRANSLATED: the HLSL to compile
     u64 compile_cost;              // PROGRAM_TRANSLATED: the compile's estimated memory
     ProgramThen* then;             // jobs to queue once it's built (shader_program_then)

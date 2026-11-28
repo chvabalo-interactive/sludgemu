@@ -7,8 +7,10 @@
 // take only part of the workers, so work a draw waits for always finds one free (a running compile
 // can't be interrupted), it runs cheapest first, so most programs are cached early and the few huge
 // ones (tens of seconds and about a gigabyte of compiler memory each) come last, and compiles start
-// only while their estimated memory fits a budget. Work something waits for is never held back, and
-// no background job starts while a title thread waits.
+// only while their estimated memory fits a budget. Work a draw needs is never held back, and no
+// background job starts while a title thread waits; its compiles, though, pass the memory budget only
+// while a title thread is blocked on them (draws that skip what isn't built make it urgent without
+// blocking, so urgent work alone may be many of the largest compiles at once).
 //
 // Title threads wait for what their draws need for a bounded time only (the wait budget below).
 
@@ -32,12 +34,12 @@ ShaderSchedule shader_schedule_for(u32 physical_cores, u64 physical_memory);
 // The memory a compile of `hlsl_bytes` of HLSL is estimated to take at most.
 u64 shader_compile_cost(u64 hlsl_bytes);
 
-// Whether a compile estimated at `cost` may start while compiles estimated at `in_flight` run. Urgent
-// ones always may; others while the sum fits the budget, or when no compile runs (one larger than the
-// whole budget would otherwise never start), and only while the sum fits `commit_room`, the commit the
-// system can spare (a budget sized from the machine's memory doesn't know what other processes and the
-// title hold; running the system out of commit stops the title).
-bool shader_compile_admitted(u64 in_flight, u64 cost, u64 budget, u64 commit_room, bool urgent);
+// Whether a compile estimated at `cost` may start while compiles estimated at `in_flight` run. Ones a
+// title thread is `blocked` on always may; others while the sum fits the budget, or when no compile runs
+// (one larger than the whole budget would otherwise never start), and only while the sum fits
+// `commit_room`, the commit the system can spare (a budget sized from the machine's memory doesn't know
+// what other processes and the title hold; running the system out of commit stops the title).
+bool shader_compile_admitted(u64 in_flight, u64 cost, u64 budget, u64 commit_room, bool blocked);
 
 // A job: a program to build, a program whose compile waited for memory, or a function to run.
 struct ShaderJob {
