@@ -2218,7 +2218,26 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         emit(t, "}");
         return true;
     }
+    case OP_DS_CMPST_B32:
+    case OP_DS_CMPST_RTN_B32: {
+        // Compare and store: DATA0 is the value compared with, DATA1 the one stored (the opposite of
+        // the buffer and global compare-swaps, whose data VGPRs hold the new value first).
+        const char* d1 = vgpr(t, in.src[2].reg);
+        if (in.op == OP_DS_CMPST_RTN_B32) {
+            emit(t, "{ uint o_ = 0u; if (%s) InterlockedCompareExchange(g_lds[(%s + %uu) >> 2], %s, %s, o_);",
+                 exec_cond(t), addr, offset, d0, d1);
+            t.depth++;
+            write_vgpr(t, in, in.dst[0].reg, "o_");
+            t.depth--;
+            emit(t, "}");
+        } else {
+            emit(t, "if (%s) InterlockedCompareStore(g_lds[(%s + %uu) >> 2], %s, %s);", exec_cond(t), addr,
+                 offset, d0, d1);
+        }
+        return true;
+    }
     case OP_DS_ADD_U32:
+    case OP_DS_SUB_U32:
     case OP_DS_MIN_U32:
     case OP_DS_MAX_U32:
     case OP_DS_MIN_I32:
@@ -2227,6 +2246,7 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
     case OP_DS_OR_B32:
     case OP_DS_XOR_B32:
     case OP_DS_ADD_RTN_U32:
+    case OP_DS_SUB_RTN_U32:
     case OP_DS_MIN_RTN_U32:
     case OP_DS_MAX_RTN_U32:
     case OP_DS_AND_RTN_B32:
@@ -2239,6 +2259,11 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         case OP_DS_ADD_U32:
         case OP_DS_ADD_RTN_U32:
             fn = "InterlockedAdd";
+            break;
+        case OP_DS_SUB_U32:
+        case OP_DS_SUB_RTN_U32:
+            fn = "InterlockedAdd"; // of the negated data, which wraps the same way
+            d0 = fmt(t, "(0u - %s)", d0);
             break;
         case OP_DS_MIN_U32:
         case OP_DS_MIN_RTN_U32:
