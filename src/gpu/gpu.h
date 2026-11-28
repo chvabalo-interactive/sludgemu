@@ -51,10 +51,27 @@ u64 gpu_queue_submitted(u32 slot); // returns the submission's number
 // Returns the submission's number (0 for a queue without a slot, whose work runs uncounted).
 u64 gpu_queue_execute(ID3D12CommandQueue* queue, u32 slot, u32 count, ID3D12CommandList* const* lists);
 
+// Work held back from its queue (see the console queue backlog) is numbered when it is held back:
+// gpu_queue_reserve hands out the slot's next number without submitting, and gpu_queue_execute_reserved
+// later executes the lists (none: nothing but the count) and signals that number. Reserved numbers must
+// reach the queue in order, and nothing else may be counted on the slot meanwhile: a later number
+// signaled first would complete the reserved ones.
+u64 gpu_queue_reserve(u32 slot);
+void gpu_queue_execute_reserved(ID3D12CommandQueue* queue, u32 slot, u64 number, u32 count,
+                                ID3D12CommandList* const* lists);
+
 // The number of the last submission the queue finished.
 u64 gpu_queue_completed(u32 slot);
 
-// Blocks until the queue finished submission `number`.
+// Which queue holds the slot: counts the queues that held it.
+u32 gpu_queue_generation(u32 slot);
+
+// Whether the queue that held the slot as `generation` finished submission `number` (or left the slot,
+// which drains its work). Doesn't wait.
+bool gpu_queue_reached(u32 slot, u32 generation, u64 number);
+
+// Blocks until the queue finished submission `number`. Never from a title's submission paths: GPU work
+// may wait for work that thread submits later.
 void gpu_queue_wait(u32 slot, u64 number);
 
 // The fence counting the queue's submissions, for other queues to wait on (alive as long as the slot).

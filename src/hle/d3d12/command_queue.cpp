@@ -1,4 +1,10 @@
 // Console ID3D12CommandQueue.
+//
+// Console queues never block the thread submitting to them, and titles rely on it: GPU work may wait
+// (on a fence or a counter in memory) for work the same thread submits afterwards. So nothing here
+// waits for the GPU. Our own lists come from pools that grow while the GPU is behind, and work that
+// desktop D3D12 can't take yet (a list submitted again before its last run finished) is held back in
+// the queue's backlog, together with everything after it (queue_backlog.h).
 
 #include <stddef.h>
 
@@ -6,6 +12,7 @@
 
 #include "common/log.h"
 #include "gpu/gpu.h"
+#include "gpu/page_tables.h"
 #include "gpu/presenter.h"
 #include "hle/d3d12/frame_pacing.h"
 #include "hle/d3d12/d3d12_objects.h"
@@ -24,62 +31,219 @@ static const ConsoleClass k_queue_class = {"ID3D12CommandQueue", k_queue_iids, A
 
 static void* const* g_queue_table = nullptr;
 
+// --- the backlog -------------------------------------------------------------------------------------
+
+// Hands one held-back op to the desktop queue. Queue lock held.
+static void run_op(ConsoleCommandQueue* self, BacklogOp& op) {
+    switch (op.kind) {
+    case BACKLOG_EXECUTE:
+        if (op.count)
+            gpu_page_tables_submit(self->desktop);
+        gpu_queue_execute_reserved(self->desktop, self->slot, op.number, op.count, op.lists);
+        for (u32 i = 0; i < op.count; i++)
+            gpu_retire(op.lists[i]);
+        break;
+    case BACKLOG_SIGNAL:
+        self->desktop->Signal(op.fence, op.value);
+        gpu_retire(op.fence);
+        break;
+    case BACKLOG_WAIT:
+        self->desktop->Wait(op.fence, op.value);
+        gpu_retire(op.fence);
+        break;
+    case BACKLOG_PRESENT: {
+        u64 done = presenter_present(self->desktop, op.planes, op.count);
+        if (op.count)
+            frame_on_present(op.token, done);
+        for (u32 i = 0; i < op.count; i++)
+            gpu_retire(op.planes[i].texture);
+        break;
+    }
+    }
+}
+
+static bool op_ready(const BacklogOp& op) {
+    return op.kind != BACKLOG_EXECUTE || op.after_slot == GPU_NO_QUEUE ||
+           gpu_queue_reached(op.after_slot, op.after_generation, op.after);
+}
+
+// Sets the backlog's event to follow the run the first op waits for. Queue lock held.
+static void arm(ConsoleCommandQueue* self, const BacklogOp& op) {
+    QueueBacklog& b = self->backlog;
+    if (!b.event || (b.armed_slot == op.after_slot && b.armed_after == op.after))
+        return; // (without an event SetEventOnCompletion would block)
+    ID3D12Fence* fence = gpu_queue_fence(op.after_slot);
+    HRESULT hr = fence ? fence->SetEventOnCompletion(op.after, b.event) : E_FAIL;
+    if (FAILED(hr)) {
+        if (!gpu_device_lost(hr))
+            LOG_E("d3d12", "cannot follow queue slot %u for held-back work (0x%08lx)", op.after_slot,
+                  (unsigned long)hr);
+        return; // the next call into the queue tries again
+    }
+    b.armed_slot = op.after_slot;
+    b.armed_after = op.after;
+}
+
+// Hands held-back work to the desktop queue, in order, as far as it can go without waiting. Queue lock
+// held.
+static void backlog_run(ConsoleCommandQueue* self) {
+    QueueBacklog& b = self->backlog;
+    while (BacklogOp* op = backlog_front(&b)) {
+        if (!op_ready(*op)) {
+            arm(self, *op);
+            return;
+        }
+        run_op(self, *op);
+        backlog_pop(&b);
+    }
+}
+
+// The run the first held-back op waits for finished (or an older one the event followed).
+static void CALLBACK backlog_wakeup(void* context, BOOLEAN) {
+    ConsoleCommandQueue* self = (ConsoleCommandQueue*)context;
+    AcquireSRWLockExclusive(&self->lock);
+    self->backlog.armed_slot = GPU_NO_QUEUE;
+    backlog_run(self);
+    ReleaseSRWLockExclusive(&self->lock);
+}
+
+// Hands all held-back work to the desktop queue, waiting for what it waits for: only when the queue
+// goes away, or without memory to hold more back. Queue lock held.
+static void backlog_drain(ConsoleCommandQueue* self) {
+    while (BacklogOp* op = backlog_front(&self->backlog)) {
+        if (!op_ready(*op))
+            gpu_queue_wait(op->after_slot, op->after);
+        run_op(self, *op);
+        backlog_pop(&self->backlog);
+    }
+}
+
+// A new held-back op at the end of the backlog, or nullptr if the work has to go straight to the queue
+// (after draining the backlog: logged, out of memory). Queue lock held.
+static BacklogOp* hold_back(ConsoleCommandQueue* self) {
+    QueueBacklog& b = self->backlog;
+    if (!b.event) {
+        b.armed_slot = GPU_NO_QUEUE;
+        b.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (b.event && !RegisterWaitForSingleObject(&b.wait, b.event, backlog_wakeup, self, INFINITE,
+                                                    WT_EXECUTEDEFAULT)) {
+            CloseHandle(b.event);
+            b.event = nullptr;
+        }
+        if (!b.event)
+            LOG_E("d3d12",
+                  "cannot make a thread pool wait for held-back queue work (%lu); it moves on with "
+                  "later submissions only",
+                  GetLastError());
+    }
+    BacklogOp* op = backlog_push(&b);
+    if (!op) {
+        LOG_E("d3d12", "out of memory holding back queue work; waiting for the GPU instead");
+        backlog_drain(self);
+    } else if (b.count == 256) {
+        LOG_W("d3d12",
+              "a queue holds back %u submissions: a list submitted again before its last run "
+              "finished waits for work that doesn't finish",
+              b.count);
+    }
+    return op;
+}
+
+// --- submissions -------------------------------------------------------------------------------------
+
+// Hands `lists` (none: just a count) to the desktop queue, after the page table work they need, once
+// submission `after` of queue slot `after_slot` finished (GPU_NO_QUEUE: no such wait). Held back while
+// anything else is, or while that run isn't finished. Returns the queue submission it is (reserved when
+// held back). Queue lock held.
+static u64 submit(ConsoleCommandQueue* self, u32 count, ID3D12CommandList* const* lists, u32 after_slot,
+                  u32 after_generation, u64 after) {
+    bool ready = after_slot == GPU_NO_QUEUE || gpu_queue_reached(after_slot, after_generation, after);
+    if (!self->backlog.count && ready) {
+        if (count)
+            gpu_page_tables_submit(self->desktop);
+        return gpu_queue_execute(self->desktop, self->slot, count, lists);
+    }
+    BacklogOp* op = hold_back(self);
+    if (!op) {
+        if (!ready)
+            gpu_queue_wait(after_slot, after);
+        if (count)
+            gpu_page_tables_submit(self->desktop);
+        return gpu_queue_execute(self->desktop, self->slot, count, lists);
+    }
+    op->kind = BACKLOG_EXECUTE;
+    op->count = count;
+    op->after_slot = ready ? GPU_NO_QUEUE : after_slot;
+    op->after_generation = after_generation;
+    op->after = after;
+    for (u32 i = 0; i < count; i++) {
+        lists[i]->AddRef();
+        op->lists[i] = lists[i];
+    }
+    u64 number = gpu_queue_reserve(self->slot);
+    op->number = number;
+    backlog_run(self); // runs what is ready by now (the op may be gone after) and arms the wait
+    return number;
+}
+
+// A desktop fence signal or wait on the queue, in order with its submissions. Queue lock held.
+static void fence_op(ConsoleCommandQueue* self, BacklogKind kind, ID3D12Fence* fence, u64 value) {
+    BacklogOp* op = self->backlog.count ? hold_back(self) : nullptr;
+    if (!op) {
+        if (kind == BACKLOG_SIGNAL)
+            self->desktop->Signal(fence, value);
+        else
+            self->desktop->Wait(fence, value);
+        return;
+    }
+    op->kind = kind;
+    fence->AddRef();
+    op->fence = fence;
+    op->value = value;
+}
+
 static void queue_destroy(void* object) {
     ConsoleCommandQueue* queue = (ConsoleCommandQueue*)object;
+    AcquireSRWLockExclusive(&queue->lock);
+    backlog_drain(queue);
+    ReleaseSRWLockExclusive(&queue->lock);
+    if (queue->backlog.wait)
+        UnregisterWaitEx(queue->backlog.wait, INVALID_HANDLE_VALUE); // waits for a running wakeup
+    if (queue->backlog.event)
+        CloseHandle(queue->backlog.event);
+    backlog_free(&queue->backlog);
     gpu_queue_unregister(queue->slot);
-    for (u32 i = 0; i < QUEUE_SIGNAL_WRITERS; i++) {
-        gpu_retire(queue->writers[i].list);
-        gpu_retire(queue->writers[i].allocator);
-    }
-    for (u32 i = 0; i < QUEUE_UPLOADERS; i++) {
-        gpu_retire(queue->uploaders[i].list);
-        gpu_retire(queue->uploaders[i].allocator);
-    }
+    gpu_list_pool_release(&queue->writers);
+    gpu_list_pool_release(&queue->uploaders);
     gpu_ring_release(&queue->scratch);
     gpu_ring_release(&queue->staging);
 }
 
 // Texture contents waiting for upload from title memory go first, from a list of the queue's own.
+// Queue lock held.
 static void upload_textures(ConsoleCommandQueue* self) {
     if (self->type == D3D12_COMMAND_LIST_TYPE_COPY || !texture_sync_pending())
         return;
-    AcquireSRWLockExclusive(&self->writer_lock); // titles may submit to a queue from several threads
-    QueueSignalWriter& w = self->uploaders[self->next_uploader];
-    HRESULT hr;
-    if (!w.list) {
-        ID3D12Device13* device = gpu_device();
-        hr = device->CreateCommandAllocator(self->type, IID_PPV_ARGS(&w.allocator));
-        if (SUCCEEDED(hr))
-            hr = device->CreateCommandList(0, self->type, w.allocator, nullptr, IID_PPV_ARGS(&w.list));
-        if (SUCCEEDED(hr))
-            gpu_set_name(w.list, "texture uploads");
-    } else {
-        gpu_queue_wait(self->slot, w.submission); // its allocator may still be in use
-        hr = w.allocator->Reset();
-        if (SUCCEEDED(hr))
-            hr = w.list->Reset(w.allocator, nullptr);
-    }
-    if (FAILED(hr)) {
-        ReleaseSRWLockExclusive(&self->writer_lock);
-        if (!gpu_device_lost(hr))
-            LOG_E("d3d12", "cannot record texture uploads (0x%08lx)", (unsigned long)hr);
+    u32 entry;
+    ID3D12GraphicsCommandList8* list =
+        gpu_list_pool_begin(&self->uploaders, gpu_queue_completed(self->slot), &entry);
+    if (!list)
         return;
-    }
     TextureUploadSources sources;
     self->scratch.slot = self->staging.slot = self->slot;
     self->staging.upload = true;
-    bool recorded = texture_sync_record(self->desktop, w.list, &sources, &self->scratch, &self->staging);
-    if (SUCCEEDED(w.list->Close()) && recorded) {
-        ID3D12CommandList* list = w.list;
-        gpu_page_tables_submit(self->desktop); // uploads may read title memory through the page tables
-        w.submission = gpu_queue_execute(self->desktop, self->slot, 1, &list);
-        gpu_ring_submitted(&self->scratch, w.submission);
-        gpu_ring_submitted(&self->staging, w.submission);
-        self->next_uploader = (self->next_uploader + 1) % QUEUE_UPLOADERS; // this one is in flight
+    bool recorded = texture_sync_record(self->desktop, list, &sources, &self->scratch, &self->staging);
+    if (SUCCEEDED(list->Close()) && recorded) {
+        ID3D12CommandList* lists[] = {list};
+        u64 number = submit(self, 1, lists, GPU_NO_QUEUE, 0, 0); // uploads may read title memory through
+                                                                 // the page tables, submitted first
+        gpu_list_pool_submitted(&self->uploaders, entry, number);
+        gpu_ring_submitted(&self->scratch, number);
+        gpu_ring_submitted(&self->staging, number);
     } else if (sources.count) {
-        gpu_queue_submitted(self->slot); // tile mapping changes alone: counted so their textures stay
+        submit(self, 0, nullptr, GPU_NO_QUEUE, 0, 0); // tile mapping changes alone: counted so their
+                                                      // textures stay
     }
-    ReleaseSRWLockExclusive(&self->writer_lock);
     for (u32 i = 0; i < sources.count; i++)
         gpu_retire(sources.resources[i]);
 }
@@ -114,32 +278,38 @@ static HRESULT WINAPI queue_copy_page_mappings_batch_x(ConsoleCommandQueue*, UIN
 }
 
 // Lists submitted per desktop call; longer submissions are split, which keeps their order.
-#define SUBMIT_BATCH 64
+#define SUBMIT_BATCH BACKLOG_LISTS
 
+// The lists of the next desktop submission, and the run they wait for (after_slot GPU_NO_QUEUE: none).
 struct SubmitBatch {
     ID3D12CommandList* lists[SUBMIT_BATCH];
     u32 count;
+    u32 after_slot;
+    u32 after_generation;
+    u64 after;
 };
 
-// Submits the batch after the page table work it needs: descriptors mirrored for it may have reached
-// pages the page tables map only now. Returns the submission's number, or `last` if there was nothing.
+// Submits the batch. Returns the submission's number, or `last` if there was nothing. Queue lock held.
 static u64 flush(ConsoleCommandQueue* self, SubmitBatch* b, u64 last) {
     if (!b->count)
         return last;
-    gpu_page_tables_submit(self->desktop);
-    u64 number = gpu_queue_execute(self->desktop, self->slot, b->count, b->lists);
+    u64 number = submit(self, b->count, b->lists, b->after_slot, b->after_generation, b->after);
     b->count = 0;
+    b->after_slot = GPU_NO_QUEUE;
     return number;
 }
 
 // Each console list runs its parts in order, with the fence signals and waits between them. A console
-// list can be submitted again while it still runs; desktop lists can't, so that waits for the run
-// before (the same list twice in one call ends the submission there).
+// list can be submitted again while it still runs; desktop lists can't, so that run is held back until
+// the one before finished (the same list twice in one call is the same case).
 static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT count,
                                                ConsoleCommandList* const* lists) {
+    AcquireSRWLockExclusive(&self->lock);
+    backlog_run(self); // what can go now goes first
     upload_textures(self);
     SubmitBatch b;
     b.count = 0;
+    b.after_slot = GPU_NO_QUEUE;
     u64 last = 0; // the call's last submission
     for (UINT i = 0; i < count; i++) {
         ConsoleCommandList* list = lists[i];
@@ -150,12 +320,17 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
                 continue;
             last = flush(self, &b, last);
             list->submitted_slot = self->slot;
+            list->submitted_generation = self->generation;
             list->submitted_number = last;
             break;
         }
         if (list->submitted_slot != GPU_NO_QUEUE &&
-            gpu_queue_completed(list->submitted_slot) < list->submitted_number)
-            gpu_queue_wait(list->submitted_slot, list->submitted_number);
+            !gpu_queue_reached(list->submitted_slot, list->submitted_generation, list->submitted_number)) {
+            last = flush(self, &b, last); // the lists before don't wait for it
+            b.after_slot = list->submitted_slot;
+            b.after_generation = list->submitted_generation;
+            b.after = list->submitted_number;
+        }
         for (u32 t = 0; t < list->table_count; t++) {
             const ConsoleCommandList::TableUse& use = list->tables[t];
             console_descriptor_mirror(use.heap, use.first, use.count, use.desktop_first);
@@ -170,24 +345,28 @@ static void WINAPI queue_execute_command_lists(ConsoleCommandQueue* self, UINT c
                 break;
             last = flush(self, &b, last);
             if (seg.sync == LIST_SYNC_SIGNAL) {
-                self->desktop->Signal(seg.fence, seg.value);
+                fence_op(self, BACKLOG_SIGNAL, seg.fence, seg.value);
             } else {
                 if (seg.counter)
                     console_counter_wait(seg.counter, seg.value);
-                self->desktop->Wait(seg.fence, seg.value);
+                fence_op(self, BACKLOG_WAIT, seg.fence, seg.value);
             }
         }
     }
     last = flush(self, &b, last);
-    u64 submission = last ? last : gpu_queue_submitted(self->slot);
+    u64 submission = last ? last : submit(self, 0, nullptr, GPU_NO_QUEUE, 0, 0);
+    bool held_back = self->backlog.count != 0;
     for (UINT i = 0; i < count; i++) {
         if (lists[i]) {
             lists[i]->submitted_slot = self->slot;
+            lists[i]->submitted_generation = self->generation;
             lists[i]->submitted_number = submission;
+            lists[i]->held_back |= held_back;
         }
     }
+    ReleaseSRWLockExclusive(&self->lock);
     if (gpu_options().serialize)
-        gpu_queue_wait(self->slot, submission);
+        gpu_queue_wait(self->slot, submission); // diagnostics: the GPU runs one submission at a time
 }
 
 // The frame token and flags tie the work to console frame pacing.
@@ -198,53 +377,42 @@ static void WINAPI queue_execute_command_lists_2x(ConsoleCommandQueue* self, UIN
 
 // Title code polls fence values in memory, so a queue signal also writes the value there once the
 // queue's earlier work is done, from a small list run just before the desktop signal. Low half
-// first: a reader never sees a value ahead of its time.
+// first: a reader never sees a value ahead of its time. Queue lock held.
 static void write_fence_value(ConsoleCommandQueue* self, ConsoleFence* fence, u64 value) {
     if (!fence->value_desktop &&
         !console_translate_coherent((u64)fence->value, sizeof(u64), &fence->value_desktop)) {
         LOG_W_ONCE("d3d12", "fence value memory is not GPU-visible; queue signals won't update it");
         return;
     }
-    AcquireSRWLockExclusive(&self->writer_lock);
-    QueueSignalWriter& w = self->writers[self->next_writer];
-    self->next_writer = (self->next_writer + 1) % QUEUE_SIGNAL_WRITERS;
-    HRESULT hr;
-    if (!w.list) {
-        ID3D12Device13* device = gpu_device();
-        hr = device->CreateCommandAllocator(self->type, IID_PPV_ARGS(&w.allocator));
-        if (SUCCEEDED(hr))
-            hr = device->CreateCommandList(0, self->type, w.allocator, nullptr, IID_PPV_ARGS(&w.list));
-        if (SUCCEEDED(hr))
-            gpu_set_name(w.list, "fence value writes");
-    } else {
-        gpu_queue_wait(self->slot, w.submission); // its allocator may still be in use
-        hr = w.allocator->Reset();
-        if (SUCCEEDED(hr))
-            hr = w.list->Reset(w.allocator, nullptr);
-    }
-    if (SUCCEEDED(hr)) {
-        D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[2] = {{fence->value_desktop, (u32)value},
-                                                          {fence->value_desktop + 4, (u32)(value >> 32)}};
-        D3D12_WRITEBUFFERIMMEDIATE_MODE modes[2] = {D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
-                                                    D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT};
-        w.list->WriteBufferImmediate(2, params, modes);
-        hr = w.list->Close();
-    }
-    if (SUCCEEDED(hr)) {
-        ID3D12CommandList* list = w.list;
-        w.submission = gpu_queue_execute(self->desktop, self->slot, 1, &list);
-    } else {
+    u32 entry;
+    ID3D12GraphicsCommandList8* list =
+        gpu_list_pool_begin(&self->writers, gpu_queue_completed(self->slot), &entry);
+    if (!list)
+        return;
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[2] = {{fence->value_desktop, (u32)value},
+                                                      {fence->value_desktop + 4, (u32)(value >> 32)}};
+    D3D12_WRITEBUFFERIMMEDIATE_MODE modes[2] = {D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+                                                D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT};
+    list->WriteBufferImmediate(2, params, modes);
+    HRESULT hr = list->Close();
+    if (FAILED(hr)) {
         if (!gpu_device_lost(hr))
             LOG_E("d3d12", "cannot write a fence value from the queue (0x%08lx)", (unsigned long)hr);
+        return;
     }
-    ReleaseSRWLockExclusive(&self->writer_lock);
+    ID3D12CommandList* lists[] = {list};
+    gpu_list_pool_submitted(&self->writers, entry, submit(self, 1, lists, GPU_NO_QUEUE, 0, 0));
 }
 
 static HRESULT WINAPI queue_signal(ConsoleCommandQueue* self, ConsoleFence* fence, UINT64 value) {
     if (!fence)
         return E_INVALIDARG;
+    AcquireSRWLockExclusive(&self->lock);
+    backlog_run(self);
     write_fence_value(self, fence, value);
-    return self->desktop->Signal(fence->desktop, value);
+    fence_op(self, BACKLOG_SIGNAL, fence->desktop, value);
+    ReleaseSRWLockExclusive(&self->lock);
+    return S_OK;
 }
 
 // The flush flags pick which console caches to write back first; desktop signals see all
@@ -254,19 +422,50 @@ static HRESULT WINAPI queue_signal_x(ConsoleCommandQueue* self, ConsoleFence* fe
 }
 
 static HRESULT WINAPI queue_wait(ConsoleCommandQueue* self, ConsoleFence* fence, UINT64 value) {
-    return fence ? self->desktop->Wait(fence->desktop, value) : E_INVALIDARG;
+    if (!fence)
+        return E_INVALIDARG;
+    AcquireSRWLockExclusive(&self->lock);
+    backlog_run(self);
+    fence_op(self, BACKLOG_WAIT, fence->desktop, value);
+    ReleaseSRWLockExclusive(&self->lock);
+    return S_OK;
 }
 
+// Markers only label work for graphics debuggers: while work is held back they are left out rather
+// than held back too. An event's end goes where its begin went, so the desktop queue's events stay
+// balanced when the backlog empties or fills between the two.
 static void WINAPI queue_set_marker(ConsoleCommandQueue* self, UINT metadata, const void* data, UINT size) {
-    self->desktop->SetMarker(metadata, data, size);
+    AcquireSRWLockExclusive(&self->lock);
+    if (!self->backlog.count)
+        self->desktop->SetMarker(metadata, data, size);
+    ReleaseSRWLockExclusive(&self->lock);
 }
 
 static void WINAPI queue_begin_event(ConsoleCommandQueue* self, UINT metadata, const void* data, UINT size) {
-    self->desktop->BeginEvent(metadata, data, size);
+    AcquireSRWLockExclusive(&self->lock);
+    bool send = !self->backlog.count;
+    if (send)
+        self->desktop->BeginEvent(metadata, data, size);
+    if (self->event_depth < 64) {
+        u64 bit = 1ull << self->event_depth;
+        self->events_sent = send ? self->events_sent | bit : self->events_sent & ~bit;
+    }
+    self->event_depth++;
+    ReleaseSRWLockExclusive(&self->lock);
 }
 
 static void WINAPI queue_end_event(ConsoleCommandQueue* self) {
-    self->desktop->EndEvent();
+    AcquireSRWLockExclusive(&self->lock);
+    bool send;
+    if (!self->event_depth) {
+        send = !self->backlog.count; // an end without a begin: the title's own imbalance, passed on
+    } else {
+        self->event_depth--;
+        send = self->event_depth < 64 ? (self->events_sent >> self->event_depth) & 1 : !self->backlog.count;
+    }
+    if (send)
+        self->desktop->EndEvent();
+    ReleaseSRWLockExclusive(&self->lock);
 }
 
 // --- presentation ------------------------------------------------------------------------------------
@@ -335,9 +534,24 @@ static HRESULT WINAPI queue_present_x(ConsoleCommandQueue* self, UINT plane_coun
         for (u32 c = 0; c < 4; c++)
             out[i].dest[c] = dest[c];
     }
-    u64 done = presenter_present(self->desktop, out, plane_count);
-    if (plane_count)
-        frame_on_present(planes[0].token, done);
+    AcquireSRWLockExclusive(&self->lock);
+    backlog_run(self);
+    BacklogOp* op = self->backlog.count ? hold_back(self) : nullptr;
+    if (op) { // after the held-back work
+        op->kind = BACKLOG_PRESENT;
+        op->count = plane_count;
+        op->token = plane_count ? planes[0].token : 0;
+        for (UINT i = 0; i < plane_count; i++) {
+            op->planes[i] = out[i];
+            if (out[i].texture)
+                out[i].texture->AddRef();
+        }
+    } else {
+        u64 done = presenter_present(self->desktop, out, plane_count);
+        if (plane_count)
+            frame_on_present(planes[0].token, done);
+    }
+    ReleaseSRWLockExclusive(&self->lock);
     return S_OK;
 }
 
@@ -401,5 +615,9 @@ HRESULT console_create_command_queue(ConsoleDevice* device, const D3D12_COMMAND_
     queue->type = desc->Type;
     queue->desktop = desktop;
     queue->slot = gpu_queue_register(desktop);
+    queue->generation = gpu_queue_generation(queue->slot);
+    queue->writers.type = queue->uploaders.type = desc->Type;
+    queue->writers.name = "fence value writes";
+    queue->uploaders.name = "texture uploads";
     return console_return(queue, iid, out);
 }

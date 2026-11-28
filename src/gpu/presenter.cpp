@@ -209,13 +209,16 @@ static void wait_frame(Presenter* p, u64 value) {
         p->fence->SetEventOnCompletion(value, nullptr);
 }
 
-// Follows the window's size; the swap chain's buffers must be idle and unreferenced to resize.
-static void fit_window(Presenter* p) {
+// Follows the window's size; the swap chain's buffers must be idle and unreferenced to resize. False
+// while the GPU still runs presents: waiting for them could wait for title work submitted after this
+// present (see presenter_present).
+static bool fit_window(Presenter* p) {
     u32 w, h;
     window_client_size(&w, &h);
     if (!w || !h || (w == p->width && h == p->height))
-        return;
-    wait_frame(p, p->fence_value);
+        return true;
+    if (p->fence->GetCompletedValue() < p->fence_value)
+        return false;
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         p->buffers[i]->Release();
         p->buffers[i] = nullptr;
@@ -228,6 +231,7 @@ static void fit_window(Presenter* p) {
     p->width = actual.Width;
     p->height = actual.Height;
     acquire_buffers(p);
+    return true;
 }
 
 // A view that reads the stored values as they are: the swap chain shows them unconverted.
@@ -481,9 +485,17 @@ u64 presenter_present(ID3D12CommandQueue* queue, const PresentPlane* planes, u32
     if (queue != p->queue)
         LOG_W_ONCE("present", "presents from a second queue go through the first one's swap chain");
 
-    fit_window(p);
+    // The presenter never waits for the GPU: the present comes from a title's submission path, and the
+    // GPU may be waiting for title work submitted after it. While the GPU is a whole swap chain of
+    // presents behind (the back buffer's allocator and descriptors still in use), or a resize waits for
+    // it, presents are dropped; the GPU catches up meanwhile.
     u32 frame = p->swap_chain->GetCurrentBackBufferIndex();
-    wait_frame(p, p->frame_fence[frame]);
+    if (!fit_window(p) || p->fence->GetCompletedValue() < p->frame_fence[frame]) {
+        LOG_W_ONCE("present", "the GPU is behind the presents; presents are dropped until it catches up");
+        ReleaseSRWLockExclusive(&p->lock);
+        return 0;
+    }
+    frame = p->swap_chain->GetCurrentBackBufferIndex(); // resizing starts the buffers over
     p->allocators[frame]->Reset();
     p->list->Reset(p->allocators[frame], nullptr);
 

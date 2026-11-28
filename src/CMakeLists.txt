@@ -109,6 +109,8 @@ add_executable(sludgemu WIN32
     hle/d3d12/command_list_work.cpp
     hle/d3d12/barriers.h
     hle/d3d12/barriers.cpp
+    hle/d3d12/queue_backlog.h
+    hle/d3d12/queue_backlog.cpp
     hle/d3d12/frame_pacing.h
     hle/d3d12/frame_pacing.cpp
     hle/d3d12/bvh_builder.cpp
@@ -122,6 +124,12 @@ add_executable(sludgemu WIN32
     gpu/gpu.cpp
     gpu/gpu_ring.h
     gpu/gpu_ring.cpp
+    gpu/ring_space.h
+    gpu/ring_space.cpp
+    gpu/reuse_order.h
+    gpu/reuse_order.cpp
+    gpu/list_pool.h
+    gpu/list_pool.cpp
     gpu/texture_untile.h
     gpu/texture_untile.cpp
     gpu/gpu_window.h
