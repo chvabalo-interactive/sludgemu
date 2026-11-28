@@ -105,6 +105,10 @@ bool console_layout_init(ConsoleModel model);
 // The swizzle mode the console runtime picks for a texture (a CONSOLE_LAYOUT_SWIZZLE value), or 0.
 u32 console_suggest_layout(const ConsoleTextureDesc& desc);
 
+// The swizzle mode a texture is laid out in, as the hardware numbers them (addrlib's AddrSwizzleMode):
+// the description's own, linear for row-major layouts, else the console runtime's pick.
+u32 console_swizzle_mode(const ConsoleTextureDesc& desc);
+
 // Computes the layout of a texture. Fails for descriptions the console can't create.
 bool console_texture_layout(const ConsoleTextureDesc& desc, ConsoleTextureLayout* out);
 
@@ -145,7 +149,8 @@ struct ConsoleSubresourceAddressing {
 // elements doesn't come out where the layout puts them (checking costs layout computations; a kind
 // of texture checked once needn't be again).
 bool console_subresource_addressing(const ConsoleTextureDesc& desc, const ConsoleTextureLayout& layout,
-                                    u32 plane, u32 mip, u32 slice, ConsoleSubresourceAddressing* out, bool check);
+                                    u32 plane, u32 mip, u32 slice, ConsoleSubresourceAddressing* out,
+                                    bool check);
 
 // Byte offset of element (x, y, z) of a subresource from the start of the texture.
 u64 console_subresource_offset(const ConsoleSubresourceAddressing& a, u32 x, u32 y, u32 z);
