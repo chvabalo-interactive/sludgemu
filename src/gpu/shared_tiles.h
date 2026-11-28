@@ -21,7 +21,7 @@ void shared_tile_keys(u64 va, u32 count, u64* keys);
 struct SharedTileEntry {
     u64 key; // 0: empty, 1: removed
     u32 tile;
-    u32 refs;
+    u32 refs; // 0: unreferenced, kept until shared_tile_drop
 };
 
 // Open addressing over keys.
@@ -29,18 +29,23 @@ struct SharedTileMap {
     SharedTileEntry* entries;
     u32 capacity; // a power of two, or 0
     u32 used;     // entries not empty (removed ones included)
-    u32 live;     // keys with a tile
+    u32 live;     // keys with a tile (unreferenced ones included)
 };
 
-// Takes a reference to the tile of `key`: true with `*tile` if the key has one; false if not (the caller
-// gets a tile and inserts it).
+// Takes a reference to the tile of `key`: true with `*tile` if the key has one (unreferenced ones too);
+// false if not (the caller gets a tile and inserts it).
 bool shared_tile_ref(SharedTileMap* m, u64 key, u32* tile);
 
 // Gives `key` its tile, with one reference. False if out of memory (the key stays without).
 bool shared_tile_insert(SharedTileMap* m, u64 key, u32 tile);
 
-// Drops a reference to the tile of `key`. True with `*tile` if that was the last: the key is gone and
-// the caller frees the tile.
-bool shared_tile_unref(SharedTileMap* m, u64 key, u32* tile);
+// Drops a reference to the tile of `key`. True if that was the last. The key keeps its tile without
+// references until shared_tile_drop: a texture over the same memory taking it meanwhile (one made
+// before this one went but not given its tiles yet, or one whose memory was swapped with this one's)
+// finds its contents, as on console, where the memory outlives the textures over it.
+bool shared_tile_unref(SharedTileMap* m, u64 key);
+
+// Removes `key` if its tile has no references: true with `*tile`, which the caller frees.
+bool shared_tile_drop(SharedTileMap* m, u64 key, u32* tile);
 
 void shared_tile_map_free(SharedTileMap* m);

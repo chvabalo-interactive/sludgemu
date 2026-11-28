@@ -9,7 +9,8 @@
 
 #define PAGE MEM_PAGE_SIZE
 
-// References count per key; the last one gives the tile back, and the key is gone.
+// References count per key. The last one leaves the key its tile, unreferenced: a reference taken then
+// gets the same tile back; dropping it frees the key.
 static void test_map_references() {
     SharedTileMap m = {};
     u32 tile = 0;
@@ -18,13 +19,23 @@ static void test_map_references() {
     CHECK(shared_tile_ref(&m, 0x10000, &tile) && tile == 7);
     CHECK(shared_tile_ref(&m, 0x10000, &tile) && tile == 7);
     CHECK(m.live == 1);
-    CHECK(!shared_tile_unref(&m, 0x10000, &tile));
-    CHECK(!shared_tile_unref(&m, 0x10000, &tile));
+    CHECK(!shared_tile_unref(&m, 0x10000));
+    CHECK(!shared_tile_drop(&m, 0x10000, &tile)); // still referenced
+    CHECK(!shared_tile_unref(&m, 0x10000));
+    CHECK(shared_tile_unref(&m, 0x10000));
+    CHECK(!shared_tile_unref(&m, 0x10000)); // no references left to drop
+    CHECK(m.live == 1);
+    // Taken again before it was dropped: the same tile (its contents) comes back.
     tile = 0;
-    CHECK(shared_tile_unref(&m, 0x10000, &tile) && tile == 7);
+    CHECK(shared_tile_ref(&m, 0x10000, &tile) && tile == 7);
+    CHECK(!shared_tile_drop(&m, 0x10000, &tile));
+    CHECK(shared_tile_unref(&m, 0x10000));
+    tile = 0;
+    CHECK(shared_tile_drop(&m, 0x10000, &tile) && tile == 7);
     CHECK(m.live == 0);
+    CHECK(!shared_tile_drop(&m, 0x10000, &tile));
     CHECK(!shared_tile_ref(&m, 0x10000, &tile));
-    CHECK(!shared_tile_unref(&m, 0x10000, &tile)); // unknown keys release nothing
+    CHECK(!shared_tile_unref(&m, 0x10000)); // unknown keys release nothing
     shared_tile_map_free(&m);
 }
 
@@ -37,7 +48,8 @@ static void test_map_churn() {
         CHECK(shared_tile_insert(&m, SHARED_TILE_FRAME | i, i));
     for (u32 i = 0; i < keys; i += 2) {
         u32 tile = ~0u;
-        CHECK(shared_tile_unref(&m, SHARED_TILE_FRAME | i, &tile) && tile == i);
+        CHECK(shared_tile_unref(&m, SHARED_TILE_FRAME | i));
+        CHECK(shared_tile_drop(&m, SHARED_TILE_FRAME | i, &tile) && tile == i);
     }
     CHECK(m.live == keys / 2);
     for (u32 round = 0; round < 3; round++) {
@@ -45,7 +57,8 @@ static void test_map_churn() {
             CHECK(shared_tile_insert(&m, (u64)(i + 1) << MEM_PAGE_SHIFT, i + round));
         for (u32 i = 0; i < keys; i += 2) {
             u32 tile = ~0u;
-            CHECK(shared_tile_unref(&m, (u64)(i + 1) << MEM_PAGE_SHIFT, &tile) && tile == i + round);
+            CHECK(shared_tile_unref(&m, (u64)(i + 1) << MEM_PAGE_SHIFT));
+            CHECK(shared_tile_drop(&m, (u64)(i + 1) << MEM_PAGE_SHIFT, &tile) && tile == i + round);
         }
     }
     u32 wrong = 0;

@@ -96,9 +96,16 @@ bool shared_tile_insert(SharedTileMap* m, u64 key, u32 tile) {
     return true;
 }
 
-bool shared_tile_unref(SharedTileMap* m, u64 key, u32* tile) {
+bool shared_tile_unref(SharedTileMap* m, u64 key) {
     SharedTileEntry* e = find(m, key);
-    if (!e || --e->refs)
+    if (!e || !e->refs)
+        return false;
+    return --e->refs == 0;
+}
+
+bool shared_tile_drop(SharedTileMap* m, u64 key, u32* tile) {
+    SharedTileEntry* e = find(m, key);
+    if (!e || e->refs)
         return false;
     *tile = e->tile;
     e->key = KEY_REMOVED;

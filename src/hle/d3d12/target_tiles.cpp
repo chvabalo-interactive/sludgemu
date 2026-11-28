@@ -44,6 +44,11 @@ static struct {
     u64 references;
     u64* scratch_keys; // resolving: a texture's new keys
     u32 scratch_capacity;
+    // Keys whose tiles lost their last reference since the last submission: freed then unless taken
+    // again (see shared_tile_unref). May repeat a key.
+    u64* unused;
+    volatile long unused_count;
+    u32 unused_capacity;
     // The queue tile mappings change on, and its last submission (which title work waits for).
     ID3D12CommandQueue* queue;
     u32 slot;
@@ -72,8 +77,17 @@ static u32 acquire_tile(u64* key) {
     return tile;
 }
 
-// Drops a reference to a tile; it goes back to the pool (once the GPU is done with it) with the last.
+// Gives the tile of `key` back to the pool (once the GPU is done with it) if it has no references.
 // Lock held.
+static void drop_unused(u64 key) {
+    u32 tile = GPU_NO_TILE;
+    if (shared_tile_drop(&g_targets.shared, key, &tile))
+        gpu_tiles_free(1, &tile);
+}
+
+// Drops a reference to a tile. A texture's own tile goes back to the pool (once the GPU is done with it)
+// now; a shared one losing its last reference waits for the next submission, so a texture over the
+// same memory resolved before then finds its contents. Lock held.
 static void release_tile(u64 key, u32 tile) {
     if (tile == GPU_NO_TILE)
         return;
@@ -83,9 +97,20 @@ static void release_tile(u64 key, u32 tile) {
         gpu_tiles_free(1, &tile);
         return;
     }
-    u32 last = GPU_NO_TILE;
-    if (shared_tile_unref(&g_targets.shared, key, &last))
-        gpu_tiles_free(1, &last);
+    if (!shared_tile_unref(&g_targets.shared, key))
+        return;
+    if ((u32)g_targets.unused_count == g_targets.unused_capacity) {
+        u32 capacity = g_targets.unused_capacity ? g_targets.unused_capacity * 2 : 1024;
+        u64* grown = (u64*)realloc(g_targets.unused, capacity * sizeof(u64));
+        if (!grown) {
+            drop_unused(key); // out of memory: its contents go now
+            return;
+        }
+        g_targets.unused = grown;
+        g_targets.unused_capacity = capacity;
+    }
+    g_targets.unused[g_targets.unused_count] = key;
+    g_targets.unused_count = g_targets.unused_count + 1;
 }
 
 // --- tile mapping ------------------------------------------------------------------------------------
@@ -376,17 +401,23 @@ static void on_mapping_changed(const u8* base, u64 size) {
 void target_tiles_submit(ID3D12CommandQueue* queue) {
     if (!g_targets.queue)
         return;
-    if (g_targets.stale) {
+    if (g_targets.stale || g_targets.unused_count) {
         AcquireSRWLockExclusive(&g_targets.lock);
         if (g_targets.stale) {
             for (u32 i = 0; i < g_targets.count; i++) {
                 if (g_targets.entries[i]->stale)
                     resolve(g_targets.entries[i]);
             }
-            g_targets.stale = 0;
             g_targets.last =
                 gpu_queue_execute(g_targets.queue, g_targets.slot, 0, nullptr); // after the mappings
+            // Only now: a submission on another queue seeing no stale textures must see the
+            // submission mapping them.
+            g_targets.stale = 0;
         }
+        // Tiles nothing took again since they lost their last reference.
+        for (long i = 0; i < g_targets.unused_count; i++)
+            drop_unused(g_targets.unused[i]);
+        g_targets.unused_count = 0;
         ReleaseSRWLockExclusive(&g_targets.lock);
     }
     u64 last = g_targets.last;
@@ -424,6 +455,13 @@ void target_tiles_init() {
     }
     gpu_set_name(g_targets.queue, "render target tiles");
     g_targets.slot = gpu_queue_register(g_targets.queue);
+    if (g_targets.slot == GPU_NO_QUEUE) {
+        // Without a submission fence title work couldn't wait for the mappings.
+        LOG_E("d3d12", "no queue slot for render target tiles; render target textures are whole");
+        g_targets.queue->Release();
+        g_targets.queue = nullptr;
+        return;
+    }
     g_targets.fence = gpu_queue_fence(g_targets.slot);
     mem_add_mapping_listener(on_mapping_changed);
     g_targets.enabled = true;
