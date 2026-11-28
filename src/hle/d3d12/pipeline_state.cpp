@@ -5,7 +5,9 @@
 // pipelines also depend on the formats drawn to, which console pipelines leave to the bound
 // targets: they are made on a worker thread when a draw first uses a set of formats, and the draw
 // waits for them (and for the programs). A console never skips a draw, and one pass of a multi-pass
-// effect left out looks broken where a late frame only looks late.
+// effect left out looks broken where a late frame only looks late. Waits are bounded, though (by the
+// budget in gpu/shader_schedule.h: titles take a long stall for a hang); a draw whose pipeline isn't
+// made by the end of its wait is skipped, and the pipeline made urgently, for the next frames.
 //
 // So that draws seldom wait, the formats each pipeline was drawn with are remembered, in memory and in
 // the shader cache's record log, by the pipeline's identity (its programs and fixed-function state).
@@ -805,6 +807,7 @@ static PipelineVariant* add_variant(ConsolePipelineState* pso, const PipelineOut
         v->outputs = key;
         v->state = VARIANT_BUILDING;
         v->builder = builder;
+        v->wait_ran_out = false;
         v->desktop = nullptr;
         v->signature = nullptr;
         InterlockedIncrement(&pso->variant_count); // publishes it, filled in
@@ -861,15 +864,19 @@ static void variant_job(void* context) {
     free(job);
 }
 
-static bool wait_variant(PipelineVariant* v) {
-    // One built ahead is made at background speed (urgent jobs run at full speed already).
-    if (v->builder)
-        gpu_job_hurry(v->builder);
+// Waits until the variant is made or `deadline_us` passes; false if it isn't made by then.
+static bool wait_variant(PipelineVariant* v, u64 deadline_us) {
     for (;;) {
         u32 state = v->state;
         if (state != VARIANT_BUILDING)
-            return state == VARIANT_READY;
-        WaitOnAddress(&v->state, &state, sizeof(state), INFINITE);
+            return true;
+        u32 ms = shader_wait_ms_left(deadline_us);
+        if (!ms) {
+            if (deadline_us)
+                v->wait_ran_out = true;
+            return false;
+        }
+        WaitOnAddress(&v->state, &state, sizeof(state), ms);
     }
 }
 
@@ -896,51 +903,122 @@ static PipelineVariant* request_variant(ConsolePipelineState* pso, const Pipelin
 }
 
 // Waits worth knowing about are logged, each once: a pipeline waits at most once per set of formats.
-static void report_wait(const ConsolePipelineState* pso, const LARGE_INTEGER& start) {
-    LARGE_INTEGER now, frequency;
-    QueryPerformanceCounter(&now);
-    QueryPerformanceFrequency(&frequency);
-    f64 ms = (f64)(now.QuadPart - start.QuadPart) * 1000.0 / (f64)frequency.QuadPart;
+static void report_wait(const ConsolePipelineState* pso, u64 waited_us) {
     const ShaderProgram* a = pso->programs[0];
     const ShaderProgram* b = pso->programs[1];
-    if (ms >= 50.0)
-        LOG_I("d3d12", "a %s waited %.0f ms for pipeline %p (programs %016llx %016llx) to be made",
-              pso->compute ? "dispatch" : "draw", ms, (const void*)pso, a ? (unsigned long long)a->key : 0ull,
-              b ? (unsigned long long)b->key : 0ull);
+    if (waited_us >= 50000)
+        LOG_I("d3d12", "a %s waited %llu ms for pipeline %p (programs %016llx %016llx) to be made",
+              pso->compute ? "dispatch" : "draw", (unsigned long long)(waited_us / 1000), (const void*)pso,
+              a ? (unsigned long long)a->key : 0ull, b ? (unsigned long long)b->key : 0ull);
     else
         LOG_D("d3d12", "a %s waited %.1f ms for pipeline %p to be made", pso->compute ? "dispatch" : "draw",
-              ms, (const void*)pso);
+              (f64)waited_us / 1000.0, (const void*)pso);
+}
+
+// Draws skipped while their pipeline is made are logged once per pipeline, apart from failures.
+static void report_late(ConsolePipelineState* pso, u64 waited_us) {
+    if (pso->late_reported || InterlockedExchange(&pso->late_reported, 1))
+        return;
+    const ShaderProgram* a = pso->programs[0];
+    const ShaderProgram* b = pso->programs[1];
+    LOG_I("d3d12",
+          "%s with pipeline %p (programs %016llx %016llx) skipped while it is made (waited %llu ms; "
+          "waits for shaders are budgeted)",
+          pso->compute ? "dispatches" : "draws", (void*)pso, a ? (unsigned long long)a->key : 0ull,
+          b ? (unsigned long long)b->key : 0ull, (unsigned long long)(waited_us / 1000));
+}
+
+// One wait per draw, for its programs and variant together, begun only when something must be waited
+// for: what failed, or is known to take long (a wait for it ran out before), draws no budget.
+static void begin_wait(ShaderWait* wait, bool* begun, bool dispatch) {
+    if (!*begun)
+        shader_wait_begin(wait, dispatch);
+    *begun = true;
+}
+
+// Waits for the programs, within the wait. Both are asked for before waiting for either: they build at
+// once, on two workers.
+static ShaderWaitResult wait_programs(ConsolePipelineState* pso, ShaderWait* wait, bool* begun) {
+    for (u32 i = 0; i < 2; i++)
+        if (pso->programs[i])
+            shader_program_hurry(pso->programs[i]);
+    for (u32 i = 0; i < 2; i++) {
+        ShaderProgram* p = pso->programs[i];
+        if (!p || p->state == PROGRAM_READY)
+            continue;
+        if (p->state == PROGRAM_FAILED)
+            return SHADER_WAIT_FAILED;
+        if (p->wait_ran_out)
+            return SHADER_WAIT_LATE;
+        begin_wait(wait, begun, pso->compute);
+        ShaderWaitResult r = shader_program_wait(p, wait->deadline_us);
+        if (r != SHADER_WAIT_READY)
+            return r;
+    }
+    return SHADER_WAIT_READY;
+}
+
+// What isn't made yet is waited for, within the budget: the draw is late rather than left out, unless
+// the title would be stalled for too long.
+static ID3D12PipelineState* wait_for_pipeline(ConsolePipelineState* pso, const PipelineOutputs* outputs,
+                                              ID3D12RootSignature** signature, bool* building) {
+    ShaderWait wait = {};
+    bool begun = false;
+    ShaderWaitResult r = wait_programs(pso, &wait, &begun);
+    PipelineVariant* v = nullptr;
+    if (r == SHADER_WAIT_READY) {
+        PipelineOutputs key = variant_key(pso, outputs);
+        v = find_variant(pso, key);
+        if (!v)
+            v = request_variant(pso, key);
+        if (!v) {
+            r = SHADER_WAIT_FAILED;
+        } else if (v->state == VARIANT_BUILDING) {
+            // One built ahead is made at background speed (urgent jobs run at full speed already).
+            if (v->builder)
+                gpu_job_hurry(v->builder);
+            if (v->wait_ran_out) {
+                r = SHADER_WAIT_LATE;
+            } else {
+                begin_wait(&wait, &begun, pso->compute);
+                if (!wait_variant(v, wait.deadline_us))
+                    r = SHADER_WAIT_LATE;
+            }
+        }
+    }
+    u64 waited_us = 0;
+    if (begun) {
+        shader_wait_end(&wait);
+        waited_us = shader_wait_now_us() - wait.start_us;
+    }
+    if (r == SHADER_WAIT_LATE) {
+        *building = true;
+        report_late(pso, waited_us);
+        return nullptr;
+    }
+    if (begun)
+        report_wait(pso, waited_us);
+    if (r != SHADER_WAIT_READY || v->state != VARIANT_READY)
+        return nullptr;
+    *signature = v->signature;
+    return v->desktop;
 }
 
 ID3D12PipelineState* console_pipeline_desktop(ConsolePipelineState* pso, const PipelineOutputs* outputs,
-                                              ID3D12RootSignature** signature) {
+                                              ID3D12RootSignature** signature, bool* building) {
     if (pso && pso->twin)
         pso = pso->twin;
     if (!pso || !desktop_signature_exists(pso))
         return nullptr;
-    // What isn't made yet is waited for: the draw is late, never left out.
-    LARGE_INTEGER wait_start = {};
-    if (!programs_ready(pso)) {
-        QueryPerformanceCounter(&wait_start);
-        for (u32 i = 0; i < 2; i++)
-            if (pso->programs[i] && !shader_program_wait(pso->programs[i]))
-                return nullptr;
+    // Made already: found without locks or clocks, as nearly every draw is.
+    if (programs_ready(pso)) {
+        PipelineVariant* v = find_variant(pso, variant_key(pso, outputs));
+        if (v && v->state == VARIANT_READY) {
+            *signature = v->signature;
+            return v->desktop;
+        }
     }
-    PipelineOutputs key = variant_key(pso, outputs);
-    PipelineVariant* v = find_variant(pso, key);
-    if (!v && !(v = request_variant(pso, key)))
-        return nullptr;
-    if (v->state == VARIANT_BUILDING) {
-        if (!wait_start.QuadPart)
-            QueryPerformanceCounter(&wait_start);
-        wait_variant(v);
-    }
-    if (wait_start.QuadPart)
-        report_wait(pso, wait_start);
-    if (v->state != VARIANT_READY)
-        return nullptr;
-    *signature = v->signature;
-    return v->desktop;
+    return wait_for_pipeline(pso, outputs, signature, building);
 }
 
 // --- desktop pipelines drawn before ------------------------------------------------------------------

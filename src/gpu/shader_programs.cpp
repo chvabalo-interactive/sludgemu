@@ -54,6 +54,12 @@ static u32 g_background_running; // of them on background jobs (under g_job_lock
 static u64 g_compile_in_flight;  // the estimated memory of the compiles running (under g_job_lock)
 static bool g_ready;
 
+// The title's waits (gpu/shader_schedule.h has the budget). Under g_job_lock: the workers' decision to
+// sleep (no background work while the title waits) and a wait's end, which wakes them, are ordered.
+static ShaderWaitBudget g_wait_budget;
+static u32 g_title_waits; // waits running
+static LARGE_INTEGER g_clock_start, g_clock_frequency;
+
 // Jobs to queue once a program is built (shader_program_then).
 struct ProgramThen {
     ProgramThen* next;
@@ -214,7 +220,7 @@ static ShaderQueueState queue_state() {
     s.background_queued = g_background.count;
     s.background_running = g_background_running;
     s.background_slots = g_schedule.background_slots;
-    s.title_waiting = false; // the title doesn't wait with a deadline yet
+    s.title_waiting = g_title_waits != 0;
     s.compile_waiting = shader_job_heap_peek(&g_compiles, &cheapest);
     s.compile_cost = s.compile_waiting ? cheapest.program->compile_cost : 0;
     s.compile_in_flight = g_compile_in_flight;
@@ -266,32 +272,89 @@ static bool is_final(u32 state) {
     return state == PROGRAM_READY || state == PROGRAM_FAILED;
 }
 
-bool shader_program_wait(ShaderProgram* p) {
-    u32 state = p->state;
-    if (is_final(state))
-        return state == PROGRAM_READY;
+// --- waits ---
+
+u64 shader_wait_now_us() {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    u64 f = (u64)g_clock_frequency.QuadPart;
+    if (!f)
+        return 0; // before shader_programs_init: no program exists to wait for
+    u64 ticks = (u64)(now.QuadPart - g_clock_start.QuadPart);
+    // In two parts: ticks times a million would overflow after days.
+    return ticks / f * 1000000 + ticks % f * 1000000 / f;
+}
+
+void shader_wait_begin(ShaderWait* wait, bool dispatch) {
+    wait->start_us = shader_wait_now_us();
+    AcquireSRWLockExclusive(&g_job_lock);
+    wait->deadline_us = shader_wait_budget_begin(&g_wait_budget, wait->start_us, dispatch);
+    if (wait->deadline_us)
+        g_title_waits++;
+    ReleaseSRWLockExclusive(&g_job_lock);
+}
+
+void shader_wait_end(ShaderWait* wait) {
+    if (!wait->deadline_us)
+        return;
+    u64 now = shader_wait_now_us();
+    AcquireSRWLockExclusive(&g_job_lock);
+    shader_wait_budget_end(&g_wait_budget, now);
+    bool last = --g_title_waits == 0;
+    bool background = last && shader_pick(queue_state()) != PICK_NOTHING;
+    ReleaseSRWLockExclusive(&g_job_lock);
+    // Background work held back meanwhile starts again (a worker that takes it wakes the next).
+    if (background)
+        WakeConditionVariable(&g_job_ready);
+}
+
+u32 shader_wait_ms_left(u64 deadline_us) {
+    u64 now = shader_wait_now_us();
+    if (!deadline_us || now >= deadline_us)
+        return 0;
+    return (u32)((deadline_us - now + 999) / 1000);
+}
+
+void shader_program_hurry(ShaderProgram* p) {
+    if (is_final(p->state))
+        return;
+    // Once urgent and queued in the urgent lane (or building), whoever builds it does so at full
+    // speed (start_program), so asking again takes no lock. Read without it: both flags are only ever
+    // set, under the lock, so a stale read only takes the slow way.
+    if (p->urgent && (p->urgent_queued || p->state == PROGRAM_BUILDING))
+        return;
     hurry(p);
-    u32 waited_s = 0;
+    // A worker that had it before it was urgent runs it at background speed.
+    long builder = p->worker;
+    if (p->state == PROGRAM_BUILDING && builder)
+        gpu_job_hurry((u32)builder);
+}
+
+ShaderWaitResult shader_program_wait(ShaderProgram* p, u64 deadline_us) {
+    shader_program_hurry(p);
     long boosted = 0;
     for (;;) {
-        state = p->state;
+        u32 state = p->state;
         if (is_final(state))
-            return state == PROGRAM_READY;
+            return state == PROGRAM_READY ? SHADER_WAIT_READY : SHADER_WAIT_FAILED;
         // A program can pass through several workers (translated on one, compiled on another).
         long builder = p->worker;
         if (state == PROGRAM_BUILDING && builder && builder != boosted) {
             gpu_job_hurry((u32)builder);
             boosted = builder;
         }
-        // Builders wake every waiter when they start (to be hurried along), when they put a program
-        // aside and when the state becomes final; the timeout only asks again where the queue was full,
-        // and tells about a wait that looks stuck.
-        if (!WaitOnAddress(&p->state, &state, sizeof(state), 1000) && GetLastError() == ERROR_TIMEOUT) {
-            hurry(p);
-            if (++waited_s == 10)
-                LOG_W("gpu", "still waiting for shader %016llx after 10 s (state %u)",
-                      (unsigned long long)p->key, p->state);
+        u32 ms = shader_wait_ms_left(deadline_us);
+        if (!ms) {
+            if (deadline_us)
+                p->wait_ran_out = true;
+            return SHADER_WAIT_LATE;
         }
+        // Builders wake every waiter when they start (to be hurried along), when they put a program
+        // aside and when the state becomes final; the timeout ends the wait at its deadline, and asks
+        // again where the urgent lane was full.
+        if (!WaitOnAddress(&p->state, &state, sizeof(state), ms < 1000 ? ms : 1000) &&
+            GetLastError() == ERROR_TIMEOUT)
+            hurry(p);
     }
 }
 
@@ -839,6 +902,9 @@ bool shader_programs_init(const ShaderTarget& target, const wchar_t* cache_root)
     if (!g_urgent.jobs || !g_programs || !shader_job_heap_init(&g_background, JOB_CAPACITY) ||
         !shader_job_heap_init(&g_compiles, JOB_CAPACITY))
         return false;
+    QueryPerformanceFrequency(&g_clock_frequency);
+    QueryPerformanceCounter(&g_clock_start);
+    shader_wait_budget_init(&g_wait_budget, 0);
     MEMORYSTATUSEX memory = {sizeof(memory)};
     g_schedule =
         shader_schedule_for(count_physical_cores(), GlobalMemoryStatusEx(&memory) ? memory.ullTotalPhys : 0);

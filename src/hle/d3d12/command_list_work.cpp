@@ -16,16 +16,18 @@ static D3D12_GPU_VIRTUAL_ADDRESS translate(u64 address, u64 size, GpuAccess acce
 // --- draws and dispatches ----------------------------------------------------------------------------
 
 // The desktop pipeline and user data for a draw or dispatch, waiting for the pipeline to be made if
-// it is not yet. Draws are skipped only when it cannot be made.
+// it is not yet. Draws are skipped when it can't be made, or isn't made within the wait budget.
 static bool prepare(ConsoleCommandList* self, bool graphics) {
     ListState& s = self->state;
     ID3D12RootSignature* signature = nullptr;
     PipelineOutputs outputs = s.outputs;
     outputs.rect_list = s.topology == CONSOLE_TOPOLOGY_RECT_LIST;
+    bool building = false;
     ID3D12PipelineState* desktop =
-        console_pipeline_desktop(s.pipeline, graphics ? &outputs : nullptr, &signature);
+        console_pipeline_desktop(s.pipeline, graphics ? &outputs : nullptr, &signature, &building);
     if (!desktop) {
-        console_pipeline_report_skip(s.pipeline, graphics);
+        if (!building)
+            console_pipeline_report_skip(s.pipeline, graphics);
         self->skipped_draws++;
         return false;
     }
