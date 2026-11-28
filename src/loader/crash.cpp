@@ -13,7 +13,7 @@
 
 #define FIRST_CHANCE_LOG_LIMIT 64
 
-static u32 capture_frames(CONTEXT* ctx, u64* frames, u32 max_frames);
+static __declspec(noinline) u32 capture_frames(CONTEXT* ctx, u64* frames, u32 max_frames);
 
 static wchar_t g_dump_path[MAX_PATH];
 static volatile long g_first_chance_logged = 0;
@@ -494,8 +494,10 @@ static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS* ep) {
 }
 
 // Unwinds one stack into raw return addresses. Must not log or touch the loader lock: other
-// threads are suspended while this runs.
-static u32 capture_frames(CONTEXT* ctx, u64* frames, u32 max_frames) {
+// threads are suspended while this runs. Never inlined: callers guard it with __try, and the
+// compiler only catches faults raised inside calls made from a __try body (reading a stack that
+// changes under us), not by instructions of the guarding function itself.
+static __declspec(noinline) u32 capture_frames(CONTEXT* ctx, u64* frames, u32 max_frames) {
     u32 n = 0;
     while (n < max_frames && ctx->Rip) {
         frames[n++] = ctx->Rip;

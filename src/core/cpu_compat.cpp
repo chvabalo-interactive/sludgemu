@@ -129,10 +129,17 @@ static u32 arith_flags(u64 a, u64 b, u64 r, bool sub) {
     return f;
 }
 
+// The stores live in a function of their own because the compiler only catches faults raised inside
+// calls made from a __try body, not by instructions of the function holding the __try (a memset of
+// constant size becomes plain stores when inlined).
+static __declspec(noinline) void zero_line_unguarded(u64 line) {
+    memset((void*)line, 0, CACHE_LINE);
+}
+
 // Zeroes the line; false if the memory isn't writable. CLZERO would fault there too.
 static bool zero_line(u64 address) {
     __try {
-        memset((void*)(address & ~(u64)(CACHE_LINE - 1)), 0, CACHE_LINE);
+        zero_line_unguarded(address & ~(u64)(CACHE_LINE - 1));
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
                                                                  : EXCEPTION_CONTINUE_SEARCH) {
         return false;
