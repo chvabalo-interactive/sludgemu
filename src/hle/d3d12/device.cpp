@@ -322,9 +322,16 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
         ID3D12Device13* desktop = gpu_device();
         if (!desktop)
             return DXGI_ERROR_UNSUPPORTED;
-        void* const* table =
-            console_build_table("ID3D12Device", k_device_entries, ARRAY_COUNT(k_device_entries),
-                                k_device_impl, ARRAY_COUNT(k_device_impl));
+        // This file's entries and device_x.cpp's in one table.
+        static ConsoleEntry s_entries[ARRAY_COUNT(k_device_impl) + 128];
+        u32 n = 0;
+        for (u32 i = 0; i < ARRAY_COUNT(k_device_impl); i++)
+            s_entries[n++] = k_device_impl[i];
+        SLUDGE_ASSERT(n + k_device_x_entry_count <= ARRAY_COUNT(s_entries));
+        for (u32 i = 0; i < k_device_x_entry_count; i++)
+            s_entries[n++] = k_device_x_entries[i];
+        void* const* table = console_build_table("ID3D12Device", k_device_entries,
+                                                 ARRAY_COUNT(k_device_entries), s_entries, n);
         desktop->AddRef(); // one reference for the console object, one held by the gpu module
         g_device = (ConsoleDevice*)console_alloc(sizeof(ConsoleDevice), &k_device_class, table, desktop);
         g_device->out_of_line_flags[0] = 1;
@@ -343,6 +350,7 @@ HRESULT console_create_device(void* adapter, const ConsoleDeviceParams* params, 
         console_command_signature_init();
         console_root_signature_init();
         console_pipeline_state_init();
+        console_heap_init();
     }
     if (!out)
         return S_FALSE; // capability check only

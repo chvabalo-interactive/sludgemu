@@ -12,6 +12,7 @@ add_executable(sludgemu_tests
     shader_cache_test.cpp
     shader_schedule_test.cpp
     submission_test.cpp
+    command_args_test.cpp
     ${PROJECT_SOURCE_DIR}/src/common/log.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory.cpp
     ${PROJECT_SOURCE_DIR}/src/core/memory_tracking.cpp
@@ -25,6 +26,7 @@ add_executable(sludgemu_tests
     ${PROJECT_SOURCE_DIR}/src/hle/d3d12/queue_backlog.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/dstorage/bcpack.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/d3d12/descriptor_shadow.cpp
+    ${PROJECT_SOURCE_DIR}/src/hle/d3d12/command_args.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xapu.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xdsp.cpp
     ${PROJECT_SOURCE_DIR}/src/hle/audio/xma.cpp

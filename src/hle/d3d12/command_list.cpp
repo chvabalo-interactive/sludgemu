@@ -349,6 +349,7 @@ static void apply_state(ConsoleCommandList* self) {
         l->OMSetFrontAndBackStencilRef(s.stencil_front, s.stencil_back);
     if (s.has_depth_bounds)
         l->OMSetDepthBounds(s.depth_min, s.depth_max);
+    list_apply_x_state(self);
 }
 
 // --- segments ----------------------------------------------------------------------------------------
@@ -554,6 +555,7 @@ static void WINAPI list_wait_64bit_value_x(ConsoleCommandList* self, UINT64 addr
 
 static void WINAPI list_set_pipeline_state(ConsoleCommandList* self, void* pso) {
     self->state.pipeline = (ConsolePipelineState*)pso; // the desktop one is found at the next draw
+    self->state.has_sample_mask_x = false;             // a new pipeline brings back its own sample mask
 }
 
 static void WINAPI list_set_descriptor_heaps(ConsoleCommandList* self, UINT count,
@@ -817,6 +819,83 @@ static void WINAPI list_om_set_render_targets(ConsoleCommandList* self, UINT cou
                                       s.has_depth ? &s.depth : nullptr);
 }
 
+// --- render passes -----------------------------------------------------------------------------------
+//
+// A render pass is render targets bound with what happens to their contents at its start and end.
+// Recorded as the targets bound and cleared where the pass begins with clears: the same results, as
+// keeping contents is always a valid outcome of discarding them. Desktop render passes would bring
+// nothing for desktop GPUs, and they'd need the same descriptor translation anyway.
+
+static void WINAPI list_begin_render_pass(ConsoleCommandList* self, UINT count,
+                                          const D3D12_RENDER_PASS_RENDER_TARGET_DESC* targets,
+                                          const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth, UINT flags) {
+    (void)flags; // UAV writes are always allowed outside passes; suspending and resuming splits nothing here
+    D3D12_CPU_DESCRIPTOR_HANDLE handles[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    if (count > ARRAY_COUNT(handles))
+        count = ARRAY_COUNT(handles);
+    for (UINT i = 0; i < count; i++)
+        handles[i] = targets[i].cpuDescriptor;
+    list_om_set_render_targets(self, count, handles, FALSE, depth ? &depth->cpuDescriptor : nullptr);
+    self->state.in_render_pass = true;
+    bool resolves = false;
+    for (UINT i = 0; i < count; i++) {
+        D3D12_CPU_DESCRIPTOR_HANDLE d;
+        if (targets[i].BeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR &&
+            list_cpu_descriptor(targets[i].cpuDescriptor.ptr, 1, &d))
+            self->desktop->ClearRenderTargetView(d, targets[i].BeginningAccess.Clear.ClearValue.Color, 0,
+                                                 nullptr);
+        resolves |= targets[i].EndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE;
+    }
+    if (depth) {
+        u32 clear = 0;
+        if (depth->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+            clear |= D3D12_CLEAR_FLAG_DEPTH;
+        if (depth->StencilBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+            clear |= D3D12_CLEAR_FLAG_STENCIL;
+        D3D12_CPU_DESCRIPTOR_HANDLE d;
+        if (clear && list_cpu_descriptor(depth->cpuDescriptor.ptr, 1, &d))
+            self->desktop->ClearDepthStencilView(
+                d, (D3D12_CLEAR_FLAGS)clear, depth->DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth,
+                depth->StencilBeginningAccess.Clear.ClearValue.DepthStencil.Stencil, 0, nullptr);
+        resolves |= depth->DepthEndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE ||
+                    depth->StencilEndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE;
+    }
+    // A resolve needs its textures in resolve layouts, which the pass would change to and back; the
+    // title's barriers keep them as render targets.
+    if (resolves)
+        LOG_W_ONCE("d3d12", "render passes ending in resolves aren't supported; the targets aren't resolved");
+}
+
+static void WINAPI list_end_render_pass(ConsoleCommandList* self) {
+    self->state.in_render_pass = false;
+}
+
+// --- bundles -----------------------------------------------------------------------------------------
+
+// A console bundle recorded onto a desktop bundle (one part: bundles neither signal nor wait). The
+// desktop list leaves the bundle with the bundle's pipeline, root arguments and input state; the
+// console list's own state goes on again so later commands see what the title set.
+//
+// Not D3D12's inheritance: the bundle's draws flush the root arguments the bundle itself recorded, not
+// the caller's, and what the bundle sets doesn't carry over to the caller. Titles relying on either
+// draw differently (warned once).
+static void WINAPI list_execute_bundle(ConsoleCommandList* self, ConsoleCommandList* bundle) {
+    if (!bundle || bundle->type != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->segment_count != 1 ||
+        !bundle->segments[0].closed || self->type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        LOG_W_ONCE("d3d12", "ExecuteBundle with an unclosed or unsplittable bundle skipped");
+        return;
+    }
+    LOG_W_ONCE("d3d12", "ExecuteBundle: bundles don't inherit root arguments from the calling list, nor pass "
+                        "their state back to it");
+    self->desktop->ExecuteBundle(bundle->segments[0].list);
+    // Its descriptor tables are mirrored again when this list is submitted.
+    for (u32 t = 0; t < bundle->table_count; t++) {
+        const ConsoleCommandList::TableUse& use = bundle->tables[t];
+        list_note_table(self, use.heap, use.first, use.count, use.desktop_first);
+    }
+    apply_state(self);
+}
+
 // --- debug markers -----------------------------------------------------------------------------------
 
 // PIX event data passes through as is, so graphics debuggers show the title's own markers.
@@ -832,6 +911,14 @@ static void WINAPI list_end_event(ConsoleCommandList* self) {
     self->desktop->EndEvent();
 }
 
+// --- memory from the allocator -------------------------------------------------------------------------
+
+// GPU-visible memory living as long as the list's allocator recording (command_allocator.cpp).
+static void* WINAPI list_allocate_from_command_allocator_x(ConsoleCommandList* self, UINT size,
+                                                           UINT alignment) {
+    return self->allocator ? console_allocator_allocate(self->allocator, size, alignment) : nullptr;
+}
+
 static const ConsoleEntry k_list_impl[] = {
     CONSOLE_ENTRY(8, list_get_type),
     CONSOLE_ENTRY(9, list_close),
@@ -844,6 +931,7 @@ static const ConsoleEntry k_list_impl[] = {
     CONSOLE_ENTRY(24, list_om_set_stencil_ref),
     CONSOLE_ENTRY(25, list_set_pipeline_state),
     CONSOLE_ENTRY(26, list_resource_barrier),
+    CONSOLE_ENTRY(27, list_execute_bundle),
     CONSOLE_ENTRY(32, list_set_descriptor_heaps),
     CONSOLE_ENTRY(33, list_set_compute_root_signature),
     CONSOLE_ENTRY(34, list_set_graphics_root_signature),
@@ -870,29 +958,50 @@ static const ConsoleEntry k_list_impl[] = {
     CONSOLE_ENTRY(73, list_wait_32bit_value_x),
     CONSOLE_ENTRY(74, list_wait_64bit_value_x),
     CONSOLE_ENTRY(109, list_om_set_depth_bounds),
+    CONSOLE_ENTRY(115, list_begin_render_pass),
+    CONSOLE_ENTRY(116, list_end_render_pass),
     CONSOLE_ENTRY(131, list_sync_x),
     CONSOLE_ENTRY(132, list_sync_x),
     CONSOLE_ENTRY(139, list_reset_x),
     CONSOLE_ENTRY(140, list_resource_barrier_x),
     CONSOLE_ENTRY(146, list_barrier),
     CONSOLE_ENTRY(147, list_om_set_front_and_back_stencil_ref),
+    CONSOLE_ENTRY(148, list_allocate_from_command_allocator_x),
 };
 
 void console_command_list_init() {
-    // Both sources' entries in one table.
-    static ConsoleEntry s_entries[ARRAY_COUNT(k_list_impl) + 64];
+    // All sources' entries in one table.
+    static ConsoleEntry s_entries[ARRAY_COUNT(k_list_impl) + 128];
     u32 n = 0;
     for (u32 i = 0; i < ARRAY_COUNT(k_list_impl); i++)
         s_entries[n++] = k_list_impl[i];
-    SLUDGE_ASSERT(n + k_list_work_entry_count <= ARRAY_COUNT(s_entries));
+    SLUDGE_ASSERT(n + k_list_work_entry_count + k_list_x_entry_count <= ARRAY_COUNT(s_entries));
     for (u32 i = 0; i < k_list_work_entry_count; i++)
         s_entries[n++] = k_list_work_entries[i];
+    for (u32 i = 0; i < k_list_x_entry_count; i++)
+        s_entries[n++] = k_list_x_entries[i];
+    console_command_list_x_init();
     g_list_table = console_build_table("ID3D12GraphicsCommandList", k_command_list_entries,
                                        ARRAY_COUNT(k_command_list_entries), s_entries, n);
     D3D12_FEATURE_DATA_D3D12_OPTIONS15 o15 = {};
     g_triangle_fans =
         SUCCEEDED(gpu_device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS15, &o15, sizeof(o15))) &&
         o15.TriangleFanSupported;
+}
+
+HRESULT console_create_closed_command_list(ConsoleDevice* device, D3D12_COMMAND_LIST_TYPE type, REFIID iid,
+                                           void** out) {
+    if (type > D3D12_COMMAND_LIST_TYPE_COPY) {
+        LOG_E("d3d12", "CreateCommandList1: list type %d not supported yet", type);
+        return E_NOTIMPL;
+    }
+    // No segment until the first Reset brings an allocator to record on.
+    ConsoleCommandList* list =
+        (ConsoleCommandList*)console_alloc(sizeof(ConsoleCommandList), &k_list_class, g_list_table, nullptr);
+    list->type = type;
+    list->device = device->desktop;
+    list->submitted_slot = GPU_NO_QUEUE;
+    return console_return(list, iid, out);
 }
 
 HRESULT console_create_command_list(ConsoleDevice* device, const ConsoleCommandListDesc* desc,

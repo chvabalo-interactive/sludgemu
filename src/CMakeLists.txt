@@ -90,6 +90,9 @@ add_executable(sludgemu WIN32
     hle/d3d12/command_queue.cpp
     hle/d3d12/fence.cpp
     hle/d3d12/resource.cpp
+    hle/d3d12/resource_cpu.cpp
+    hle/d3d12/heap.cpp
+    hle/d3d12/device_x.cpp
     hle/d3d12/descriptor_heap.cpp
     hle/d3d12/descriptor_shadow.h
     hle/d3d12/descriptor_shadow.cpp
@@ -107,6 +110,9 @@ add_executable(sludgemu WIN32
     hle/d3d12/command_list.h
     hle/d3d12/command_list.cpp
     hle/d3d12/command_list_work.cpp
+    hle/d3d12/command_list_x.cpp
+    hle/d3d12/command_args.h
+    hle/d3d12/command_args.cpp
     hle/d3d12/barriers.h
     hle/d3d12/barriers.cpp
     hle/d3d12/queue_backlog.h

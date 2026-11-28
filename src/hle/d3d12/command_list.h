@@ -26,5 +26,14 @@ ID3D12Resource* list_resource(void* console_resource, u64* offset, GpuAccess acc
 // `counter`: for waits on a title counter (see console_sync_fence), its address; otherwise 0.
 bool list_split(ConsoleCommandList* list, ListSyncKind sync, ID3D12Fence* fence, u64 value, u64 counter);
 
+// State of command_list_x.cpp (shading rates, sample positions, view instancing, stream output) on a
+// fresh desktop list.
+void list_apply_x_state(ConsoleCommandList* list);
+
+// What the desktop GPU supports of command_list_x.cpp's state; once, with the list table.
+void console_command_list_x_init();
+
 extern const ConsoleEntry k_list_work_entries[];
 extern const u32 k_list_work_entry_count;
+extern const ConsoleEntry k_list_x_entries[];
+extern const u32 k_list_x_entry_count;

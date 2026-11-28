@@ -75,6 +75,8 @@ struct ConsoleFence {
 
 // The fence whose value lives at `address`, or nullptr.
 ConsoleFence* console_fence_at(u64 address);
+// Sets a fence's value from the CPU, as its Signal entry does.
+HRESULT console_fence_signal_cpu(ConsoleFence* fence, u64 value);
 
 // The desktop fence that follows the 64-bit counter at title GPU address `address`: a console
 // fence's own, or one made on first use for memory the title writes and waits on from the GPU.
@@ -88,6 +90,13 @@ void console_counter_wait(u64 address, u64 value);
 typedef void* (*ConsoleAllocatorCallback)(void* allocator, void* list, u32 xmem_type, usize size,
                                           u32 alignment, u32 flags, u64 context);
 
+// Memory handed out by AllocateFromCommandAllocatorX: GPU-visible chunks used front to back, rewound
+// when the allocator is reset (the title has waited for the GPU then, as for the command memory).
+struct AllocatorChunk {
+    u8* memory;
+    u32 size;
+};
+
 struct ConsoleCommandAllocator {
     ConsoleObjectHeader header;
 
@@ -95,7 +104,15 @@ struct ConsoleCommandAllocator {
     ID3D12CommandAllocator* desktop;
     ConsoleAllocatorCallback callback;
     u64 callback_context;
+    AllocatorChunk* chunks;
+    u32 chunk_count;
+    u32 current_chunk; // the chunk allocations come from
+    u32 chunk_used;    // bytes of it handed out
 };
+
+// `size` bytes at `alignment` (a power of two, at most 64 KiB) from the allocator's memory, valid until
+// it is reset; nullptr when out of memory.
+void* console_allocator_allocate(ConsoleCommandAllocator* allocator, u32 size, u32 alignment);
 
 // The command buffer write cursor of a console command list. Inlined title code writes packets only
 // while current < limit_draw / limit_api; we keep them null.
@@ -120,6 +137,11 @@ struct PipelineOutputs {
     u8 depth_format;
     u8 sample_count;
     u8 rect_list; // drawn as console rectangle lists (geometry shader expansion)
+    // OMSetSampleMaskX replaces the pipeline's sample mask with `sample_mask`. Set only where the two
+    // differ in the targets' samples, so the default (0) stays the pipeline's own mask.
+    u8 sample_mask_override;
+    u8 unused; // 0: keys are compared byte by byte
+    u16 sample_mask;
 };
 
 // Root arguments: tables as desktop heap indices, root descriptors as desktop GPU addresses. They
@@ -176,6 +198,27 @@ struct ListState {
     ID3D12Resource* predication;
     u64 predication_offset;
     D3D12_PREDICATION_OP predication_op;
+    // OMSetSampleMaskX: the mask draws use instead of the pipeline's, until the next SetPipelineState
+    // (which goes back to the pipeline's, as on console).
+    bool has_sample_mask_x;
+    u16 sample_mask_x;
+    // Variable rate shading: the base rate and combiners (1x1, passthrough when never set), the
+    // shading rate image (borrowed: the title keeps it alive while lists use it).
+    bool has_shading_rate;
+    D3D12_SHADING_RATE shading_rate;
+    D3D12_SHADING_RATE_COMBINER shading_rate_combiners[2];
+    ID3D12Resource* shading_rate_image;
+    bool has_view_instance_mask;
+    u32 view_instance_mask;
+    // Programmable sample positions: per_pixel * pixels of them; none set when per_pixel is 0.
+    u8 sample_positions_per_pixel;
+    u8 sample_position_pixels;
+    D3D12_SAMPLE_POSITION sample_positions[64];
+    u32 stream_output_mask; // stream output targets set
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW stream_output[D3D12_SO_BUFFER_SLOT_COUNT];
+    // Between BeginRenderPass and EndRenderPass: the resolves the pass ends with (see
+    // command_list.cpp, render passes).
+    bool in_render_pass;
 };
 
 // What happens on the queue between two parts of a split list.
@@ -308,9 +351,19 @@ struct ConsoleResource {
     // the mips they have loaded: the memory of those before (larger mips, last in console layouts) belongs
     // to other textures, so it takes no tiles (texture_sync).
     volatile u32 view_first_mip; // 0xFFFFFFFF until a view (0 for textures the title made itself)
+    u32 validation_flags;        // what the console debug layer checks for it: kept, nothing checks
 };
 
 void console_resource_init();
+
+// CPU access to a texture's memory in the console layout (resource_cpu.cpp): the WriteToSubresource and
+// ReadFromSubresource entries.
+HRESULT WINAPI console_resource_write_to_subresource(ConsoleResource* self, UINT subresource,
+                                                     const D3D12_BOX* box, const void* data, UINT row_pitch,
+                                                     UINT depth_pitch);
+HRESULT WINAPI console_resource_read_from_subresource(ConsoleResource* self, void* data, UINT row_pitch,
+                                                      UINT depth_pitch, UINT subresource,
+                                                      const D3D12_BOX* box);
 
 HRESULT console_create_placed_resource(ConsoleDevice* device, u64 gpu_address,
                                        const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT initial_layout,
@@ -327,6 +380,29 @@ HRESULT console_create_committed_resource(ConsoleDevice* device, const D3D12_HEA
                                           D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC1* desc,
                                           D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE* clear,
                                           REFIID iid, void** out);
+
+// The version-0 description of a resource (the console API hands out both).
+D3D12_RESOURCE_DESC console_desc0_from_desc1(const D3D12_RESOURCE_DESC1& desc);
+
+// A heap: title memory the runtime allocates for placed resources (heap.cpp).
+struct ConsoleHeap {
+    ConsoleObjectHeader header;
+
+    D3D12_HEAP_DESC desc; // size and alignment as allocated
+    void* memory;
+    u64 attributes; // of the allocation (xmem)
+};
+
+void console_heap_init();
+HRESULT console_create_heap(ConsoleDevice* device, const D3D12_HEAP_DESC* desc, REFIID iid, void** out);
+// A resource placed in a heap: a resource at the heap's address plus `offset`.
+HRESULT console_create_heap_resource(ConsoleDevice* device, ConsoleHeap* heap, u64 offset,
+                                     const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout,
+                                     const D3D12_CLEAR_VALUE* clear, REFIID iid, void** out);
+
+// A command list created closed, without an allocator: the title's first Reset gives it one.
+HRESULT console_create_closed_command_list(ConsoleDevice* device, D3D12_COMMAND_LIST_TYPE type, REFIID iid,
+                                           void** out);
 
 // Titles also describe textures by a description and an address alone, in views of placed memory
 // (the console runtime only writes the hardware descriptor). Such a texture gets a resource of ours,
@@ -641,6 +717,9 @@ struct ConsolePipelineState {
 
 void console_pipeline_state_init();
 
+HRESULT console_create_graphics_pipeline_state(ConsoleDevice* device,
+                                               const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID iid,
+                                               void** out);
 HRESULT console_create_pipeline_state(ConsoleDevice* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
                                       REFIID iid, void** out);
 HRESULT console_create_compute_pipeline_state(ConsoleDevice* device,

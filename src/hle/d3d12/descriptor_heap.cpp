@@ -405,10 +405,18 @@ static D3D12_GPU_DESCRIPTOR_HANDLE WINAPI descriptor_heap_get_gpu_start(ConsoleD
     return {(u64)self->memory};
 }
 
+// Console sampler heaps keep their border colors in a table samplers index. Desktop samplers carry their
+// border color themselves, so there is no table to hand out; handle 0 is the heap's default one.
+static UINT WINAPI descriptor_heap_get_sampler_border_color_table_x(ConsoleDescriptorHeap*) {
+    LOG_W_ONCE("d3d12", "GetSamplerBorderColorTableX: border color tables aren't supported; handle 0");
+    return 0;
+}
+
 static const ConsoleEntry k_descriptor_heap_impl[] = {
     CONSOLE_ENTRY(8, descriptor_heap_get_desc),
     CONSOLE_ENTRY(9, descriptor_heap_get_cpu_start),
     CONSOLE_ENTRY(10, descriptor_heap_get_gpu_start),
+    CONSOLE_ENTRY(11, descriptor_heap_get_sampler_border_color_table_x),
 };
 
 void console_descriptor_heap_init() {

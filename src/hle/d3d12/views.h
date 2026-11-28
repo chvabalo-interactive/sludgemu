@@ -43,6 +43,9 @@ void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESO
 void WINAPI device_create_placed_raw_uav_x(ConsoleDevice* self, const D3D12_RESOURCE_DESC* resource_desc,
                                            const ConsoleUavDescX* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest);
 
+// The memory location a console placed view description (the SRV or UAV kind) names.
+u64 console_view_location_x(const void* desc, bool unordered_access);
+
 struct ConsoleSamplerDescX;
 void WINAPI device_create_sampler_x(ConsoleDevice* self, const ConsoleSamplerDescX* desc,
                                     D3D12_CPU_DESCRIPTOR_HANDLE dest);
