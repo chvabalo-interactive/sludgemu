@@ -72,6 +72,14 @@ static u32 log2_floor(u64 v) {
     return n;
 }
 
+// How many mips or slices of `total` a view sees from `first`: UINT32_MAX runs to the last one, and a
+// view sees one at least (also where `first` is past the end, which only invalid views ask for).
+static u32 viewed_count(u32 count, u32 first, u32 total) {
+    if (count == UINT32_MAX)
+        count = first < total ? total - first : 1;
+    return count ? count : 1;
+}
+
 // Mip levels of a texture: the description's, or the full chain.
 static u32 texture_mips(const D3D12_RESOURCE_DESC1& r) {
     if (r.MipLevels)
@@ -131,17 +139,17 @@ static void image_descriptor(const D3D12_RESOURCE_DESC1& r, u64 address, const I
     if (multisampled) {
         last_level = max_mip = log2_floor(samples);
     } else {
-        u32 mips =
-            v.mips == UINT32_MAX && v.first_mip < texture_levels ? texture_levels - v.first_mip : v.mips;
         base_level = v.first_mip;
-        last_level = v.first_mip + (mips ? mips - 1 : 0);
+        last_level = v.first_mip + viewed_count(v.mips, v.first_mip, texture_levels) - 1;
         max_mip = texture_levels - 1;
     }
 
     bool volume = r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-    u32 layers = volume ? (u32)r.DepthOrArraySize >> v.first_mip : r.DepthOrArraySize;
-    u32 slices = v.slices == UINT32_MAX && v.first_slice < layers ? layers - v.first_slice : v.slices;
-    u32 last_slice = v.first_slice + (slices ? slices - 1 : 0);
+    // A volume's mips halve its depth too, down to one slice (depths have 16 bits).
+    u32 layers = r.DepthOrArraySize;
+    if (volume)
+        layers = v.first_mip < 16 && layers >> v.first_mip ? layers >> v.first_mip : 1;
+    u32 last_slice = v.first_slice + viewed_count(v.slices, v.first_slice, layers) - 1;
     // 3D views of the whole volume: its depth - 1; others: the slices viewed, the last one in the depth.
     bool whole_volume = v.type == IMAGE_TYPE_3D && !v.slice_range;
     u32 depth = whole_volume ? r.DepthOrArraySize - 1u : last_slice;

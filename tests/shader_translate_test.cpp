@@ -1522,6 +1522,14 @@ static void test_image_descriptors() {
         CHECK(f.type == 10 && f.format == 22);
         CHECK(f.array_pitch == 1 && f.first_slice == 4 && f.depth - f.first_slice == 12);
         CHECK(f.base_level == 1 && f.last_level == 1 && f.max_mip == 2);
+        // A mip deeper than the volume halves: one slice, not a range running past the end.
+        r.MipLevels = 7;
+        v.Texture3D.MipSlice = 6;
+        v.Texture3D.FirstWSlice = 0;
+        shadow_texture_uav(r, 0x200000, v, d);
+        f = image_fields(d);
+        CHECK(f.first_slice == 0 && f.depth == 1);
+        CHECK(f.base_level == 6 && f.last_level == 6 && f.max_mip == 6);
     }
     {
         // Arrays and cubes: the slices viewed, the last one in the depth field.
