@@ -190,6 +190,8 @@ struct Translator {
     bool clip_written; // vertex shaders: clip (cull) distances exported, declared from vs_out_cntl
     bool cull_written;
     u8 target_compressed[8];
+    // Pixel shaders without a color or depth export: main returns nothing (see emit_program).
+    bool ps_without_outputs;
     bool needs_descriptor_info;
     bool uses_lds;
     bool wave32; // the console wave size

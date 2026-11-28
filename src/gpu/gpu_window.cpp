@@ -196,6 +196,8 @@ static const ChunkWindow* chunk_window(u32 chunk, void* chunk_view) {
         HRESULT hr =
             gpu_device()->OpenExistingHeapFromAddress1(chunk_view, MEM_CHUNK_SIZE, IID_PPV_ARGS(&heap));
         if (SUCCEEDED(hr)) {
+            // Named as well as the buffer: debug layer messages may name the heap.
+            gpu_set_name(heap, "window heap over physical memory chunk %u", chunk);
             w->buffer = place_window(heap, 0, MEM_CHUNK_SIZE);
             if (w->buffer) {
                 w->desktop_address = w->buffer->GetGPUVirtualAddress();
@@ -221,6 +223,7 @@ static ID3D12Resource* open_private_window(const MemBlock& block) {
               (unsigned long)hr);
         return nullptr;
     }
+    gpu_set_name(heap, "window heap over title memory %p+0x%llx", block.base, block.size);
     ID3D12Resource* buffer = place_window(heap, 0, block.size);
     if (buffer)
         gpu_set_name(buffer, "window over title memory %p+0x%llx", block.base, block.size);

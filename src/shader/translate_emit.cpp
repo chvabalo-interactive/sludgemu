@@ -1247,16 +1247,21 @@ static void write_declarations(Translator& t, Text& h) {
     } else if (info.stage == SHADER_PIXEL) {
         if (!write_attribute_declarations(t, h))
             return;
-        h.put("struct Output {\n");
-        for (u32 i = 0; i < 8; i++)
-            if (t.out->ps_target_mask & (1u << i))
-                h.put("    float4 t%u : SV_Target%u;\n", i, i);
-        if (t.out->ps_writes_depth)
-            h.put("    float depth : SV_Depth;\n");
-        if (!t.out->ps_target_mask && !t.out->ps_writes_depth)
-            h.put("    float4 unused : SV_Target7;\n"); // an empty struct cannot be a return type
-        h.put("};\n");
-        h.put("Output main(Input input) {\n    Output output = (Output)0;\n");
+        if (t.ps_without_outputs) {
+            // No output struct: a placeholder target would be a slot the pipeline binds nothing to.
+            h.put("void main(Input input) {\n");
+        } else {
+            h.put("struct Output {\n");
+            for (u32 i = 0; i < 8; i++)
+                if (t.out->ps_target_mask & (1u << i))
+                    h.put("    float4 t%u : SV_Target%u;\n", i, i);
+            if (t.out->ps_writes_depth)
+                h.put("    float depth : SV_Depth;\n");
+            if (!t.out->ps_target_mask && !t.out->ps_writes_depth)
+                h.put("    float4 unused : SV_Target7;\n"); // an empty struct cannot be a return type
+            h.put("};\n");
+            h.put("Output main(Input input) {\n    Output output = (Output)0;\n");
+        }
     } else {
         write_compute_head(t, h);
     }
@@ -1382,9 +1387,22 @@ void detect_wave_size(Translator& t) {
     t.wave32 = code ? code == 32 : t.info->wave_size == 32;
 }
 
+// Whether a pixel program exports color or depth anywhere. Known before emission, since returns are
+// emitted with the body.
+static bool ps_exports_outputs(const Translator& t) {
+    for (u32 i = 0; i < t.program.count; i++) {
+        const RdnaInst& in = t.program.insts[i];
+        if (in.enc == ENC_EXP && (in.exp.target < 8 || (in.exp.target == EXP_MRTZ && (in.exp.enable & 1))))
+            return true;
+    }
+    return false;
+}
+
 void emit_program(Translator& t) {
-    if (t.info->stage == SHADER_PIXEL)
+    if (t.info->stage == SHADER_PIXEL) {
         layout_ps_inputs(t);
+        t.ps_without_outputs = !ps_exports_outputs(t);
+    }
     t.depth = 1;
     t.sgpr_used[SRC_EXEC_LO] = t.sgpr_used[SRC_EXEC_HI] = 1;
     emit_control_flow(t);
@@ -1406,7 +1424,7 @@ void emit_program(Translator& t) {
     Text& h = t.out->hlsl;
     write_declarations(t, h);
     h.put_raw(t.body.data ? t.body.data : "", t.body.length);
-    if (t.info->stage != SHADER_COMPUTE)
+    if (t.info->stage != SHADER_COMPUTE && !t.ps_without_outputs)
         h.put("    return output;\n");
     h.put("}\n");
 }

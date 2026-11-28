@@ -645,7 +645,7 @@ static const char* jump_statement(Structurer& s, const Jump& j) {
     Translator& t = *s.t;
     switch (j.kind) {
     case JUMP_RETURN:
-        return t.info->stage == SHADER_COMPUTE ? "return;" : "return output;";
+        return t.info->stage == SHADER_COMPUTE || t.ps_without_outputs ? "return;" : "return output;";
     case JUMP_BREAK:
         return "break;";
     case JUMP_CONTINUE:

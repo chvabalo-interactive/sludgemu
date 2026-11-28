@@ -248,6 +248,18 @@ static void record_buffer_group(ID3D12GraphicsCommandList7* list, const D3D12_BA
     u32 n = 0;
     for (u32 i = 0; i < g.NumBarriers; i++) {
         D3D12_BUFFER_BARRIER b = g.pBufferBarriers[i];
+        // One desktop buffer (a page table segment or a memory window) stands for every title buffer in
+        // its range. A title barrier syncing nothing before or after promises that its own buffer isn't
+        // accessed on that side within the submission, which the other title buffers sharing the desktop
+        // buffer break. Nothing before: nothing to wait for or write back, and buffers have no layout,
+        // so the barrier does nothing. Nothing after: its writes are waited for and made visible to all
+        // later work instead, which keeps memory handed from one title buffer to the next in order.
+        if (b.SyncBefore == D3D12_BARRIER_SYNC_NONE)
+            continue;
+        if (b.SyncAfter == D3D12_BARRIER_SYNC_NONE) {
+            b.SyncAfter = D3D12_BARRIER_SYNC_ALL;
+            b.AccessAfter = D3D12_BARRIER_ACCESS_COMMON;
+        }
         u64 offset;
         b.pResource =
             b.pResource ? console_resource_desktop((ConsoleResource*)b.pResource, &offset, GPU_READ) : nullptr;

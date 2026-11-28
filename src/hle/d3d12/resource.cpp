@@ -149,11 +149,56 @@ static ID3D12Resource* create_reserved_texture(ConsoleResource* r, const D3D12_R
     return texture;
 }
 
+// Whether desktop D3D12 may place a texture of desktop description `desc` at 4 KiB alignment: one slice
+// of its most detailed mip fits in 16 tiles of 4 KiB in the standard tile shape for its element size.
+// Asking for 4 KiB placement of any other texture is an error the debug layer reports (and the answer
+// is 64 KiB anyway). Textures whose element size isn't known here pass, and the runtime decides.
+static bool small_placement_possible(const D3D12_RESOURCE_DESC1& desc) {
+    if (desc.SampleDesc.Count > 1 ||
+        (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)))
+        return false;
+    if ((u32)desc.Format >= 116) // console and desktop numbers differ from here on (gpu/formats.h)
+        return true;
+    FormatInfo f = format_info(desc.Format);
+    u32 bpe = f.bytes_per_element;
+    if ((f.kind != FORMAT_KIND_COLOR && f.kind != FORMAT_KIND_BLOCK_COMPRESSED) || !bpe || bpe > 16 ||
+        (bpe & (bpe - 1)))
+        return true;
+    u32 shift = 0;
+    while ((1u << shift) < bpe)
+        shift++;
+    u64 bw = f.block_width ? f.block_width : 1, bh = f.block_height ? f.block_height : 1;
+    u64 w = (desc.Width + bw - 1) / bw, h = (desc.Height + bh - 1) / bh; // in elements (blocks)
+    // 4 KiB tile shapes in elements of the standard swizzle, by log2 of the element size.
+    static const u8 k_tile_2d[5][2] = {{64, 64}, {64, 32}, {32, 32}, {32, 16}, {16, 16}};
+    static const u8 k_tile_3d[5][3] = {{16, 16, 16}, {16, 16, 8}, {16, 8, 8}, {8, 8, 8}, {8, 8, 4}};
+    u64 tiles;
+    switch (desc.Dimension) {
+    case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
+        tiles = (w * bpe + 4095) / 4096;
+        break;
+    case D3D12_RESOURCE_DIMENSION_TEXTURE2D: {
+        const u8* t = k_tile_2d[shift];
+        tiles = ((w + t[0] - 1) / t[0]) * ((h + t[1] - 1) / t[1]);
+        break;
+    }
+    case D3D12_RESOURCE_DIMENSION_TEXTURE3D: {
+        const u8* t = k_tile_3d[shift];
+        tiles =
+            ((w + t[0] - 1) / t[0]) * ((h + t[1] - 1) / t[1]) * ((desc.DepthOrArraySize + t[2] - 1) / t[2]);
+        break;
+    }
+    default:
+        return true;
+    }
+    return tiles <= 16;
+}
+
 // Textures the GPU only reads whose most detailed mip is small take 4 KiB slots of the tile pool, not a
 // 64 KiB tile or more. nullptr where that can't be.
 static ID3D12Resource* create_small_texture(ConsoleResource* r, const D3D12_RESOURCE_DESC1& desc,
                                             D3D12_BARRIER_LAYOUT layout) {
-    if (!texture_sync_tracks(r->desc))
+    if (!texture_sync_tracks(r->desc) || !small_placement_possible(desc))
         return nullptr;
     D3D12_RESOURCE_DESC1 placed = desc;
     placed.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -200,7 +245,7 @@ static ID3D12Resource* create_target_texture(ConsoleResource* r, const D3D12_RES
                        desc.Format, desc.Flags, (unsigned long)hr);
         return nullptr;
     }
-    if (!target_tiles_add(r, texture, desc)) {
+    if (!target_tiles_add(r, texture, desc, layout)) {
         texture->Release(); // never used
         return nullptr;
     }

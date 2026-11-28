@@ -16,6 +16,12 @@
 // Tiles follow the title's mappings: a mapping change under a texture remaps its tiles before the GPU
 // next runs title work. Mapping runs on a queue of ours, which title submissions wait for.
 //
+// Desktop render target and depth textures need their compression metadata initialized (a clear, copy
+// or discard) before first use; console titles may draw into new targets without one. A new texture's
+// subresources whose tiles hold no contents yet (fresh from the pool) are discarded on that queue right
+// after their tiles are mapped. Subresources sharing tiles with a texture over the same memory keep them:
+// on console that memory holds what the other texture left there.
+//
 // SLUDGE_TARGET_TILES=0 turns this off (whole desktop textures, as before), for comparisons.
 
 void target_tiles_init();
@@ -24,10 +30,11 @@ void target_tiles_init();
 // (whether desktop D3D12 makes reserved textures of its kind is the caller's to check).
 bool target_tiles_eligible(const ConsoleResource* r);
 
-// Registers `texture`, a reserved texture just created for `r` from the desktop description `desc`; its
-// tiles are mapped before the next title submission. Takes a reference of its own. False (logged) if
-// its tiles can't be followed: the caller makes a whole texture instead.
-bool target_tiles_add(ConsoleResource* r, ID3D12Resource* texture, const D3D12_RESOURCE_DESC1& desc);
+// Registers `texture`, a reserved texture just created for `r` from the desktop description `desc` in
+// `layout`; its tiles are mapped before the next title submission. Takes a reference of its own. False
+// (logged) if its tiles can't be followed: the caller makes a whole texture instead.
+bool target_tiles_add(ConsoleResource* r, ID3D12Resource* texture, const D3D12_RESOURCE_DESC1& desc,
+                      D3D12_BARRIER_LAYOUT layout);
 
 // Before the resource is destroyed: its tiles go back (once the GPU is done with them).
 void target_tiles_remove(ConsoleResource* r);

@@ -5,6 +5,7 @@
 
 #include "common/log.h"
 #include "core/memory.h"
+#include "gpu/list_pool.h"
 #include "gpu/shared_tiles.h"
 #include "gpu/tile_pool.h"
 
@@ -25,7 +26,11 @@ struct TargetTexture {
     u64 size;
     u32 tile_count;
     u32 region_count;
-    bool stale; // tiles to resolve before the next submission
+    u32 mips;                    // of the desktop texture
+    u32 standard_mips;           // mips with tiles of their own; the rest are packed per slice
+    D3D12_BARRIER_LAYOUT layout; // the desktop texture was created in
+    bool stale;                  // tiles to resolve before the next submission
+    bool initialized;            // resolved once (render target and depth: fresh regions discarded)
     TargetRegion* regions;
     u64* keys;  // per tile: what names it (SHARED_TILE_PRIVATE: its own)
     u32* tiles; // per tile: the pool tile, or GPU_NO_TILE (no VRAM for it: reads zero)
@@ -54,15 +59,22 @@ static struct {
     u32 slot;
     ID3D12Fence* fence;
     volatile u64 last;
+    // Discards of new textures' fresh regions, run on the queue after the mappings.
+    GpuListPool init_lists;
+    ID3D12GraphicsCommandList8* init_list; // recording, or nullptr
+    u32 init_entry;
 } g_targets = {SRWLOCK_INIT};
 
 // --- tiles -------------------------------------------------------------------------------------------
 
-// A tile for `key`, with a reference; GPU_NO_TILE if VRAM ran out (the pool logged it). Lock held.
-static u32 acquire_tile(u64* key) {
+// A tile for `key`, with a reference; GPU_NO_TILE if VRAM ran out (the pool logged it). Sets `*kept`
+// if the tile is one a texture over the same memory holds, or held until the last submission: it has
+// contents. Lock held.
+static u32 acquire_tile(u64* key, bool* kept) {
     u32 tile = GPU_NO_TILE;
     if (*key != SHARED_TILE_PRIVATE && shared_tile_ref(&g_targets.shared, *key, &tile)) {
         g_targets.references++;
+        *kept = true;
         return tile;
     }
     if (!gpu_tiles_alloc(1, &tile))
@@ -178,8 +190,54 @@ static void add_tile(ID3D12Resource* texture, MapBatch* b, const TargetRegion& r
     }
 }
 
+// --- initialization ----------------------------------------------------------------------------------
+
+#define DISCARD_BATCH 64
+
+static D3D12_TEXTURE_BARRIER s_discards[DISCARD_BATCH]; // under g_targets.lock
+static u32 s_discard_count;
+
+// Records the gathered discards into the initialization list, begun if need be. Lock held.
+static void flush_discards() {
+    if (!s_discard_count)
+        return;
+    if (!g_targets.init_list)
+        g_targets.init_list = gpu_list_pool_begin(&g_targets.init_lists, gpu_queue_completed(g_targets.slot),
+                                                  &g_targets.init_entry);
+    if (g_targets.init_list) { // (without one the pool logged why)
+        D3D12_BARRIER_GROUP group = {D3D12_BARRIER_TYPE_TEXTURE, s_discard_count};
+        group.pTextureBarriers = s_discards;
+        g_targets.init_list->Barrier(1, &group);
+    }
+    s_discard_count = 0;
+}
+
+// Discards region `r` of a new texture: its tiles came fresh from the pool, so it has no contents to
+// keep. The list runs alone in its submission, after the mappings and before any title work, so the
+// barrier syncs with nothing. Lock held.
+static void add_discard(const TargetTexture* t, const TargetRegion& r) {
+    if (s_discard_count == DISCARD_BATCH)
+        flush_discards();
+    u32 mip = r.subresource % t->mips;
+    bool packed = mip >= t->standard_mips;
+    D3D12_TEXTURE_BARRIER& b = s_discards[s_discard_count++];
+    b.SyncBefore = D3D12_BARRIER_SYNC_NONE;
+    b.SyncAfter = D3D12_BARRIER_SYNC_NONE;
+    b.AccessBefore = D3D12_BARRIER_ACCESS_NO_ACCESS;
+    b.AccessAfter = D3D12_BARRIER_ACCESS_NO_ACCESS;
+    b.LayoutBefore = D3D12_BARRIER_LAYOUT_UNDEFINED;
+    b.LayoutAfter = t->layout;
+    b.pResource = t->texture;
+    // A packed region holds its slice's mips from the first packed one on; target textures are never
+    // planar (make_texture).
+    b.Subresources = {mip, packed ? t->mips - mip : 1, r.subresource / t->mips, 1, 0, 1};
+    b.Flags = D3D12_TEXTURE_BARRIER_FLAG_DISCARD;
+}
+
+// --- resolving ---------------------------------------------------------------------------------------
+
 // Gives each tile of `t` the tile of what its page shows now, and maps the ones that changed on our
-// queue. Lock held.
+// queue. A new texture's regions without contents are discarded. Lock held.
 static void resolve(TargetTexture* t) {
     t->stale = false;
     if (g_targets.scratch_capacity < t->tile_count) {
@@ -202,13 +260,14 @@ static void resolve(TargetTexture* t) {
 
     for (u32 ri = 0; ri < t->region_count; ri++) {
         const TargetRegion& r = t->regions[ri];
+        bool kept = false;
         for (u32 n = r.first; n < r.first + r.count; n++) {
             u64 key = keys[n];
             if (key == t->keys[n] && t->tiles[n] != GPU_NO_TILE)
                 continue;
             u32 old = t->tiles[n];
             release_tile(t->keys[n], old);
-            u32 tile = acquire_tile(&key);
+            u32 tile = acquire_tile(&key, &kept);
             t->keys[n] = key;
             t->tiles[n] = tile;
             if (tile != GPU_NO_TILE)
@@ -216,7 +275,12 @@ static void resolve(TargetTexture* t) {
             else if (old != GPU_NO_TILE)
                 add_tile(t->texture, &s_unmap, r, n, nullptr, GPU_NO_TILE);
         }
+        // Remaps of a texture in use get no discard: its layout is the title's by then, and memory newly
+        // mapped under a texture holds whatever it holds, as on console.
+        if (!t->initialized && !kept)
+            add_discard(t, r);
     }
+    t->initialized = true;
     flush_batch(t->texture, &s_map);
     flush_batch(t->texture, &s_unmap);
 }
@@ -290,6 +354,8 @@ static TargetTexture* make_texture(ConsoleResource* r, ID3D12Resource* texture, 
     t->size = size;
     t->tile_count = total;
     t->region_count = region_count;
+    t->mips = mips;
+    t->standard_mips = standard;
     t->stale = true;
     t->regions = (TargetRegion*)(t + 1);
     t->keys = (u64*)(t->regions + region_count);
@@ -325,13 +391,18 @@ static TargetTexture* make_texture(ConsoleResource* r, ID3D12Resource* texture, 
     return t;
 }
 
-bool target_tiles_add(ConsoleResource* r, ID3D12Resource* texture, const D3D12_RESOURCE_DESC1& desc) {
+bool target_tiles_add(ConsoleResource* r, ID3D12Resource* texture, const D3D12_RESOURCE_DESC1& desc,
+                      D3D12_BARRIER_LAYOUT layout) {
     D3D12_RESOURCE_ALLOCATION_INFO info = console_resource_allocation_info(r->desc);
     if (info.SizeInBytes == UINT64_MAX || !g_targets.queue)
         return false;
     TargetTexture* t = make_texture(r, texture, desc, info.SizeInBytes);
     if (!t)
         return false;
+    t->layout = layout;
+    // Only render target and depth textures have metadata a discard initializes.
+    t->initialized =
+        !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL));
     AcquireSRWLockExclusive(&g_targets.lock);
     if (g_targets.count == g_targets.capacity) {
         u32 capacity = g_targets.capacity ? g_targets.capacity * 2 : 256;
@@ -408,8 +479,21 @@ void target_tiles_submit(ID3D12CommandQueue* queue) {
                 if (g_targets.entries[i]->stale)
                     resolve(g_targets.entries[i]);
             }
-            g_targets.last =
-                gpu_queue_execute(g_targets.queue, g_targets.slot, 0, nullptr); // after the mappings
+            flush_discards();
+            ID3D12CommandList* lists[1];
+            u32 count = 0;
+            if (g_targets.init_list) {
+                HRESULT hr = g_targets.init_list->Close();
+                if (SUCCEEDED(hr))
+                    lists[count++] = g_targets.init_list;
+                else if (!gpu_device_lost(hr))
+                    LOG_E("d3d12", "cannot close the render target discards (0x%08lx)", (unsigned long)hr);
+            }
+            // After the mappings (queue operations run in order).
+            g_targets.last = gpu_queue_execute(g_targets.queue, g_targets.slot, count, lists);
+            if (count)
+                gpu_list_pool_submitted(&g_targets.init_lists, g_targets.init_entry, g_targets.last);
+            g_targets.init_list = nullptr;
             // Only now: a submission on another queue seeing no stale textures must see the
             // submission mapping them.
             g_targets.stale = 0;
@@ -447,7 +531,8 @@ void target_tiles_init() {
     gpu_device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o));
     if (o.ResourceHeapTier < D3D12_RESOURCE_HEAP_TIER_2)
         return;
-    D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_COPY};
+    // Direct: discards of render target and depth textures take a direct list.
+    D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_DIRECT};
     if (FAILED(gpu_device()->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_targets.queue)))) {
         LOG_E("d3d12", "cannot create the render target tile queue; render target textures are whole");
         g_targets.queue = nullptr;
@@ -463,6 +548,8 @@ void target_tiles_init() {
         return;
     }
     g_targets.fence = gpu_queue_fence(g_targets.slot);
+    g_targets.init_lists.type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    g_targets.init_lists.name = "render target discards";
     mem_add_mapping_listener(on_mapping_changed);
     g_targets.enabled = true;
 }
