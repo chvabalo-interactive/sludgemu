@@ -101,6 +101,8 @@ add_executable(sludgemu WIN32
     hle/d3d12/page_pool.cpp
     hle/d3d12/texture_sync.h
     hle/d3d12/texture_sync.cpp
+    hle/d3d12/target_tiles.h
+    hle/d3d12/target_tiles.cpp
     hle/d3d12/views.h
     hle/d3d12/views.cpp
     hle/d3d12/command_allocator.cpp
@@ -128,6 +130,8 @@ add_executable(sludgemu WIN32
     gpu/gpu_window.cpp
     gpu/tile_pool.h
     gpu/tile_pool.cpp
+    gpu/shared_tiles.h
+    gpu/shared_tiles.cpp
     gpu/page_tables.h
     gpu/page_tables.cpp
     gpu/shader_programs.h

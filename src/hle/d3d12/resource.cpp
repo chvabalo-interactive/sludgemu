@@ -9,6 +9,7 @@
 #include "core/memory.h"
 #include "hle/d3d12/barriers.h"
 #include "hle/d3d12/d3d12_objects.h"
+#include "hle/d3d12/target_tiles.h"
 #include "hle/d3d12/texture_sync.h"
 #include "hle/d3d12/d3d12_tables.h"
 #include "gpu/console_layout.h"
@@ -175,6 +176,36 @@ static ID3D12Resource* create_small_texture(ConsoleResource* r, const D3D12_RESO
     return texture;
 }
 
+// Render target, depth and UAV textures over title memory get reserved desktop textures whose tiles are
+// those of the memory (see target_tiles): textures the title aliases share video memory. nullptr where
+// that can't be.
+static ID3D12Resource* create_target_texture(ConsoleResource* r, const D3D12_RESOURCE_DESC1& desc,
+                                             D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE* clear) {
+    if (!target_tiles_eligible(r) || !reserved_texture_supported(desc))
+        return nullptr;
+    D3D12_RESOURCE_DESC reserved = desc0_from_desc1(desc);
+    reserved.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    ID3D12Resource* texture = nullptr;
+    HRESULT hr = gpu_device()->CreateReservedResource2(&reserved, layout, clear, nullptr, 0, nullptr,
+                                                       IID_PPV_ARGS(&texture));
+    if (hr == E_INVALIDARG && clear) // see create_texture
+        hr = gpu_device()->CreateReservedResource2(&reserved, layout, nullptr, nullptr, 0, nullptr,
+                                                   IID_PPV_ARGS(&texture));
+    if (FAILED(hr)) {
+        if (!gpu_device_lost(hr))
+            LOG_W_ONCE("d3d12",
+                       "cannot create a reserved render target texture (format %d, flags 0x%x): 0x%08lx; "
+                       "such textures are whole",
+                       desc.Format, desc.Flags, (unsigned long)hr);
+        return nullptr;
+    }
+    if (!target_tiles_add(r, texture, desc)) {
+        texture->Release(); // never used
+        return nullptr;
+    }
+    return texture;
+}
+
 static ID3D12Resource* create_texture(ConsoleResource* r) {
     D3D12_RESOURCE_DESC1 desc = desktop_texture_desc(r->desc, r->first_mip);
     if (desc.Format == DXGI_FORMAT_UNKNOWN) {
@@ -198,9 +229,12 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
     texture = create_small_texture(r, desc, layout);
     if (!texture)
         texture = create_reserved_texture(r, desc, layout);
+    if (!texture)
+        texture = create_target_texture(r, desc, layout, clear);
     if (texture) {
-        gpu_set_name(texture, "%s texture at 0x%llx (dim %d, %llux%ux%u, format %d, from mip %u)",
-                     r->reserved ? "reserved" : "small", r->gpu_address, r->desc.Dimension, r->desc.Width,
+        const char* kind = r->reserved ? "reserved" : r->target ? "render target" : "small";
+        gpu_set_name(texture, "%s texture at 0x%llx (dim %d, %llux%ux%u, format %d, from mip %u)", kind,
+                     r->gpu_address, r->desc.Dimension, r->desc.Width,
                      r->desc.Height, r->desc.DepthOrArraySize, r->desc.Format, r->first_mip);
         count_texture(r, desc);
         return texture;
@@ -286,6 +320,7 @@ static void resource_destroy(void* object) {
     if (texture_sync_tracks(r->desc))
         texture_sync_remove(r);
     uncount_texture(r);
+    target_tiles_remove(r);
     gpu_retire(r->texture);
     gpu_slots_free(r->slots); // handed out again once the GPU is done with the texture
     if (r->owned_memory)
@@ -595,11 +630,11 @@ static TextureKind texture_kind(const ConsoleResource* r) {
 
 // Counts the desktop texture just created for `r`.
 static void count_texture(ConsoleResource* r, const D3D12_RESOURCE_DESC1& desktop_desc) {
-    // Reserved textures take tiles, which the tile pool counts.
+    // Reserved textures take tiles, which the tile pool counts (and target_tiles, for render targets).
     D3D12_RESOURCE_ALLOCATION_INFO desktop = {};
     if (r->slots.count)
         desktop.SizeInBytes = (u64)r->slots.count * GPU_SLOT_SIZE;
-    else if (!r->reserved)
+    else if (!r->reserved && !r->target)
         desktop = gpu_device()->GetResourceAllocationInfo2(0, 1, &desktop_desc, nullptr);
     D3D12_RESOURCE_ALLOCATION_INFO console = console_resource_allocation_info(r->desc);
     AcquireSRWLockExclusive(&g_textures.lock);

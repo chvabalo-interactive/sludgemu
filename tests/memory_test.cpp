@@ -823,6 +823,7 @@ void test_shader_translate();
 void test_shader_lanes();
 void test_shader_cache();
 void test_shader_schedule();
+void test_shared_tiles();
 
 int main() {
     log_init(nullptr, LOG_LEVEL_WARN);
@@ -845,6 +846,7 @@ int main() {
     test_store_traps();
     test_taken_pages();
     test_device_writes();
+    test_shared_tiles();
     test_xapu_decode();
     test_xapu_convert();
     test_xdsp();

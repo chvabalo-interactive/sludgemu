@@ -47,7 +47,7 @@ typedef PVOID(WINAPI* MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, 
                                         MEM_EXTENDED_PARAMETER*, ULONG);
 typedef BOOL(WINAPI* UnmapViewOfFile2Fn)(HANDLE, PVOID, ULONG);
 
-#define MAX_MAPPING_LISTENERS 4
+#define MAX_MAPPING_LISTENERS 8
 
 // A frame mapped at more than one address: the addresses after the first (see frame_va).
 struct FrameAlias {

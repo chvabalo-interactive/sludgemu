@@ -10,6 +10,7 @@
 #include "hle/d3d12/frame_pacing.h"
 #include "hle/d3d12/d3d12_objects.h"
 #include "hle/d3d12/d3d12_tables.h"
+#include "hle/d3d12/target_tiles.h"
 #include "hle/d3d12/texture_sync.h"
 
 static_assert(offsetof(ConsoleCommandQueue, type) == 0x10, "command queue layout");
@@ -126,6 +127,7 @@ struct SubmitBatch {
 static u64 flush(ConsoleCommandQueue* self, SubmitBatch* b, u64 last) {
     if (!b->count)
         return last;
+    target_tiles_submit(self->desktop); // textures recorded into the lists get their tiles first
     gpu_page_tables_submit(self->desktop);
     u64 number = gpu_queue_execute(self->desktop, self->slot, b->count, b->lists);
     b->count = 0;
