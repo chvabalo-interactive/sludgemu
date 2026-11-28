@@ -16,6 +16,14 @@ u16 console_quad_sample_mask(u64 quad_mask, bool* uniform) {
     return (u16)(pixels[0] | pixels[1] | pixels[2] | pixels[3]);
 }
 
+bool console_sample_mask_override(u16 mask, u32 pipeline_mask, u32 samples, u16* desktop_mask) {
+    u32 present = samples >= 16 ? 0xFFFFu : (1u << (samples ? samples : 1)) - 1;
+    if ((mask & present) == (pipeline_mask & present))
+        return false;
+    *desktop_mask = (u16)(mask & present);
+    return true;
+}
+
 D3D12_SHADING_RATE console_shading_rate(u32 rate, bool additional_rates) {
     switch (rate) {
     case D3D12_SHADING_RATE_1X1:

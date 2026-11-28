@@ -144,8 +144,10 @@ static void WINAPI list_om_set_sample_mask_x(ConsoleCommandList* self, UINT64 qu
                    "sample mask 0x%016llx differs between the pixels of a quad, which desktop sample masks "
                    "can't; every pixel keeps the samples any of them keeps",
                    (unsigned long long)quad_mask);
-    // Pipelines are made per mask; the next draw picks the variant (see PipelineOutputs).
-    self->state.dropped_samples = (u16)~mask;
+    // It replaces the pipeline's mask until the next SetPipelineState; draws pick a pipeline variant
+    // where the two differ (see PipelineOutputs).
+    self->state.sample_mask_x = mask;
+    self->state.has_sample_mask_x = true;
 }
 
 static void set_sample_positions(ConsoleCommandList* self) {

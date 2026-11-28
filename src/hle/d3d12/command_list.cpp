@@ -544,6 +544,7 @@ static void WINAPI list_wait_64bit_value_x(ConsoleCommandList* self, UINT64 addr
 
 static void WINAPI list_set_pipeline_state(ConsoleCommandList* self, void* pso) {
     self->state.pipeline = (ConsolePipelineState*)pso; // the desktop one is found at the next draw
+    self->state.has_sample_mask_x = false;             // a new pipeline brings back its own sample mask
 }
 
 static void WINAPI list_set_descriptor_heaps(ConsoleCommandList* self, UINT count,

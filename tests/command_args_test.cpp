@@ -31,6 +31,22 @@ static void test_quad_sample_mask() {
     CHECK(console_quad_sample_mask(0x8000000000000000ull, &uniform) == 0x8000 && !uniform);
 }
 
+static void test_sample_mask_override() {
+    u16 mask = 0x1234;
+    // The pipeline's own mask, or one that differs only in samples the targets lack: no variant.
+    CHECK(!console_sample_mask_override(0xFFFF, UINT32_MAX, 1, &mask) && mask == 0x1234);
+    CHECK(!console_sample_mask_override(0xFFFF, UINT32_MAX, 0, &mask));
+    CHECK(!console_sample_mask_override(0x000F, UINT32_MAX, 4, &mask));
+    CHECK(!console_sample_mask_override(0xFF05, 0x5, 4, &mask));
+    CHECK(!console_sample_mask_override(0xFFFF, UINT32_MAX, 16, &mask));
+    // Fewer samples than the pipeline keeps: the mask, cut to the targets' samples.
+    CHECK(console_sample_mask_override(0xFFF5, UINT32_MAX, 4, &mask) && mask == 0x5);
+    CHECK(console_sample_mask_override(0, UINT32_MAX, 1, &mask) && mask == 0);
+    CHECK(console_sample_mask_override(0x7FFF, UINT32_MAX, 16, &mask) && mask == 0x7FFF);
+    // It replaces the pipeline's mask, so it can also bring back samples the pipeline leaves out.
+    CHECK(console_sample_mask_override(0xFFFF, 0x1, 4, &mask) && mask == 0xF);
+}
+
 static void test_shading_rates() {
     CHECK(console_shading_rate(0x0, false) == D3D12_SHADING_RATE_1X1);
     CHECK(console_shading_rate(0x1, false) == D3D12_SHADING_RATE_1X2);
@@ -140,6 +156,7 @@ static void test_copyable_footprints() {
 void test_command_args() {
     test_copy_flags();
     test_quad_sample_mask();
+    test_sample_mask_override();
     test_shading_rates();
     test_shading_rate_settings();
     test_sample_positions();

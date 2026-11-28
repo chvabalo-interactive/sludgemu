@@ -31,6 +31,12 @@ u32 console_copy_flags_unsupported(u32 flags);
 // draws goes missing, at the cost of some it meant to leave alone.
 u16 console_quad_sample_mask(u64 quad_mask, bool* uniform);
 
+// The console mask replaces the pipeline's sample mask (until the next SetPipelineState). Whether a
+// draw to targets with `samples` samples per pixel needs a pipeline variant for `mask`: only when it
+// differs from `pipeline_mask` in those samples, so a mask the pipeline already has makes none.
+// `*desktop_mask` is then the desktop pipeline's sample mask.
+bool console_sample_mask_override(u16 mask, u32 pipeline_mask, u32 samples, u16* desktop_mask);
+
 // --- variable rate shading (RSSetShadingRate, RSSetShadingRateX) -------------------------------------
 
 // Console shading rates use the desktop encoding (log2 of the coarse size per axis, x in bits 2-3, y in

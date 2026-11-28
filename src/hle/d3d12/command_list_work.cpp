@@ -24,10 +24,18 @@ static bool prepare(ConsoleCommandList* self, bool graphics) {
     ID3D12RootSignature* signature = nullptr;
     PipelineOutputs outputs = s.outputs;
     outputs.rect_list = s.topology == CONSOLE_TOPOLOGY_RECT_LIST;
-    // Only samples the targets have: a mask leaving out samples of more samples than that is the full
-    // mask for these targets, and must not make a pipeline variant of its own.
-    u32 samples = outputs.sample_count ? outputs.sample_count : 1;
-    outputs.dropped_samples = (u16)(s.dropped_samples & ((1u << samples) - 1));
+    // A sample mask from OMSetSampleMaskX makes a variant only where it differs from the pipeline's
+    // in the samples the targets have.
+    outputs.sample_mask_override = 0;
+    outputs.unused = 0;
+    outputs.sample_mask = 0;
+    u16 mask;
+    if (graphics && s.has_sample_mask_x && s.pipeline &&
+        console_sample_mask_override(s.sample_mask_x, s.pipeline->fixed.sample_mask, outputs.sample_count,
+                                     &mask)) {
+        outputs.sample_mask_override = 1;
+        outputs.sample_mask = mask;
+    }
     bool building = false;
     ID3D12PipelineState* desktop =
         console_pipeline_desktop(s.pipeline, graphics ? &outputs : nullptr, &signature, &building);

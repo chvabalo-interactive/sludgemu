@@ -811,7 +811,7 @@ static ID3D12PipelineState* create_graphics(const ConsolePipelineState* pso, con
         d.GS = *gs;
     }
     d.BlendState = f.blend;
-    d.SampleMask = f.sample_mask & ~(UINT)o.dropped_samples; // OMSetSampleMaskX narrows the pipeline's
+    d.SampleMask = o.sample_mask_override ? o.sample_mask : f.sample_mask; // OMSetSampleMaskX replaces it
     d.RasterizerState = f.rasterizer;
     d.DepthStencilState = f.depth_stencil;
     if (o.depth_format == DXGI_FORMAT_UNKNOWN) {

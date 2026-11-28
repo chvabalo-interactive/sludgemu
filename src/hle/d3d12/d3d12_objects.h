@@ -141,9 +141,11 @@ struct PipelineOutputs {
     u8 depth_format;
     u8 sample_count;
     u8 rect_list; // drawn as console rectangle lists (geometry shader expansion)
-    // Samples the console quad sample mask (OMSetSampleMaskX) leaves out, which the desktop pipeline's
-    // sample mask leaves out too; 0 for none (the default).
-    u16 dropped_samples;
+    // OMSetSampleMaskX replaces the pipeline's sample mask with `sample_mask`. Set only where the two
+    // differ in the targets' samples, so the default (0) stays the pipeline's own mask.
+    u8 sample_mask_override;
+    u8 unused; // 0: keys are compared byte by byte
+    u16 sample_mask;
 };
 
 // Root arguments: tables as desktop heap indices, root descriptors as desktop GPU addresses. They
@@ -200,7 +202,10 @@ struct ListState {
     ID3D12Resource* predication;
     u64 predication_offset;
     D3D12_PREDICATION_OP predication_op;
-    u16 dropped_samples; // see PipelineOutputs
+    // OMSetSampleMaskX: the mask draws use instead of the pipeline's, until the next SetPipelineState
+    // (which goes back to the pipeline's, as on console).
+    bool has_sample_mask_x;
+    u16 sample_mask_x;
     // Variable rate shading: the base rate and combiners (1x1, passthrough when never set), the
     // shading rate image (borrowed: the title keeps it alive while lists use it).
     bool has_shading_rate;
