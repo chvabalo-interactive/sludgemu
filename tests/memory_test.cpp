@@ -14,8 +14,10 @@ int g_failures = 0;
 
 #define PAGE MEM_PAGE_SIZE
 
-static u32 g_notifications = 0;
-static const u8* g_last_notified = nullptr;
+// State the callbacks write is volatile, and so are accesses through aliases: callbacks run from the
+// fault handler in the middle of a plain store or load, which optimized builds otherwise move or fold.
+static volatile u32 g_notifications = 0;
+static const u8* volatile g_last_notified = nullptr;
 
 static void on_mapping_changed(const u8* base, u64) {
     g_notifications++;
@@ -204,8 +206,8 @@ static void test_runs_and_remaps() {
 
     // Aliasing: the same frame at a second address, writes visible through both.
     CHECK(mem_map_physical(base + 20 * PAGE, 1, &other[0]));
-    base[20 * PAGE + 100] = 0x77;
-    CHECK(base[7 * PAGE + 100] == 0x77);
+    ((volatile u8*)base)[20 * PAGE + 100] = 0x77;
+    CHECK(((volatile u8*)base)[7 * PAGE + 100] == 0x77);
 
     // Unmapping returns a page to a placeholder.
     u64 invalid = MEM_INVALID_PFN;
@@ -381,10 +383,10 @@ static void test_gpu_section_ranges() {
     CHECK(range_is_free(base, size));
 }
 
-static u32 g_write_reports = 0;
-static u64 g_write_base = 0, g_write_size = 0;
+static volatile u32 g_write_reports = 0;
+static volatile u64 g_write_base = 0, g_write_size = 0;
 
-static u32 g_dropped_reports; // watches ended by other memory mapped where they were
+static volatile u32 g_dropped_reports; // watches ended by other memory mapped where they were
 
 static void on_write(u64 base, u64 size, MemWriteKind kind) {
     if (kind == MEM_WATCH_DROPPED) {
@@ -486,12 +488,12 @@ static void test_write_watches() {
         mem_watch_writes(gpu + MiB(3), 4096);
         mem_prepare(gpu + MiB(3), MiB(1)); // commits the granule again
         CHECK(!page_writable(gpu + MiB(3)));
-        gpu[MiB(3) + 10] = 3;
+        ((volatile u8*)gpu)[MiB(3) + 10] = 3;
         CHECK(g_write_reports == 1 && g_write_base == (u64)gpu + MiB(3) && g_write_size == 4096);
         // A write elsewhere in a protected host page (small textures share pages) is caught too.
         gpu[MiB(5)] = 1;
         mem_watch_writes(gpu + MiB(5), 0x400);
-        gpu[MiB(5) + 0xB00] = 4;
+        ((volatile u8*)gpu)[MiB(5) + 0xB00] = 4;
         CHECK(g_write_reports == 2 && g_write_base == (u64)gpu + MiB(5) && g_write_size == 0x400);
         CHECK(mem_release(gpu));
     }
@@ -517,10 +519,10 @@ static void test_watch_counts() {
     mem_watch_writes(gpu, 3 * 4096, 1);     // another client's watch over the same range
     mem_unwatch_writes(gpu, 3 * 4096, 1);   // that client lets go: watch A stays
     CHECK(!page_writable(gpu) && !page_writable(gpu + 3 * 4096));
-    gpu[3 * 4096] = 1; // B's own page: B ends, A's pages stay protected
+    ((volatile u8*)gpu)[3 * 4096] = 1; // B's own page: B ends, A's pages stay protected
     CHECK(g_write_reports == 1 && g_write_base == (u64)gpu + 2 * 4096);
     CHECK(!page_writable(gpu + 2 * 4096) && page_writable(gpu + 3 * 4096));
-    gpu[2 * 4096] = 1; // now only A covers page 2
+    ((volatile u8*)gpu)[2 * 4096] = 1; // now only A covers page 2
     CHECK(g_write_reports == 2 && g_write_base == (u64)gpu && page_writable(gpu));
 
     // Two watches over one page; unwatching one keeps the page protected for the other.
@@ -528,7 +530,7 @@ static void test_watch_counts() {
     mem_watch_writes(gpu + 4 * 4096 + 0x800, 0x100);
     mem_unwatch_writes(gpu + 4 * 4096, 0x100);
     CHECK(!page_writable(gpu + 4 * 4096));
-    gpu[4 * 4096 + 0x10] = 1; // the page is written: the remaining watch ends
+    ((volatile u8*)gpu)[4 * 4096 + 0x10] = 1; // the page is written: the remaining watch ends
     CHECK(g_write_reports == 3 && g_write_base == (u64)gpu + 4 * 4096 + 0x800 &&
           page_writable(gpu + 4 * 4096));
     CHECK(mem_release(gpu));
@@ -548,8 +550,8 @@ static void test_watch_counts() {
     mem_remove_write_listener(on_write);
 }
 
-static u32 g_store_reports = 0;
-static u64 g_store_base = 0, g_store_value = 0;
+static volatile u32 g_store_reports = 0;
+static volatile u64 g_store_base = 0, g_store_value = 0;
 
 static void on_store(u64 base, u64) {
     g_store_reports++;
@@ -573,9 +575,9 @@ static DWORD WINAPI store_thread(void* p) {
 // shares, by stores straddling two trapped pages and by repeated string stores; the pages stay
 // protected throughout, also while another thread stores.
 // The taken listener brings a page up to date through the host view of its memory and gives it back.
-static u32 g_taken_calls = 0;
-static const void* g_taken_addr = nullptr;
-static u8 g_taken_value = 0;
+static volatile u32 g_taken_calls = 0;
+static const void* volatile g_taken_addr = nullptr;
+static volatile u8 g_taken_value = 0;
 
 static void on_taken(const void* addr) {
     g_taken_calls++;
@@ -685,8 +687,8 @@ static void test_store_traps() {
     CHECK(!page_writable((const void*)counter));
     *counter = 3;
     CHECK(g_store_reports == 2 && g_store_value == 3 && *counter == 3);
-    gpu[0x1800] = 7; // elsewhere on the page: reported too, the listener checks the values
-    CHECK(g_store_reports == 3 && gpu[0x1800] == 7);
+    ((volatile u8*)gpu)[0x1800] = 7; // elsewhere on the page: reported too, the listener checks the values
+    CHECK(g_store_reports == 3 && ((volatile u8*)gpu)[0x1800] == 7);
 
     // A watch on the same page ends at the first write; the trap stays.
     g_write_reports = 0;

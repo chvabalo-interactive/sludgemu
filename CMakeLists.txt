@@ -40,6 +40,14 @@ target_compile_definitions(sludge_options INTERFACE
 )
 target_link_options(sludge_options INTERFACE /DEBUG:FULL)
 
+# Optimized builds: full inlining (CMake's RelWithDebInfo default is /Ob1), whole-program optimization
+# across translation units, and dropping unreferenced and identical code (/DEBUG turns that off unless
+# asked for).
+target_compile_options(sludge_options INTERFACE "$<$<NOT:$<CONFIG:Debug>>:/Ob2;/Gw>")
+target_link_options(sludge_options INTERFACE "$<$<NOT:$<CONFIG:Debug>>:/OPT:REF;/OPT:ICF>")
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+
 # Third-party libraries are fetched at configure time; nothing is vendored into the repo.
 include(FetchContent)
 
