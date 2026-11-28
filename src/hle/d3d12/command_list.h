@@ -33,6 +33,10 @@ void list_apply_x_state(ConsoleCommandList* list);
 // What the desktop GPU supports of command_list_x.cpp's state; once, with the list table.
 void console_command_list_x_init();
 
+// Reapplies the list's tracked desktop state after external work (e.g. FidelityFX) records directly
+// to `list->desktop`.
+void list_restore_state(ConsoleCommandList* list);
+
 extern const ConsoleEntry k_list_work_entries[];
 extern const u32 k_list_work_entry_count;
 extern const ConsoleEntry k_list_x_entries[];

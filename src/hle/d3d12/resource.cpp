@@ -85,7 +85,7 @@ static D3D12_RESOURCE_DESC1 desktop_texture_desc(const D3D12_RESOURCE_DESC1& con
         desc.Height = desc.Height >> first_mip ? desc.Height >> first_mip : 1;
         desc.MipLevels = (u16)(desc.MipLevels - first_mip);
     }
-    desc.Format = format_desktop_resource(console.Format);
+    desc.Format = format_desktop_target(console.Format, console.Flags);
     desc.Layout = desktop_texture_layout(desc.Layout);
     desc.Flags = (D3D12_RESOURCE_FLAGS)(desc.Flags & k_desktop_resource_flags);
     if (console_texture_loses_uav(console)) {
@@ -217,6 +217,8 @@ static ID3D12Resource* create_texture(ConsoleResource* r) {
     D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
     D3D12_CLEAR_VALUE clear_value = r->clear_value;
     clear_value.Format = format_desktop(r->clear_value.Format);
+    if (desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && r->clear_value.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
+        clear_value.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     bool clear_allowed =
         desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
     const D3D12_CLEAR_VALUE* clear = r->has_clear_value && clear_allowed ? &clear_value : nullptr;

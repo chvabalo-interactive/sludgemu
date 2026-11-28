@@ -352,6 +352,10 @@ static void apply_state(ConsoleCommandList* self) {
     list_apply_x_state(self);
 }
 
+void list_restore_state(ConsoleCommandList* self) {
+    apply_state(self);
+}
+
 // --- segments ----------------------------------------------------------------------------------------
 
 // Starts recording segment `index` on the list's allocator: a new desktop list, or a closed one

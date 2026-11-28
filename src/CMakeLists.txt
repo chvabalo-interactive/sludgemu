@@ -122,6 +122,7 @@ add_executable(sludgemu WIN32
     hle/d3d12/frame_pacing.h
     hle/d3d12/frame_pacing.cpp
     hle/d3d12/bvh_builder.cpp
+    hle/fidelityfx/fidelityfx.cpp
     hle/dstorage/bcpack.cpp
     hle/dstorage/dstorage.cpp
 
@@ -209,13 +210,14 @@ add_custom_command(OUTPUT ${translator_hash}
     COMMENT "Hashing the shader translator sources")
 target_sources(sludgemu PRIVATE ${translator_hash})
 target_link_libraries(sludgemu PRIVATE sludge_shader agility sludge_options shell32 user32 synchronization delayimp
-    dstorage libdeflate::libdeflate_static opus addrlib d3d12 dxgi dxc)
+    dstorage libdeflate::libdeflate_static opus addrlib d3d12 dxgi dxc fidelityfx)
 
 # Loaded only when a title uses DirectStorage.
 target_link_options(sludgemu PRIVATE /DELAYLOAD:dstorage.dll)
 add_custom_command(TARGET sludgemu POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUDGE_DSTORAGE_DLLS} $<TARGET_FILE_DIR:sludgemu>
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUDGE_DXC_DLLS} $<TARGET_FILE_DIR:sludgemu>
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUDGE_FIDELITYFX_DLLS} $<TARGET_FILE_DIR:sludgemu>
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:sludgemu>/D3D12
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SLUDGE_AGILITY_DLLS} $<TARGET_FILE_DIR:sludgemu>/D3D12)
 
