@@ -128,6 +128,67 @@ static void test_ring_space() {
     CHECK(s.count == 1 && s.uses[s.first].submission == 0);
 }
 
+// A ring a burst grew gives the memory back once the work after needs far less, and only while nothing
+// is in use.
+static void test_ring_shrink() {
+    RingSpace s;
+    ring_space_reset(&s, MiB(256));
+    u64 at = 0;
+    u64 number = 1;
+
+    // Too few takes yet: no look.
+    CHECK(ring_space_take(&s, MiB(1), 256, &at));
+    ring_space_submitted(&s, number++);
+    ring_space_reclaim(&s, number);
+    CHECK(ring_space_shrink_size(&s, MiB(16)) == 0);
+
+    // A period of 4 MiB submissions, two in flight at a time: peak 8 MiB, so it shrinks to 16 MiB...
+    for (u32 i = 1; i < RING_SPACE_SHRINK_PERIOD; i++) {
+        CHECK(ring_space_take(&s, MiB(4), 256, &at));
+        ring_space_submitted(&s, number);
+        ring_space_reclaim(&s, number - 1);
+        number++;
+    }
+    CHECK(s.peak == MiB(8));
+    // ...but not while a region is still in use.
+    CHECK(ring_space_shrink_size(&s, MiB(1)) == 0);
+    ring_space_reclaim(&s, number);
+    CHECK(s.count == 0);
+    CHECK(ring_space_shrink_size(&s, MiB(1)) == MiB(16));
+    // The look started a new period.
+    CHECK(s.takes == 0 && s.peak == 0 && ring_space_shrink_size(&s, MiB(1)) == 0);
+
+    // Never below the least size asked for.
+    for (u32 i = 0; i < RING_SPACE_SHRINK_PERIOD; i++) {
+        CHECK(ring_space_take(&s, 4096, 256, &at));
+        ring_space_submitted(&s, number);
+        ring_space_reclaim(&s, number++);
+    }
+    CHECK(ring_space_shrink_size(&s, MiB(16)) == MiB(16));
+
+    // A ring whose work uses more than a quarter of it stays.
+    ring_space_reset(&s, MiB(16));
+    for (u32 i = 0; i < RING_SPACE_SHRINK_PERIOD; i++) {
+        CHECK(ring_space_take(&s, MiB(5), 256, &at));
+        ring_space_submitted(&s, number);
+        ring_space_reclaim(&s, number++);
+    }
+    CHECK(s.peak == MiB(5) && ring_space_shrink_size(&s, MiB(1)) == 0);
+
+    // Use that wraps around the end counts the bytes skipped there.
+    ring_space_reset(&s, 1000);
+    CHECK(ring_space_take(&s, 600, 1, &at) && at == 0);
+    ring_space_submitted(&s, number);
+    ring_space_reclaim(&s, number++);
+    CHECK(ring_space_take(&s, 300, 1, &at) && at == 0); // empty: starts over
+    ring_space_submitted(&s, number++);
+    CHECK(ring_space_take(&s, 500, 1, &at) && at == 300);
+    ring_space_submitted(&s, number++);
+    ring_space_reclaim(&s, number - 2);                 // [0, 300) done; [300, 800) in use
+    CHECK(ring_space_take(&s, 250, 1, &at) && at == 0); // wraps: 200 bytes skipped at the end
+    CHECK(s.peak == 1000 - 300 + 250);
+}
+
 static void test_backlog_order() {
     QueueBacklog b = {};
     CHECK(!backlog_front(&b));
@@ -164,5 +225,6 @@ static void test_backlog_order() {
 void test_submission() {
     test_reuse_order();
     test_ring_space();
+    test_ring_shrink();
     test_backlog_order();
 }

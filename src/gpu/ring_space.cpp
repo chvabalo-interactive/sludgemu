@@ -4,6 +4,8 @@ void ring_space_reset(RingSpace* s, u64 size) {
     s->size = size;
     s->head = 0;
     s->first = s->count = 0;
+    s->peak = 0;
+    s->takes = 0;
 }
 
 void ring_space_reclaim(RingSpace* s, u64 done) {
@@ -44,6 +46,12 @@ bool ring_space_take(RingSpace* s, u64 bytes, u64 alignment, u64* offset) {
     }
     s->head = start + bytes;
     *offset = start;
+    // In use: from the oldest region to the head, around the end when it wrapped (the bytes skipped at
+    // the end count too: the ring needed them).
+    u64 tail = s->uses[s->first].start;
+    u64 used = s->head > tail ? s->head - tail : s->size - tail + s->head;
+    s->peak = used > s->peak ? used : s->peak;
+    s->takes++;
     return true;
 }
 
@@ -55,4 +63,15 @@ void ring_space_submitted(RingSpace* s, u64 number) {
             break;
         u.submission = number;
     }
+}
+
+u64 ring_space_shrink_size(RingSpace* s, u64 least) {
+    if (s->count || s->takes < RING_SPACE_SHRINK_PERIOD)
+        return 0;
+    u64 want = ALIGN_UP(s->peak * 2, MiB(1));
+    want = want > least ? want : least;
+    bool shrink = s->peak * 4 <= s->size && want < s->size;
+    s->peak = 0;
+    s->takes = 0;
+    return shrink ? want : 0;
 }

@@ -47,6 +47,11 @@ bool gpu_ring_alloc(GpuRing* r, u64 bytes, u64 alignment, u64* offset) {
     if (!r->buffer && !create(r, RING_MIN_SIZE > least ? RING_MIN_SIZE : least))
         return false;
     ring_space_reclaim(&r->space, gpu_queue_completed(r->slot));
+    // Give back what a burst of work grew the ring to (nothing is in use when it shrinks). A failed
+    // create keeps the ring as it is.
+    u64 smaller = ring_space_shrink_size(&r->space, RING_MIN_SIZE > least ? RING_MIN_SIZE : least);
+    if (smaller && create(r, smaller))
+        LOG_I("gpu", "a GPU ring shrinks to %llu MiB", smaller >> 20);
     if (ring_space_take(&r->space, bytes, alignment, offset))
         return true;
     // Waiting for the GPU to finish older regions could wait for work that waits for the caller's
