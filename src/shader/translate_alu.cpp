@@ -1582,6 +1582,36 @@ static bool emit_vector(Translator& t, const RdnaInst& in) {
     case OP_V_COS_F16:
         vhalf(t, in, fmt(t, "cos_rev(%s)", h(t, in, 0)));
         return true;
+    case OP_V_MIN3_F16:
+        vhalf(t, in, fmt(t, "min(min(%s, %s), %s)", h(t, in, 0), h(t, in, 1), h(t, in, 2)));
+        return true;
+    case OP_V_MAX3_F16:
+        vhalf(t, in, fmt(t, "max(max(%s, %s), %s)", h(t, in, 0), h(t, in, 1), h(t, in, 2)));
+        return true;
+    case OP_V_MED3_F16:
+        vhalf(t, in, fmt(t, "med3_f32(%s, %s, %s)", h(t, in, 0), h(t, in, 1), h(t, in, 2)));
+        return true;
+    case OP_V_MIN3_I16:
+    case OP_V_MAX3_I16:
+    case OP_V_MED3_I16:
+    case OP_V_MIN3_U16:
+    case OP_V_MAX3_U16:
+    case OP_V_MED3_U16: {
+        // Sign or zero extended to 32 bits, where the order is the same.
+        bool is_signed = in.op == OP_V_MIN3_I16 || in.op == OP_V_MAX3_I16 || in.op == OP_V_MED3_I16;
+        const char* a = u16_src(t, in, 0, is_signed);
+        const char* b = u16_src(t, in, 1, is_signed);
+        const char* c = u16_src(t, in, 2, is_signed);
+        const char* r;
+        if (in.op == OP_V_MIN3_I16 || in.op == OP_V_MIN3_U16)
+            r = fmt(t, "(uint)min(min(%s, %s), %s)", a, b, c);
+        else if (in.op == OP_V_MAX3_I16 || in.op == OP_V_MAX3_U16)
+            r = fmt(t, "(uint)max(max(%s, %s), %s)", a, b, c);
+        else
+            r = fmt(t, "(uint)%s(%s, %s, %s)", is_signed ? "med3_i32" : "med3_u32", a, b, c);
+        vhalf_u16(t, in, r);
+        return true;
+    }
     case OP_V_ADD_NC_U16:
     case OP_V_SUB_NC_U16:
     case OP_V_MUL_LO_U16:
