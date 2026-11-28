@@ -7,7 +7,10 @@
 // take only part of the workers, so work a draw waits for always finds one free (a running compile
 // can't be interrupted), it runs cheapest first, so most programs are cached early and the few huge
 // ones (tens of seconds and about a gigabyte of compiler memory each) come last, and compiles start
-// only while their estimated memory fits a budget. Work something waits for is never held back.
+// only while their estimated memory fits a budget. Work something waits for is never held back, and
+// no background job starts while a title thread waits.
+//
+// Title threads wait for what their draws need for a bounded time only (the wait budget below).
 
 #pragma once
 
@@ -70,6 +73,7 @@ struct ShaderQueueState {
     u32 background_queued;  // jobs nothing waits for yet
     u32 background_running; // background jobs (and compiles that waited for memory) running
     u32 background_slots;
+    bool title_waiting;    // a title thread is blocked on a program or pipeline
     bool compile_waiting;  // a translated program waits for memory to compile in
     u64 compile_cost;      // the cheapest such program's estimate
     u64 compile_in_flight; // the estimates of the compiles running
@@ -84,7 +88,57 @@ enum ShaderPick : u32 {
     PICK_COMPILE,    // the cheapest program waiting for memory, which now fits
 };
 
-// Urgent work first. Background work only on a free background slot: a compile that waited for memory
-// as soon as it fits (it was translated already, and what waits holds its HLSL), else the cheapest
-// queued job.
+// Urgent work first. Background work only on a free background slot and while no title thread waits:
+// a background job can't be stopped once started, so one started while the title waits would hold a
+// worker the next urgent job may need, and takes power and memory bandwidth from the build the title
+// waits for (on laptops the cores share one power limit). Waits are bounded, so this holds background
+// work back for a fraction of the time at most. Then a compile that waited for memory as soon as it
+// fits (it was translated already, and what waits holds its HLSL), else the cheapest queued job.
 ShaderPick shader_pick(const ShaderQueueState& s);
+
+// --- the wait budget ---
+//
+// A draw or dispatch whose program or desktop pipeline isn't built yet waits for it: one pass of an
+// effect left out looks broken, a late frame only late. But titles take a thread blocked for long for
+// a hang (watchdogs stop the title after some seconds without frame progress), and the largest
+// programs take seconds to compile, tens of seconds on a slow machine. So the wall time during which
+// any title thread waits is budgeted, the way a token bucket meters a rate: a burst for the first
+// sight of a scene, refilled at a share of the time passing. Waits that overlap draw on it once (they
+// block the title once, not once each), so all threads waiting at once wait until the same deadline.
+// Past it, the draw is skipped and what it needs stays urgent, ready a frame or a few later.
+//
+// Dispatches may overdraw the budget, into a reserve below zero, which draws then refill before they
+// wait again: compute work tends to feed state that later passes and frames build on (simulations,
+// histories, tables computed once at load), where a skipped draw usually costs one frame's pixels.
+//
+// Bounds: a stall (all waits back to back) lasts at most (BURST + RESERVE) * SHARE / (SHARE - 1),
+// 4 s with the values below, and over any stretch of time T the title waits at most
+// BURST + RESERVE + T / SHARE (plus the wake-up latency of waits ending at their deadline, which is
+// paid back). Rather than a cap per wait (a frame has many draws, recorded on several threads, each of
+// which may wait) or a budget per frame (titles also record while they present nothing, as when they
+// load), this bounds what watchdogs measure: wall time.
+
+// A second: one hitch when a scene is first seen, with all its new pipelines drawn. Most desktop
+// pipelines are made in tens of milliseconds and most programs in tens to hundreds.
+#define SHADER_WAIT_BURST_US 1000000
+// Two seconds more for dispatches.
+#define SHADER_WAIT_RESERVE_US 2000000
+// A quarter of the time passing: while the workers can't keep up, the title still runs three quarters
+// of the time, and its frames miss only what isn't built.
+#define SHADER_WAIT_REFILL_SHARE 4
+
+struct ShaderWaitBudget {
+    s64 balance_us; // waiting time left; below zero after dispatches overdrew it or waits overran
+    u64 stamp_us;   // when `balance_us` was brought up to date
+    u32 waiters;    // waits running
+};
+
+// A full budget at `now_us` (microseconds on a monotonic clock).
+void shader_wait_budget_init(ShaderWaitBudget* b, u64 now_us);
+// A wait starts at `now_us`, for a dispatch or a draw: the time it may wait until, the same for every
+// wait running (nonzero), and it counts as running until shader_wait_budget_end; or 0, the budget
+// being spent, and it doesn't wait.
+u64 shader_wait_budget_begin(ShaderWaitBudget* b, u64 now_us, bool dispatch);
+// A wait shader_wait_budget_begin gave a deadline ends at `now_us`, at the deadline or before (or a
+// little after: the overrun is paid back).
+void shader_wait_budget_end(ShaderWaitBudget* b, u64 now_us);

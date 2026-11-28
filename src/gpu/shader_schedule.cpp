@@ -129,7 +129,7 @@ bool shader_job_heap_pop(ShaderJobHeap* heap, ShaderJob* job) {
 ShaderPick shader_pick(const ShaderQueueState& s) {
     if (s.urgent_queued)
         return PICK_URGENT;
-    if (s.background_running >= s.background_slots)
+    if (s.title_waiting || s.background_running >= s.background_slots)
         return PICK_NOTHING;
     if (s.compile_waiting &&
         shader_compile_admitted(s.compile_in_flight, s.compile_cost, s.compile_budget, s.commit_room, false))
@@ -137,4 +137,43 @@ ShaderPick shader_pick(const ShaderQueueState& s) {
     if (s.background_queued)
         return PICK_BACKGROUND;
     return PICK_NOTHING;
+}
+
+// --- the wait budget ----------------------------------------------------------------------------------
+
+void shader_wait_budget_init(ShaderWaitBudget* b, u64 now_us) {
+    b->balance_us = SHADER_WAIT_BURST_US;
+    b->stamp_us = now_us;
+    b->waiters = 0;
+}
+
+// Brings the balance up to `now_us`: refilled all along (up to the burst), drained while waits run.
+static void advance(ShaderWaitBudget* b, u64 now_us) {
+    if (now_us <= b->stamp_us)
+        return; // threads read the clock before taking the lock, so `now_us` may lag a little
+    s64 elapsed = (s64)(now_us - b->stamp_us);
+    b->balance_us += elapsed / SHADER_WAIT_REFILL_SHARE;
+    if (b->waiters)
+        b->balance_us -= elapsed;
+    if (b->balance_us > SHADER_WAIT_BURST_US)
+        b->balance_us = SHADER_WAIT_BURST_US;
+    b->stamp_us = now_us;
+}
+
+u64 shader_wait_budget_begin(ShaderWaitBudget* b, u64 now_us, bool dispatch) {
+    advance(b, now_us);
+    s64 floor = dispatch ? -(s64)SHADER_WAIT_RESERVE_US : 0;
+    if (b->balance_us <= floor)
+        return 0;
+    b->waiters++;
+    // While waits run the balance drains at the wall time less the refill, so it reaches the floor
+    // after (balance - floor) * SHARE / (SHARE - 1); at least a microsecond, so never 0.
+    u64 left = (u64)(b->balance_us - floor);
+    return b->stamp_us + left * SHADER_WAIT_REFILL_SHARE / (SHADER_WAIT_REFILL_SHARE - 1);
+}
+
+void shader_wait_budget_end(ShaderWaitBudget* b, u64 now_us) {
+    advance(b, now_us);
+    if (b->waiters)
+        b->waiters--;
 }

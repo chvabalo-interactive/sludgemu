@@ -214,6 +214,7 @@ static ShaderQueueState queue_state() {
     s.background_queued = g_background.count;
     s.background_running = g_background_running;
     s.background_slots = g_schedule.background_slots;
+    s.title_waiting = false; // the title doesn't wait with a deadline yet
     s.compile_waiting = shader_job_heap_peek(&g_compiles, &cheapest);
     s.compile_cost = s.compile_waiting ? cheapest.program->compile_cost : 0;
     s.compile_in_flight = g_compile_in_flight;
