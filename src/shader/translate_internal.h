@@ -293,6 +293,9 @@ bool lane_write_replaces(const Translator& t, const RdnaInst& in);
 // Whether emission wrote every destination register the analysis takes an instruction to write
 // (`written`: a bit per register, from write_vgpr).
 bool lane_write_complete(const Translator& t, const RdnaInst& in, u32 written);
+// Marks (a byte per register) the vector registers an instruction reads, destinations it keeps part of
+// (or stores from) included.
+void vector_registers_read(const RdnaInst& in, u8* regs);
 void emit_program(Translator& t);
 // A block's instructions; t.tags ends as the state where it ends. translate_emit.cpp
 void emit_block(Translator& t, u32 b);

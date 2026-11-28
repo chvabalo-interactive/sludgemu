@@ -1405,10 +1405,110 @@ static void find_xor_swaps(Translator& t) {
     }
 }
 
-// Spill VGPRs: registers only v_writelane_b32 writes and only v_readlane_b32 reads, always at constant
-// lanes. Scalar code parks SGPRs in their lanes; the translation keeps one variable per lane used
-// instead of cross-lane operations (exact whatever the desktop wave size and whichever lanes run, and
-// masks keep each lane's own bit), and tracks the parked registers' tags and descriptors through them.
+// A bit per vector register.
+struct VgprSet {
+    u64 w[4];
+};
+
+static bool vgpr_set_has(const VgprSet& s, u32 r) {
+    return (s.w[(r & 255) >> 6] >> (r & 63)) & 1ull;
+}
+
+static void vgpr_set_put(VgprSet& s, u32 r, bool on) {
+    u64 bit = 1ull << (r & 63);
+    s.w[(r & 255) >> 6] = on ? s.w[(r & 255) >> 6] | bit : s.w[(r & 255) >> 6] & ~bit;
+}
+
+// Which writes may have left the value of each register: the spill lanes, or anything else (including
+// the value at the start).
+struct SpillReach {
+    VgprSet spill, other;
+};
+
+static bool is_spill_access(const Translator& t, const RdnaInst& in) {
+    u32 lane;
+    if (in.op == OP_V_WRITELANE_B32)
+        return in.dst[0].kind == OPND_VGPR && in.dst[0].count <= 1 && constant_lane(t, in.src[1], &lane);
+    if (in.op == OP_V_READLANE_B32)
+        return in.src[0].kind == OPND_VGPR && in.src[0].count <= 1 && constant_lane(t, in.src[1], &lane);
+    return false;
+}
+
+// Moves the reach over one instruction, adding to `mixed` the registers it reads a value of the other
+// kind from.
+static void spill_reach_transfer(const Translator& t, const RdnaInst& in, const u32* candidates, u32 count,
+                                 SpillReach& s, VgprSet& mixed) {
+    if (is_spill_access(t, in)) {
+        if (in.op == OP_V_READLANE_B32) {
+            if (vgpr_set_has(s.other, in.src[0].reg))
+                vgpr_set_put(mixed, in.src[0].reg, true);
+        } else {
+            vgpr_set_put(s.spill, in.dst[0].reg, true);
+            vgpr_set_put(s.other, in.dst[0].reg, false);
+        }
+        return;
+    }
+    u8 reads[256];
+    memset(reads, 0, sizeof(reads));
+    vector_registers_read(in, reads);
+    for (u32 c = 0; c < count; c++)
+        if (reads[candidates[c]] && vgpr_set_has(s.spill, candidates[c]))
+            vgpr_set_put(mixed, candidates[c], true);
+    for (u32 d = 0; d < 2; d++) {
+        const RdnaOperand& o = in.dst[d];
+        if (o.kind != OPND_VGPR)
+            continue;
+        for (u32 k = 0; k < (o.count ? o.count : 1u); k++) {
+            vgpr_set_put(s.other, o.reg + k, true);
+            vgpr_set_put(s.spill, o.reg + k, false);
+        }
+    }
+}
+
+// Spill VGPRs that other instructions use as well: register allocators reuse them for ordinary values
+// outside the spill's live range (before the first spill, after the last reload). The two uses keep
+// apart, and each part can keep its own variables, if no value a spill left is read by another
+// instruction and no value anything else wrote (or the value at the start) by a reload: a forward pass
+// over which kinds of writes reach each point. Writes as a whole register count here, which the spills
+// of compilers' live ranges are. Sets `apart` for the `candidates` that pass.
+static bool find_spills_apart(const Translator& t, const u32* candidates, u32 count, bool* apart) {
+    const Program& p = t.program;
+    SpillReach* entry = (SpillReach*)calloc(p.block_count, sizeof(SpillReach));
+    if (!entry)
+        return false;
+    memset(&entry[0].other, 0xFF, sizeof(entry[0].other));
+    VgprSet mixed = {};
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (u32 b = 0; b < p.block_count; b++) {
+            SpillReach s = entry[b];
+            for (u32 i = p.blocks[b].first; i < p.blocks[b].end; i++)
+                spill_reach_transfer(t, p.insts[i], candidates, count, s, mixed);
+            for (u32 k = 0; k < 2; k++) {
+                s32 n = p.blocks[b].next[k];
+                if (n < 0)
+                    continue;
+                for (u32 w = 0; w < 4; w++) {
+                    u64 spill = entry[n].spill.w[w] | s.spill.w[w];
+                    u64 other = entry[n].other.w[w] | s.other.w[w];
+                    changed |= spill != entry[n].spill.w[w] || other != entry[n].other.w[w];
+                    entry[n].spill.w[w] = spill;
+                    entry[n].other.w[w] = other;
+                }
+            }
+        }
+    }
+    free(entry);
+    for (u32 c = 0; c < count; c++)
+        apart[candidates[c]] = !vgpr_set_has(mixed, candidates[c]);
+    return true;
+}
+
+// Spill VGPRs: registers v_writelane_b32 writes and v_readlane_b32 reads at constant lanes, otherwise
+// untouched (or apart from their other uses, see find_spills_apart). Scalar code parks SGPRs in their
+// lanes; the translation keeps one variable per lane used instead of cross-lane operations (exact
+// whatever the desktop wave size and whichever lanes run, and masks keep each lane's own bit), and
+// tracks the parked registers' tags and descriptors through them.
 static void find_spill_vgprs(Translator& t) {
     const Program& p = t.program;
     memset(t.spill_slot, 0xFF, sizeof(t.spill_slot));
@@ -1445,8 +1545,16 @@ static void find_spill_vgprs(Translator& t) {
             for (u32 k = 0; k < in.mem.nsa_count && k < sizeof(in.mem.nsa_addr); k++)
                 other[in.mem.nsa_addr[k]] = true;
     }
+    u32 candidates[256];
+    u32 count = 0;
+    for (u32 r = 0; r < 256; r++)
+        if (written[r] && other[r])
+            candidates[count++] = r;
+    bool apart[256] = {};
+    if (count)
+        find_spills_apart(t, candidates, count, apart); // out of memory: none apart
     for (u32 r = 0; r < 256; r++) {
-        if (!written[r] || other[r] || t.spill_vgpr_count >= SHADER_MAX_SPILL_VGPRS)
+        if (!written[r] || (other[r] && !apart[r]) || t.spill_vgpr_count >= SHADER_MAX_SPILL_VGPRS)
             continue;
         t.spill_slot[r] = t.spill_vgpr_count;
         t.spill_vgprs[t.spill_vgpr_count++] = (u8)r;

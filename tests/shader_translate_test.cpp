@@ -1471,6 +1471,52 @@ static void test_half_interpolation() {
     }
 }
 
+// --- spill VGPRs with other uses ---------------------------------------------------------------------
+
+// A wave64 pixel shader (lanes are not exact: lane writes and reads must be spills) whose spill VGPRs
+// also hold ordinary values before the first spill (v2) or after the last reload (v4).
+static void test_spills_apart() {
+    ShaderInfo info = pixel_info();
+    {
+        static const u32 k_program[] = {
+            0xbe8403f2,             // s_mov_b32 s4, 1.0
+            0xc8080000,             // v_interp_p1_f32 v2, v0, attr0.x
+            0xc8090001,             // v_interp_p2_f32 v2, v1, attr0.x
+            0x7e060302,             // v_mov_b32 v3, v2
+            0xd7610002, 0x02010a04, // v_writelane_b32 v2, s4, 5
+            0xd7610004, 0x02010e04, // v_writelane_b32 v4, s4, 7
+            0xd7600005, 0x02010b02, // v_readlane_b32 s5, v2, 5
+            0xd7600006, 0x02010f04, // v_readlane_b32 s6, v4, 7
+            0x7e080205,             // v_mov_b32 v4, s5
+            0x060a0806,             // v_add_f32 v5, s6, v4
+            0xf800180f, 0x05050403, // exp mrt0, v3, v4, v5, v5 done vm
+            0xbf810000,             // s_endpgm
+        };
+        Asm a = {};
+        put_words(a, k_program, ARRAY_COUNT(k_program));
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("spill0_5 = s4;"));
+        CHECK(hlsl_has("spill1_7 = s4;"));
+        CHECK(hlsl_has("s5 = spill0_5;"));
+        CHECK(hlsl_has("s6 = spill1_7;"));
+        CHECK(hlsl_has("v3 = v2;"));
+    }
+    {
+        // Lanes a v_writelane_b32 wrote read as an ordinary value: not a spill.
+        static const u32 k_program[] = {
+            0xbe8403f2,             // s_mov_b32 s4, 1.0
+            0xd7610006, 0x02010604, // v_writelane_b32 v6, s4, 3
+            0x7e0e0306,             // v_mov_b32 v7, v6
+            0xf800180f, 0x07070707, // exp mrt0, v7, v7, v7, v7 done vm
+            0xbf810000,             // s_endpgm
+        };
+        Asm a = {};
+        put_words(a, k_program, ARRAY_COUNT(k_program));
+        CHECK(!translate(a, info));
+        CHECK(error_has("v_writelane_b32 in a wave64 program"));
+    }
+}
+
 void test_shader_translate() {
     rdna_init();
     test_constant_sampler_in_vcc();
@@ -1489,5 +1535,6 @@ void test_shader_translate() {
     test_descriptor_shadow_records();
     test_wave64_emission();
     test_half_interpolation();
+    test_spills_apart();
     g_out.hlsl.release();
 }
