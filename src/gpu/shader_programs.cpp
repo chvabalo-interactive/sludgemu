@@ -194,16 +194,16 @@ static void hurry(ShaderProgram* p) {
         WakeConditionVariable(&g_job_ready);
 }
 
-// Compiles nothing waits for take only commit the system can spare: beyond the reserve the title's own
-// memory stops at (core/memory.h), room for the title to grow, as a compile of one of the largest
-// programs takes a gigabyte and the title stops when the system runs short. All if Windows doesn't tell.
+// Compiles nothing waits for take only commit the system can spare: they leave room for the title to
+// grow, as a compile of one of the largest programs takes a gigabyte and the title stops when the system
+// runs out. All if Windows doesn't tell.
 #define COMPILE_COMMIT_HEADROOM GiB(2)
 
 static u64 commit_room() {
     MEMORYSTATUSEX m = {sizeof(m)};
     if (!GlobalMemoryStatusEx(&m))
         return ~0ull;
-    u64 keep = MEM_COMMIT_RESERVE + COMPILE_COMMIT_HEADROOM;
+    u64 keep = COMPILE_COMMIT_HEADROOM;
     return m.ullAvailPageFile > keep ? m.ullAvailPageFile - keep : 0;
 }
 
