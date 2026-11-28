@@ -14,6 +14,7 @@
 #include "hle/d3d12/d3d12_tables.h"
 #include "gpu/console_layout.h"
 #include "gpu/formats.h"
+#include "gpu/gpu_ring.h"
 #include "gpu/gpu_window.h"
 #include "gpu/tile_pool.h"
 #include "hle/xmem/xmem.h"
@@ -714,6 +715,34 @@ static u64 mapped_bytes(u64 start, u64 end) {
     return mapped;
 }
 
+// Frames of physical memory under [start, end) not counted in `seen` yet: counts them there and in
+// `distinct`, and in `earlier` those `before` holds (frames under textures of another kind).
+static void count_frames(u64 start, u64 end, u64* seen, const u64* before, u64* distinct, u64* earlier) {
+    const u32 batch = 256;
+    u64 pfns[batch];
+    for (u64 at = ALIGN_DOWN(start, MEM_PAGE_SIZE); at < end;) {
+        u64 left = (end - at + MEM_PAGE_SIZE - 1) >> MEM_PAGE_SHIFT;
+        u32 n = left < batch ? (u32)left : batch;
+        if (!mem_frames_at((const void*)at, n, pfns)) { // not one placeholder range: page by page
+            for (u32 k = 0; k < n; k++)
+                if (!mem_frames_at((const void*)(at + ((u64)k << MEM_PAGE_SHIFT)), 1, &pfns[k]))
+                    pfns[k] = MEM_INVALID_PFN;
+        }
+        for (u32 k = 0; k < n; k++) {
+            if (pfns[k] == MEM_INVALID_PFN)
+                continue;
+            u64 id = pfns[k] >> MEM_PAGE_NUMBER_SHIFT;
+            if (seen[id / 64] & (1ull << (id % 64)))
+                continue;
+            seen[id / 64] |= 1ull << (id % 64);
+            (*distinct)++;
+            if (before[id / 64] & (1ull << (id % 64)))
+                (*earlier)++;
+        }
+        at += (u64)n << MEM_PAGE_SHIFT;
+    }
+}
+
 void console_memory_report(const char* why) {
     AcquireSRWLockShared(&g_textures.lock);
     u32 count = g_textures.count;
@@ -737,6 +766,11 @@ void console_memory_report(const char* why) {
     gpu_window_usage(&chunk_windows, &block_windows, &replaced_windows);
     u64 page_table_tiles = 0, downloads = 0;
     gpu_page_tables_usage(&page_table_tiles, &downloads);
+    TargetTileUsage targets = {};
+    target_tiles_usage(&targets);
+    u64 upload_rings = 0, local_rings = 0;
+    gpu_ring_usage(&upload_rings, &local_rings);
+    u64 chunks = (u64)mem_physical_chunks_created() * MEM_CHUNK_SIZE;
     LOG_I("d3d12",
           "memory (%s): whole desktop textures %llu MiB, tiles %llu MiB (heaps %llu MiB); VRAM %llu of %llu "
           "MiB, shared %llu of %llu MiB; title physical memory %llu of %llu MiB used; commit %llu MiB",
@@ -752,19 +786,49 @@ void console_memory_report(const char* why) {
         "MiB of tiles, %llu pages copied back",
         (u64)system.CommitTotal * system.PageSize >> 20, (u64)system.CommitLimit * system.PageSize >> 20,
         (u64)system.PhysicalAvailable * system.PageSize >> 20, (u64)process.PrivateUsage >> 20,
-        (u64)process.WorkingSetSize >> 20, ((u64)mem_physical_chunks_created() * MEM_CHUNK_SIZE) >> 20,
-        (mem_physical_bound_pages() << MEM_PAGE_SHIFT) >> 20, chunk_windows >> 20, block_windows >> 20,
-        replaced_windows >> 20, page_table_tiles >> 20, downloads);
+        (u64)process.WorkingSetSize >> 20, chunks >> 20, (mem_physical_bound_pages() << MEM_PAGE_SHIFT) >> 20,
+        chunk_windows >> 20, block_windows >> 20, replaced_windows >> 20, page_table_tiles >> 20, downloads);
+
+    // Where the counters come from. VRAM: whole textures, tile heaps and the rest (rings, descriptor
+    // heaps, the driver's). Shared memory is mostly windows, heaps opened over title memory, which pin it
+    // but charge no commit of their own; the rest is system memory heaps of ours (upload rings) or of the
+    // driver (also VRAM it moved out under pressure). Private bytes hold VRAM and those heaps too; the
+    // rest is plain CPU memory, the title's and ours. Physical memory chunks and title GPU memory
+    // (sections) are charged to the system, not the process.
+    u64 windows = chunk_windows + block_windows + replaced_windows;
+    u64 vram_known = total + tile_heaps;
+    u64 vram_other = video.local_usage > vram_known ? video.local_usage - vram_known : 0;
+    u64 shared_other = video.shared_usage > windows ? video.shared_usage - windows : 0;
+    u64 gpu_charged = video.local_usage + shared_other;
+    u64 cpu_private = (u64)process.PrivateUsage > gpu_charged ? (u64)process.PrivateUsage - gpu_charged : 0;
+    LOG_I("d3d12",
+          "memory:   by consumer: VRAM %llu MiB = whole textures %llu + tile heaps %llu (page tables "
+          "%llu, render targets %llu) + other %llu (rings %llu); shared %llu MiB = windows over title "
+          "memory %llu + other heaps %llu (upload rings %llu); private %llu MiB = VRAM + other heaps + CPU "
+          "memory %llu; outside the process: physical memory chunks %llu, title GPU memory windowed %llu",
+          video.local_usage >> 20, total >> 20, tile_heaps >> 20, page_table_tiles >> 20,
+          (targets.shared + targets.own) >> 20, vram_other >> 20, local_rings >> 20, video.shared_usage >> 20,
+          windows >> 20, shared_other >> 20, upload_rings >> 20, (u64)process.PrivateUsage >> 20,
+          cpu_private >> 20, chunks >> 20, block_windows >> 20);
+    LOG_I("d3d12",
+          "memory:   render target tiles: %u textures; %llu MiB shared through title memory + %llu MiB their "
+          "own; %llu MiB as textures of their own",
+          targets.textures, targets.shared >> 20, targets.own >> 20, targets.referenced >> 20);
     if (!spans)
         return;
 
     // Per kind: what the desktop textures take, the title memory they describe, how much of that is
-    // distinct (aliased textures share it) and how much the title has mapped.
+    // distinct (aliased textures share it), how much the title has mapped and the frames of physical
+    // memory under it, counted once however many addresses show them (and how many of those are under
+    // textures of a kind listed before).
+    u64 words = (mem_physical_total_pages() + 63) / 64;
+    u64* seen = (u64*)calloc(words * 2, sizeof(u64));
+    u64* before = seen ? seen + words : nullptr;
     qsort(spans, count, sizeof(TextureSpan), compare_spans);
     for (u32 i = 0; i < count;) {
         TextureKind kind = spans[i].kind;
         u32 textures = 0;
-        u64 desktop = 0, console = 0, distinct = 0, mapped = 0, bound = 0;
+        u64 desktop = 0, console = 0, distinct = 0, mapped = 0, bound = 0, frames = 0, earlier = 0;
         u64 run_start = spans[i].start, run_end = spans[i].start;
         for (; i < count && spans[i].kind == kind; i++) {
             textures++;
@@ -774,6 +838,8 @@ void console_memory_report(const char* why) {
                 distinct += run_end - run_start;
                 mapped += mapped_bytes(run_start, run_end);
                 bound += mem_physical_bound_pages_at((const void*)run_start, run_end - run_start);
+                if (seen)
+                    count_frames(run_start, run_end, seen, before, &frames, &earlier);
                 run_start = spans[i].start;
             }
             run_end = spans[i].end > run_end ? spans[i].end : run_end;
@@ -781,11 +847,21 @@ void console_memory_report(const char* why) {
         distinct += run_end - run_start;
         mapped += mapped_bytes(run_start, run_end);
         bound += mem_physical_bound_pages_at((const void*)run_start, run_end - run_start);
+        if (seen) {
+            count_frames(run_start, run_end, seen, before, &frames, &earlier);
+            for (u64 w = 0; w < words; w++) {
+                before[w] |= seen[w];
+                seen[w] = 0;
+            }
+        }
         LOG_I("d3d12",
               "memory:   %s: %u, %llu MiB as whole desktop textures; %llu MiB of title memory, %llu MiB "
-              "distinct, %llu MiB mapped (%llu MiB bound to system memory)",
+              "distinct, %llu MiB mapped (%llu MiB bound to system memory); %llu MiB of distinct frames "
+              "(%llu MiB also under textures above)",
               k_texture_kind_names[kind], textures, desktop >> 20, console >> 20, distinct >> 20,
-              mapped >> 20, (bound << MEM_PAGE_SHIFT) >> 20);
+              mapped >> 20, (bound << MEM_PAGE_SHIFT) >> 20, (frames << MEM_PAGE_SHIFT) >> 20,
+              (earlier << MEM_PAGE_SHIFT) >> 20);
     }
+    free(seen);
     free(spans);
 }

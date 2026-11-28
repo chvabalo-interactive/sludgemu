@@ -4,6 +4,20 @@
 
 #define RING_MIN_SIZE MiB(16)
 
+// Bytes of all rings' buffers, current and retired (memory reports): upload heaps, default heaps.
+static volatile s64 g_ring_bytes[2];
+
+void gpu_ring_usage(u64* upload, u64* local) {
+    *upload = (u64)g_ring_bytes[1];
+    *local = (u64)g_ring_bytes[0];
+}
+
+// Gives up a ring's buffer, once the GPU is done with it.
+static void retire_buffer(GpuRing* r) {
+    InterlockedAdd64(&g_ring_bytes[r->upload ? 1 : 0], -(s64)r->size);
+    gpu_retire(r->buffer);
+}
+
 static bool create(GpuRing* r, u64 size) {
     D3D12_HEAP_PROPERTIES heap = {r->upload ? D3D12_HEAP_TYPE_UPLOAD : D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC1 desc = {};
@@ -32,7 +46,8 @@ static bool create(GpuRing* r, u64 size) {
     }
     gpu_set_name(buffer, "GPU ring (%llu MiB)", size >> 20);
     if (r->buffer)
-        gpu_retire(r->buffer); // what was handed out from it is kept alive by its users' references
+        retire_buffer(r); // what was handed out from it is kept alive by its users' references
+    InterlockedAdd64(&g_ring_bytes[r->upload ? 1 : 0], (s64)size);
     r->buffer = buffer;
     r->mapped = mapped;
     r->size = size;
@@ -108,7 +123,7 @@ void gpu_ring_submitted(GpuRing* r, u64 number) {
 
 void gpu_ring_release(GpuRing* r) {
     if (r->buffer)
-        gpu_retire(r->buffer);
+        retire_buffer(r);
     r->buffer = nullptr;
     r->mapped = nullptr;
     r->size = 0;
