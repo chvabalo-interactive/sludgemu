@@ -66,3 +66,14 @@ struct ConsoleSampleLocations {
 // pixels have the same positions (returns 1), else all four in desktop order (returns 4; needs sample
 // position tier 2). Offsets are clamped to what desktop allows (-8 to 7). `out` holds 64 positions.
 u32 console_sample_positions(const ConsoleSampleLocations& in, u32 samples, D3D12_SAMPLE_POSITION* out);
+
+// --- copyable footprints (GetCopyableFootprints) -----------------------------------------------------
+
+// Where subresources [first, first + count) of a resource go in a buffer for copies, by the D3D12 rules
+// (rows 256-byte aligned, subresources 512-byte aligned from `base`), in the resource's own (console)
+// format: titles fill those buffers with console data, so a desktop stand-in format's sizes would be
+// wrong. Depth-stencil formats have a depth plane (4 bytes per texel) and a stencil plane (1 byte).
+// Any output may be null. False for a description without a valid format or subresource range.
+bool console_copyable_footprints(const D3D12_RESOURCE_DESC1& desc, u32 first, u32 count, u64 base,
+                                 D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, u32* rows, u64* row_sizes,
+                                 u64* total);

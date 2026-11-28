@@ -185,6 +185,10 @@ static HRESULT WINAPI fence_signal(ConsoleFence* self, UINT64 value) {
     return self->desktop->Signal(value);
 }
 
+HRESULT console_fence_signal_cpu(ConsoleFence* fence, u64 value) {
+    return fence_signal(fence, value);
+}
+
 static D3D12_FENCE_FLAGS WINAPI fence_get_creation_flags(ConsoleFence* self) {
     return self->desktop->GetCreationFlags();
 }

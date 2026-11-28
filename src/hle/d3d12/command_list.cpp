@@ -971,6 +971,21 @@ void console_command_list_init() {
         o15.TriangleFanSupported;
 }
 
+HRESULT console_create_closed_command_list(ConsoleDevice* device, D3D12_COMMAND_LIST_TYPE type, REFIID iid,
+                                           void** out) {
+    if (type > D3D12_COMMAND_LIST_TYPE_COPY) {
+        LOG_E("d3d12", "CreateCommandList1: list type %d not supported yet", type);
+        return E_NOTIMPL;
+    }
+    // No segment until the first Reset brings an allocator to record on.
+    ConsoleCommandList* list =
+        (ConsoleCommandList*)console_alloc(sizeof(ConsoleCommandList), &k_list_class, g_list_table, nullptr);
+    list->type = type;
+    list->device = device->desktop;
+    list->submitted_slot = GPU_NO_QUEUE;
+    return console_return(list, iid, out);
+}
+
 HRESULT console_create_command_list(ConsoleDevice* device, const ConsoleCommandListDesc* desc,
                                     ConsoleCommandAllocator* allocator, void* initial_state, REFIID iid,
                                     void** out) {

@@ -294,6 +294,10 @@ static void resource_destroy(void* object) {
 
 // --- entries -----------------------------------------------------------------------------------------
 
+D3D12_RESOURCE_DESC console_desc0_from_desc1(const D3D12_RESOURCE_DESC1& d) {
+    return desc0_from_desc1(d);
+}
+
 static D3D12_RESOURCE_DESC desc0_from_desc1(const D3D12_RESOURCE_DESC1& d) {
     D3D12_RESOURCE_DESC r;
     r.Dimension = d.Dimension;
@@ -368,13 +372,34 @@ static D3D12_RESOURCE_DESC1* WINAPI resource_get_desc1(D3D12_RESOURCE_DESC1* ret
     return ret;
 }
 
+// The console debug layer's checks for the resource: kept for the title to read back.
+static UINT WINAPI resource_get_validation_flags_x(ConsoleResource* self) {
+    return self->validation_flags;
+}
+
+static void WINAPI resource_set_validation_flags_x(ConsoleResource* self, UINT flags) {
+    self->validation_flags = flags;
+}
+
+// Console titles have no protected content: no resource belongs to a protected session.
+static HRESULT WINAPI resource_get_protected_resource_session(ConsoleResource*, REFIID, void** out) {
+    if (out)
+        *out = nullptr;
+    return DXGI_ERROR_NOT_FOUND;
+}
+
 static const ConsoleEntry k_resource_impl[] = {
     CONSOLE_ENTRY(8, resource_map),
     CONSOLE_ENTRY(9, resource_unmap),
     CONSOLE_ENTRY(10, resource_get_desc),
     CONSOLE_ENTRY(11, resource_get_gpu_virtual_address),
+    CONSOLE_ENTRY(12, console_resource_write_to_subresource),
+    CONSOLE_ENTRY(13, console_resource_read_from_subresource),
     CONSOLE_ENTRY(14, resource_get_heap_properties),
     CONSOLE_ENTRY(15, resource_get_placement_desc_x),
+    CONSOLE_ENTRY(16, resource_get_validation_flags_x),
+    CONSOLE_ENTRY(17, resource_set_validation_flags_x),
+    CONSOLE_ENTRY(18, resource_get_protected_resource_session),
     CONSOLE_ENTRY(19, resource_get_desc1),
 };
 

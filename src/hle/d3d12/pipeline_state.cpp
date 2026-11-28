@@ -69,9 +69,63 @@ static void pipeline_state_destroy(void* object) {
 
 static void load_known_variants();
 
+// --- entries -----------------------------------------------------------------------------------------
+//
+// Pipelines are console shader programs translated into desktop pipelines made per draw formats, so
+// there is no one desktop pipeline to describe or cache, and the console programs stay as the title
+// gave them. These entries report that they can't, which titles treat as for any optional feature.
+
+// Cached blobs serve the driver that made them: a desktop pipeline's would be no use to a console title.
+static HRESULT WINAPI pipeline_get_cached_blob(ConsolePipelineState*, void** blob) {
+    if (blob)
+        *blob = nullptr;
+    LOG_W_ONCE("d3d12", "GetCachedBlob: pipeline caching is done by sludgemu's shader cache; no blob");
+    return DXGI_ERROR_UNSUPPORTED;
+}
+
+// The descriptions the pipeline was made from aren't kept (only what translation needs).
+static HRESULT WINAPI pipeline_get_graphics_desc(ConsolePipelineState*, void*, void*, UINT, void*, void*) {
+    LOG_W_ONCE("d3d12", "GetGraphicsDesc: pipeline descriptions aren't kept; refused");
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI pipeline_get_compute_desc(ConsolePipelineState*, void*, void*, UINT) {
+    LOG_W_ONCE("d3d12", "GetComputeDesc: pipeline descriptions aren't kept; refused");
+    return E_NOTIMPL;
+}
+
+// Console compiler and hardware details of the pipeline (register use, packets).
+static HRESULT WINAPI pipeline_get_information_x(ConsolePipelineState*, UINT, UINT64, void** blob) {
+    if (blob)
+        *blob = nullptr;
+    LOG_W_ONCE("d3d12", "GetInformationX: console pipeline details don't exist for translated pipelines");
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI pipeline_set_option_x(ConsolePipelineState*, UINT type, UINT64, UINT, const void*) {
+    LOG_W_ONCE("d3d12", "SetOptionX(%u): console pipeline options aren't supported; ignored", type);
+    return E_NOTIMPL;
+}
+
+// Replacing a pipeline's shader code would need its programs translated again; draws keep the code
+// the pipeline was made with.
+static HRESULT WINAPI pipeline_patch_shaders_x(ConsolePipelineState*, const void*, const void*, const void*,
+                                               const void*, const void*, const void*, const void*,
+                                               const void*) {
+    LOG_W_ONCE("d3d12", "PatchShadersX: patched shader code isn't translated; the pipeline keeps its code");
+    return E_NOTIMPL;
+}
+
+static const ConsoleEntry k_pipeline_state_impl[] = {
+    CONSOLE_ENTRY(8, pipeline_get_cached_blob),   CONSOLE_ENTRY(9, pipeline_get_graphics_desc),
+    CONSOLE_ENTRY(10, pipeline_get_compute_desc), CONSOLE_ENTRY(11, pipeline_get_information_x),
+    CONSOLE_ENTRY(12, pipeline_set_option_x),     CONSOLE_ENTRY(13, pipeline_patch_shaders_x),
+};
+
 void console_pipeline_state_init() {
     g_pipeline_state_table = console_build_table("ID3D12PipelineState", k_pipeline_state_entries,
-                                                 ARRAY_COUNT(k_pipeline_state_entries), nullptr, 0);
+                                                 ARRAY_COUNT(k_pipeline_state_entries), k_pipeline_state_impl,
+                                                 ARRAY_COUNT(k_pipeline_state_impl));
     g_device = gpu_device(); // opens the shader cache, which holds the variants drawn before
     load_known_variants();
 }
@@ -558,15 +612,9 @@ static bool request_stream_programs(ConsolePipelineState* pso, const StreamPipel
     return pso->programs[0] != nullptr;
 }
 
-HRESULT console_create_pipeline_state(ConsoleDevice*, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
-                                      REFIID iid, void** out) {
-    if (!desc || !desc->pPipelineStateSubobjectStream)
-        return E_INVALIDARG;
-    if (!out)
-        return E_POINTER;
-    StreamPipeline sp;
-    const char* why = nullptr;
-    bool readable = read_stream(desc, &sp, &why);
+// A graphics pipeline from shader containers and fixed state, read from a stream or a description.
+static HRESULT create_stream_pipeline(const StreamPipeline& sp, bool readable, const char* why, REFIID iid,
+                                      void** out) {
     ConsolePipelineState* pso = new_pipeline_state(false, readable ? sp.root_signature : nullptr, nullptr, 0);
     if (readable) {
         pso->fixed = sp.fixed;
@@ -581,6 +629,51 @@ HRESULT console_create_pipeline_state(ConsoleDevice*, const D3D12_PIPELINE_STATE
               "pipeline state %p from a state stream is not translated (%s); draws with it are skipped",
               (void*)pso, why ? why : "unknown");
     return console_return(pso, iid, out);
+}
+
+HRESULT console_create_pipeline_state(ConsoleDevice*, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+                                      REFIID iid, void** out) {
+    if (!desc || !desc->pPipelineStateSubobjectStream)
+        return E_INVALIDARG;
+    if (!out)
+        return E_POINTER;
+    StreamPipeline sp;
+    const char* why = nullptr;
+    bool readable = read_stream(desc, &sp, &why);
+    return create_stream_pipeline(sp, readable, why, iid, out);
+}
+
+// The description holds what a stream would: the same translation.
+HRESULT console_create_graphics_pipeline_state(ConsoleDevice*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+                                               REFIID iid, void** out) {
+    if (!desc)
+        return E_INVALIDARG;
+    if (!out)
+        return E_POINTER;
+    StreamPipeline sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.root_signature = (ConsoleRootSignature*)desc->pRootSignature;
+    sp.vs = desc->VS;
+    sp.ps = desc->PS;
+    sp.layout = desc->InputLayout;
+    default_fixed_state(&sp.fixed);
+    sp.fixed.blend = desc->BlendState;
+    sp.fixed.sample_mask = desc->SampleMask;
+    sp.fixed.rasterizer = desc->RasterizerState;
+    sp.fixed.depth_stencil = desc->DepthStencilState;
+    input_layout(desc->InputLayout, &sp.fixed);
+    sp.fixed.strip_cut = desc->IBStripCutValue;
+    sp.fixed.topology_type = desc->PrimitiveTopologyType;
+    const char* why = nullptr;
+    bool readable = true;
+    if (desc->GS.BytecodeLength || desc->HS.BytecodeLength || desc->DS.BytecodeLength) {
+        why = "tessellation or geometry stages";
+        readable = false;
+    } else if (!desc->VS.pShaderBytecode || !desc->VS.BytecodeLength) {
+        why = "no vertex shader";
+        readable = false;
+    }
+    return create_stream_pipeline(sp, readable, why, iid, out);
 }
 
 HRESULT console_create_compute_pipeline_state(ConsoleDevice*, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,

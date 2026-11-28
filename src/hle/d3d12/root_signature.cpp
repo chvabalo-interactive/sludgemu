@@ -163,9 +163,24 @@ ID3D12RootSignature* console_root_signature_desktop(ConsoleRootSignature* rs, co
     return desktop;
 }
 
+// The hardware descriptor of a compute root signature, which titles put into indirect dispatch
+// arguments. Translated signatures have no console hardware form; indirect work is translated from the
+// console objects instead.
+static HRESULT WINAPI root_signature_get_compute_descriptor_x(ConsoleRootSignature*, void*, UINT* size) {
+    if (size)
+        *size = 0;
+    LOG_W_ONCE("d3d12", "GetComputeDescriptorX: root signatures have no console hardware form here; refused");
+    return E_NOTIMPL;
+}
+
+static const ConsoleEntry k_root_signature_impl[] = {
+    CONSOLE_ENTRY(8, root_signature_get_compute_descriptor_x),
+};
+
 void console_root_signature_init() {
     g_root_signature_table = console_build_table("ID3D12RootSignature", k_root_signature_entries,
-                                                 ARRAY_COUNT(k_root_signature_entries), nullptr, 0);
+                                                 ARRAY_COUNT(k_root_signature_entries), k_root_signature_impl,
+                                                 ARRAY_COUNT(k_root_signature_impl));
     ID3D12Device13* device = gpu_device();
     D3D12_FEATURE_DATA_D3D12_OPTIONS19 o19 = {};
     if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &o19, sizeof(o19))))

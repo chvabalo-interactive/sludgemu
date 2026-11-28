@@ -854,6 +854,11 @@ static void unsupported_placed_texture_view(const char* kind) {
               kind);
 }
 
+u64 console_view_location_x(const void* desc, bool unordered_access) {
+    return unordered_access ? ((const ConsoleUavDescX*)desc)->location
+                            : ((const ConsoleSrvDescX*)desc)->location;
+}
+
 void WINAPI device_create_placed_raw_srv_x(ConsoleDevice* self, const D3D12_RESOURCE_DESC* resource_desc,
                                            const ConsoleSrvDescX* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     DescriptorSlot slot;

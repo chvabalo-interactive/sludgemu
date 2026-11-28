@@ -2,6 +2,8 @@
 
 #include "hle/d3d12/command_args.h"
 
+#include "gpu/formats.h"
+
 u32 console_copy_flags_unsupported(u32 flags) {
     return flags & ~CONSOLE_COPY_FLAGS_METADATA;
 }
@@ -77,4 +79,100 @@ u32 console_sample_positions(const ConsoleSampleLocations& in, u32 samples, D3D1
         }
     }
     return pixels;
+}
+
+// Depth-stencil formats copy as two planes: depth, then stencil.
+static bool depth_stencil_planes(DXGI_FORMAT f, DXGI_FORMAT* depth) {
+    switch (f) {
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+        *depth = DXGI_FORMAT_R32_TYPELESS;
+        return true;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24G8_TYPELESS:
+        *depth = DXGI_FORMAT_R24G8_TYPELESS;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static u32 full_mip_count(const D3D12_RESOURCE_DESC1& d) {
+    u64 size = d.Width > d.Height ? d.Width : d.Height;
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && d.DepthOrArraySize > size)
+        size = d.DepthOrArraySize;
+    u32 mips = 1;
+    while (size > 1) {
+        size >>= 1;
+        mips++;
+    }
+    return mips;
+}
+
+bool console_copyable_footprints(const D3D12_RESOURCE_DESC1& d, u32 first, u32 count, u64 base,
+                                 D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, u32* rows, u64* row_sizes,
+                                 u64* total) {
+    if (total)
+        *total = UINT64_MAX;
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (first != 0 || count != 1)
+            return false;
+        if (layouts)
+            layouts[0] = {ALIGN_UP(base, (u64)D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT),
+                          {DXGI_FORMAT_UNKNOWN, (UINT)d.Width, 1, 1,
+                           (UINT)ALIGN_UP(d.Width, (u64)D3D12_TEXTURE_DATA_PITCH_ALIGNMENT)}};
+        if (rows)
+            rows[0] = 1;
+        if (row_sizes)
+            row_sizes[0] = d.Width;
+        if (total)
+            *total = d.Width;
+        return true;
+    }
+    FormatInfo f = format_info(d.Format);
+    if (f.kind == FORMAT_KIND_UNKNOWN || !f.bytes_per_element)
+        return false;
+    DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
+    u32 planes = depth_stencil_planes(d.Format, &depth_format) ? 2 : 1;
+    u32 mips = d.MipLevels ? d.MipLevels : full_mip_count(d);
+    u32 slices = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : d.DepthOrArraySize;
+    if ((u64)first + count > (u64)mips * slices * planes)
+        return false;
+    u64 offset = 0; // from base, before alignment
+    u64 end = 0;
+    for (u32 i = 0; i < count; i++) {
+        u32 s = first + i;
+        u32 mip = s % mips, plane = s / (mips * slices);
+        DXGI_FORMAT format = d.Format;
+        u32 bpe = f.bytes_per_element, bw = f.block_width ? f.block_width : 1,
+            bh = f.block_height ? f.block_height : 1;
+        if (planes == 2) {
+            format = plane == 0 ? depth_format : DXGI_FORMAT_R8_TYPELESS;
+            bpe = plane == 0 ? 4 : 1;
+            bw = bh = 1;
+        }
+        u64 w = d.Width >> mip ? d.Width >> mip : 1;
+        u32 h = d.Height >> mip ? d.Height >> mip : 1;
+        u32 depth = 1;
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            depth = d.DepthOrArraySize >> mip ? d.DepthOrArraySize >> mip : 1;
+        u64 row_size = (w + bw - 1) / bw * bpe;
+        u32 row_count = (h + bh - 1) / bh;
+        u64 pitch = ALIGN_UP(row_size, (u64)D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        offset = ALIGN_UP(base + offset, (u64)D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) - base;
+        if (layouts)
+            layouts[i] = {
+                base + offset,
+                {format, (UINT)ALIGN_UP(w, (u64)bw), (UINT)ALIGN_UP((u64)h, (u64)bh), depth, (UINT)pitch}};
+        if (rows)
+            rows[i] = row_count;
+        if (row_sizes)
+            row_sizes[i] = row_size;
+        // The last row of the last slice takes only its own bytes.
+        end = offset + pitch * ((u64)row_count * depth - 1) + row_size;
+        offset += pitch * row_count * depth;
+    }
+    if (total)
+        *total = end;
+    return true;
 }

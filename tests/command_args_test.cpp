@@ -89,10 +89,59 @@ static void test_sample_positions() {
     CHECK(out[1 * 4 + 2].X == -6 && out[1 * 4 + 2].Y == 2);
 }
 
+static D3D12_RESOURCE_DESC1 texture_desc(D3D12_RESOURCE_DIMENSION dim, u64 w, u32 h, u16 depth, u16 mips,
+                                         DXGI_FORMAT format) {
+    D3D12_RESOURCE_DESC1 d = {};
+    d.Dimension = dim;
+    d.Width = w;
+    d.Height = h;
+    d.DepthOrArraySize = depth;
+    d.MipLevels = mips;
+    d.Format = format;
+    d.SampleDesc.Count = 1;
+    return d;
+}
+
+static void test_copyable_footprints() {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT f[16];
+    u32 rows[16];
+    u64 row_sizes[16], total = 0;
+    // RGBA8 100x30, 3 mips: rows pitch-aligned to 256, subresources to 512.
+    D3D12_RESOURCE_DESC1 d =
+        texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 100, 30, 1, 3, DXGI_FORMAT_R8G8B8A8_UNORM);
+    CHECK(console_copyable_footprints(d, 0, 3, 0, f, rows, row_sizes, &total));
+    CHECK(f[0].Offset == 0 && f[0].Footprint.Width == 100 && f[0].Footprint.Height == 30);
+    CHECK(f[0].Footprint.RowPitch == 512 && rows[0] == 30 && row_sizes[0] == 400);
+    CHECK(f[1].Offset == 15360 && f[1].Footprint.Width == 50 && f[1].Footprint.RowPitch == 256 &&
+          rows[1] == 15);
+    CHECK(f[2].Offset == 19456 && f[2].Footprint.Width == 25 && rows[2] == 7);
+    CHECK(total == 19456 + 256 * 6 + 100);
+    // Block compressed: footprints in whole blocks, rows of blocks.
+    d = texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 10, 10, 1, 1, DXGI_FORMAT_BC1_UNORM);
+    CHECK(console_copyable_footprints(d, 0, 1, 1024, f, rows, row_sizes, &total));
+    CHECK(f[0].Offset == 1024 && f[0].Footprint.Width == 12 && f[0].Footprint.Height == 12);
+    CHECK(rows[0] == 3 && row_sizes[0] == 24 && total == 256 * 2 + 24);
+    // Depth-stencil: the depth plane, then the stencil plane.
+    d = texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 64, 1, 1, DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+    CHECK(console_copyable_footprints(d, 0, 2, 0, f, rows, row_sizes, &total));
+    CHECK(f[0].Footprint.Format == DXGI_FORMAT_R32_TYPELESS && row_sizes[0] == 256);
+    CHECK(f[1].Footprint.Format == DXGI_FORMAT_R8_TYPELESS && row_sizes[1] == 64 && f[1].Offset == 256 * 64);
+    CHECK(!console_copyable_footprints(d, 1, 2, 0, f, rows, row_sizes, &total)); // past the planes
+    // Volumes: depth slices one after another.
+    d = texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 16, 16, 4, 1, DXGI_FORMAT_R32_FLOAT);
+    CHECK(console_copyable_footprints(d, 0, 1, 0, f, rows, row_sizes, &total));
+    CHECK(f[0].Footprint.Depth == 4 && total == 256 * (16 * 4 - 1) + 64);
+    // Buffers: one subresource of the buffer's bytes.
+    d = texture_desc(D3D12_RESOURCE_DIMENSION_BUFFER, 1000, 1, 1, 1, DXGI_FORMAT_UNKNOWN);
+    CHECK(console_copyable_footprints(d, 0, 1, 0, f, rows, row_sizes, &total));
+    CHECK(total == 1000 && f[0].Footprint.Width == 1000 && rows[0] == 1);
+}
+
 void test_command_args() {
     test_copy_flags();
     test_quad_sample_mask();
     test_shading_rates();
     test_shading_rate_settings();
     test_sample_positions();
+    test_copyable_footprints();
 }

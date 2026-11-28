@@ -79,6 +79,8 @@ struct ConsoleFence {
 
 // The fence whose value lives at `address`, or nullptr.
 ConsoleFence* console_fence_at(u64 address);
+// Sets a fence's value from the CPU, as its Signal entry does.
+HRESULT console_fence_signal_cpu(ConsoleFence* fence, u64 value);
 
 // The desktop fence that follows the 64-bit counter at title GPU address `address`: a console
 // fence's own, or one made on first use for memory the title writes and waits on from the GPU.
@@ -344,9 +346,19 @@ struct ConsoleResource {
     // the mips they have loaded: the memory of those before (larger mips, last in console layouts) belongs
     // to other textures, so it takes no tiles (texture_sync).
     volatile u32 view_first_mip; // 0xFFFFFFFF until a view (0 for textures the title made itself)
+    u32 validation_flags;        // what the console debug layer checks for it: kept, nothing checks
 };
 
 void console_resource_init();
+
+// CPU access to a texture's memory in the console layout (resource_cpu.cpp): the WriteToSubresource and
+// ReadFromSubresource entries.
+HRESULT WINAPI console_resource_write_to_subresource(ConsoleResource* self, UINT subresource,
+                                                     const D3D12_BOX* box, const void* data, UINT row_pitch,
+                                                     UINT depth_pitch);
+HRESULT WINAPI console_resource_read_from_subresource(ConsoleResource* self, void* data, UINT row_pitch,
+                                                      UINT depth_pitch, UINT subresource,
+                                                      const D3D12_BOX* box);
 
 HRESULT console_create_placed_resource(ConsoleDevice* device, u64 gpu_address,
                                        const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT initial_layout,
@@ -363,6 +375,29 @@ HRESULT console_create_committed_resource(ConsoleDevice* device, const D3D12_HEA
                                           D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC1* desc,
                                           D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE* clear,
                                           REFIID iid, void** out);
+
+// The version-0 description of a resource (the console API hands out both).
+D3D12_RESOURCE_DESC console_desc0_from_desc1(const D3D12_RESOURCE_DESC1& desc);
+
+// A heap: title memory the runtime allocates for placed resources (heap.cpp).
+struct ConsoleHeap {
+    ConsoleObjectHeader header;
+
+    D3D12_HEAP_DESC desc; // size and alignment as allocated
+    void* memory;
+    u64 attributes; // of the allocation (xmem)
+};
+
+void console_heap_init();
+HRESULT console_create_heap(ConsoleDevice* device, const D3D12_HEAP_DESC* desc, REFIID iid, void** out);
+// A resource placed in a heap: a resource at the heap's address plus `offset`.
+HRESULT console_create_heap_resource(ConsoleDevice* device, ConsoleHeap* heap, u64 offset,
+                                     const D3D12_RESOURCE_DESC1* desc, D3D12_BARRIER_LAYOUT layout,
+                                     const D3D12_CLEAR_VALUE* clear, REFIID iid, void** out);
+
+// A command list created closed, without an allocator: the title's first Reset gives it one.
+HRESULT console_create_closed_command_list(ConsoleDevice* device, D3D12_COMMAND_LIST_TYPE type, REFIID iid,
+                                           void** out);
 
 // Titles also describe textures by a description and an address alone, in views of placed memory
 // (the console runtime only writes the hardware descriptor). Such a texture gets a resource of ours,
@@ -677,6 +712,9 @@ struct ConsolePipelineState {
 
 void console_pipeline_state_init();
 
+HRESULT console_create_graphics_pipeline_state(ConsoleDevice* device,
+                                               const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID iid,
+                                               void** out);
 HRESULT console_create_pipeline_state(ConsoleDevice* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
                                       REFIID iid, void** out);
 HRESULT console_create_compute_pipeline_state(ConsoleDevice* device,

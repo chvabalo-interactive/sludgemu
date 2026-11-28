@@ -257,6 +257,19 @@ static HRESULT WINAPI queue_wait(ConsoleCommandQueue* self, ConsoleFence* fence,
     return fence ? self->desktop->Wait(fence->desktop, value) : E_INVALIDARG;
 }
 
+// The sync parameters pick console caches to flush and pipeline points to wait at around the signal;
+// a desktop signal comes after all earlier work and sees all its writes.
+static HRESULT WINAPI queue_signal_2x(ConsoleCommandQueue* self, ConsoleFence* fence, UINT64 value,
+                                      const void*, const void*) {
+    return queue_signal(self, fence, value);
+}
+
+// Likewise for the work after a wait: desktop waits hold back all of it.
+static HRESULT WINAPI queue_wait_x(ConsoleCommandQueue* self, ConsoleFence* fence, UINT64 value,
+                                   const void*) {
+    return queue_wait(self, fence, value);
+}
+
 static void WINAPI queue_set_marker(ConsoleCommandQueue* self, UINT metadata, const void* data, UINT size) {
     self->desktop->SetMarker(metadata, data, size);
 }
@@ -344,6 +357,59 @@ static HRESULT WINAPI queue_present_x(ConsoleCommandQueue* self, UINT plane_coun
 // Work is submitted as it arrives, so there is nothing to kick off.
 static void WINAPI queue_kickoff_x(ConsoleCommandQueue*) {}
 
+// Titles suspend their queues while the console suspends them; desktop processes keep running, and the
+// queue simply has no work meanwhile.
+static HRESULT WINAPI queue_suspend_x(ConsoleCommandQueue*, UINT) {
+    return S_OK;
+}
+
+static HRESULT WINAPI queue_resume_x(ConsoleCommandQueue*) {
+    return S_OK;
+}
+
+// Titles managing GPU page mappings themselves flush the GPU's address translation caches; desktop
+// tile mappings take effect in queue order without that.
+static void WINAPI queue_invalidate_graphics_tlb_x(ConsoleCommandQueue*) {}
+
+// The display hardware's HDR tone mapping table. Presentation shows SDR (see queue_present_x), so the
+// table has nothing to apply to.
+static HRESULT WINAPI queue_set_hdr_tone_mapper_x(ConsoleCommandQueue*, void* tone_mapper) {
+    if (tone_mapper)
+        LOG_W_ONCE("present", "SetHDRToneMapperX: HDR output isn't supported; the tone mapper is ignored");
+    return S_OK;
+}
+
+// Markers for the console's own capture tools; desktop debuggers see the PIX events.
+static void WINAPI queue_insert_gpu_marker(ConsoleCommandQueue*, UINT8, const void*, UINT) {}
+static void WINAPI queue_insert_timing_marker(ConsoleCommandQueue*, UINT8) {}
+
+// Captures the console's GPU capture tool takes on the title's request: desktop captures are taken with
+// desktop tools (RenderDoc, PIX on Windows) instead.
+static HRESULT WINAPI queue_pix_capture(ConsoleCommandQueue*, UINT, LPCWSTR) {
+    LOG_W_ONCE("d3d12", "GPU captures requested by the title aren't supported; use a desktop capture tool");
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI queue_pix_end_capture(ConsoleCommandQueue*) {
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI queue_enable_live_debugging_x(ConsoleCommandQueue*, void*) {
+    return S_OK;
+}
+
+// Tile mappings of reserved resources: titles can't create reserved resources here (CreateReservedResource
+// fails), so there is nothing to map. Console titles map memory with page mappings (CopyPageMappingsX).
+static void WINAPI queue_update_tile_mappings(ConsoleCommandQueue*, void*, UINT, const void*, const void*,
+                                              void*, UINT, const void*, const void*, const void*, UINT) {
+    LOG_W_ONCE("d3d12", "UpdateTileMappings: reserved resources aren't supported; ignored");
+}
+
+static void WINAPI queue_copy_tile_mappings(ConsoleCommandQueue*, void*, const void*, void*, const void*,
+                                            const void*, UINT) {
+    LOG_W_ONCE("d3d12", "CopyTileMappings: reserved resources aren't supported; ignored");
+}
+
 static HRESULT WINAPI queue_get_timestamp_frequency(ConsoleCommandQueue* self, UINT64* frequency) {
     return self->desktop->GetTimestampFrequency(frequency);
 }
@@ -357,7 +423,21 @@ static void WINAPI queue_get_desc(ConsoleCommandQueue* self, D3D12_COMMAND_QUEUE
 }
 
 static const ConsoleEntry k_queue_impl[] = {
+    CONSOLE_ENTRY(8, queue_update_tile_mappings),
+    CONSOLE_ENTRY(9, queue_copy_tile_mappings),
     CONSOLE_ENTRY(10, queue_execute_command_lists),
+    CONSOLE_ENTRY(14, queue_insert_gpu_marker),
+    CONSOLE_ENTRY(15, queue_insert_timing_marker),
+    CONSOLE_ENTRY(20, queue_pix_capture),
+    CONSOLE_ENTRY(21, queue_pix_capture),
+    CONSOLE_ENTRY(22, queue_pix_end_capture),
+    CONSOLE_ENTRY(23, queue_suspend_x),
+    CONSOLE_ENTRY(24, queue_resume_x),
+    CONSOLE_ENTRY(26, queue_invalidate_graphics_tlb_x),
+    CONSOLE_ENTRY(33, queue_set_hdr_tone_mapper_x),
+    CONSOLE_ENTRY(34, queue_signal_2x),
+    CONSOLE_ENTRY(36, queue_enable_live_debugging_x),
+    CONSOLE_ENTRY(37, queue_wait_x),
     CONSOLE_ENTRY(11, queue_set_marker),
     CONSOLE_ENTRY(12, queue_begin_event),
     CONSOLE_ENTRY(13, queue_end_event),
