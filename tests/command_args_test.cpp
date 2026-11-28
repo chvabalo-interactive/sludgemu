@@ -141,7 +141,9 @@ static void test_copyable_footprints() {
     d = texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 64, 1, 1, DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
     CHECK(console_copyable_footprints(d, 0, 2, 0, f, rows, row_sizes, &total));
     CHECK(f[0].Footprint.Format == DXGI_FORMAT_R32_TYPELESS && row_sizes[0] == 256);
-    CHECK(f[1].Footprint.Format == DXGI_FORMAT_R8_TYPELESS && row_sizes[1] == 64 && f[1].Offset == 256 * 64);
+    CHECK(f[0].Footprint.RowPitch == 512); // planar rows: twice the pitch alignment
+    CHECK(f[1].Footprint.Format == DXGI_FORMAT_R8_TYPELESS && row_sizes[1] == 64 && f[1].Offset == 512 * 64);
+    CHECK(f[1].Footprint.RowPitch == 512 && total == 512 * 64 + 512 * 63 + 64);
     CHECK(!console_copyable_footprints(d, 1, 2, 0, f, rows, row_sizes, &total)); // past the planes
     // Volumes: depth slices one after another.
     d = texture_desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 16, 16, 4, 1, DXGI_FORMAT_R32_FLOAT);
@@ -153,6 +155,103 @@ static void test_copyable_footprints() {
     CHECK(total == 1000 && f[0].Footprint.Width == 1000 && rows[0] == 1);
 }
 
+// The desktop runtime applies the same rules to formats both sides share: footprints must match it
+// exactly, as titles size and fill their copy buffers by them.
+static void test_copyable_footprints_match_desktop() {
+    ID3D12Device* device = nullptr;
+    if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)))) {
+        printf("copyable footprints vs desktop: skipped (no D3D12 device)\n");
+        return;
+    }
+    struct Case {
+        D3D12_RESOURCE_DIMENSION dim;
+        u64 width;
+        u32 height;
+        u16 depth;
+        u16 mips;
+        DXGI_FORMAT format;
+    };
+    const Case cases[] = {
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 100, 30, 1, 3, DXGI_FORMAT_R8G8B8A8_UNORM},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1920, 1080, 1, 0, DXGI_FORMAT_R8G8B8A8_UNORM},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 333, 17, 6, 0, DXGI_FORMAT_R16G16B16A16_FLOAT},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 10, 10, 1, 0, DXGI_FORMAT_BC1_UNORM},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1000, 600, 2, 4, DXGI_FORMAT_BC7_UNORM},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 129, 65, 1, 0, DXGI_FORMAT_BC5_SNORM},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 7, 3, 1, 0, DXGI_FORMAT_R32G32B32_FLOAT},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 640, 360, 1, 1, DXGI_FORMAT_D32_FLOAT},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 640, 360, 3, 2, DXGI_FORMAT_D32_FLOAT_S8X24_UINT},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 300, 200, 1, 1, DXGI_FORMAT_D24_UNORM_S8_UINT},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 100, 10, 2, 1, DXGI_FORMAT_R24G8_TYPELESS},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 64, 1, 0, DXGI_FORMAT_R32G8X24_TYPELESS},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 100, 10, 1, 1, DXGI_FORMAT_D16_UNORM},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE1D, 4000, 1, 5, 0, DXGI_FORMAT_R8_UNORM},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE3D, 64, 32, 20, 0, DXGI_FORMAT_R32_FLOAT},
+        {D3D12_RESOURCE_DIMENSION_TEXTURE3D, 17, 9, 5, 0, DXGI_FORMAT_BC4_UNORM},
+        {D3D12_RESOURCE_DIMENSION_BUFFER, 1000, 1, 1, 1, DXGI_FORMAT_UNKNOWN},
+    };
+    const u64 bases[] = {0, 1536};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT ours[256], theirs[256];
+    u32 our_rows[256], their_rows[256];
+    u64 our_sizes[256], their_sizes[256];
+    for (u32 c = 0; c < ARRAY_COUNT(cases); c++) {
+        const Case& k = cases[c];
+        D3D12_RESOURCE_DESC1 d1 = texture_desc(k.dim, k.width, k.height, k.depth, k.mips, k.format);
+        if (k.dim == D3D12_RESOURCE_DIMENSION_BUFFER)
+            d1.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_RESOURCE_DESC d = {d1.Dimension, 0,         d1.Width,      d1.Height, d1.DepthOrArraySize,
+                                 d1.MipLevels, d1.Format, d1.SampleDesc, d1.Layout, d1.Flags};
+        // How many subresources there are: as many as desktop gives footprints for. Then the whole
+        // resource, and its last subresource alone.
+        u64 their_total;
+        u32 count = 0;
+        for (u32 n = 1; n <= ARRAY_COUNT(theirs); n++) {
+            their_total = UINT64_MAX;
+            device->GetCopyableFootprints(&d, 0, n, 0, nullptr, nullptr, nullptr, &their_total);
+            if (their_total == UINT64_MAX)
+                break;
+            count = n;
+        }
+        CHECK(count > 0);
+        for (u32 b = 0; b < ARRAY_COUNT(bases); b++) {
+            for (u32 first = 0; first < count; first += count > 1 ? count - 1 : 1) {
+                u32 n = count - first;
+                u64 our_total = 0;
+                their_total = 0;
+                device->GetCopyableFootprints(&d, first, n, bases[b], theirs, their_rows, their_sizes,
+                                              &their_total);
+                bool ok = console_copyable_footprints(d1, first, n, bases[b], ours, our_rows, our_sizes,
+                                                      &our_total);
+                CHECK(ok && our_total == their_total);
+                if (!ok || our_total != their_total)
+                    printf("  case %u (format %d), base %llu, first %u: total %llu, desktop %llu\n", c,
+                           k.format, (unsigned long long)bases[b], first, (unsigned long long)our_total,
+                           (unsigned long long)their_total);
+                for (u32 i = 0; ok && i < n; i++) {
+                    // Field by field: the footprint struct has padding.
+                    const D3D12_SUBRESOURCE_FOOTPRINT& o = ours[i].Footprint;
+                    const D3D12_SUBRESOURCE_FOOTPRINT& t = theirs[i].Footprint;
+                    bool same = ours[i].Offset == theirs[i].Offset && o.Format == t.Format &&
+                                o.Width == t.Width && o.Height == t.Height && o.Depth == t.Depth &&
+                                o.RowPitch == t.RowPitch && our_rows[i] == their_rows[i] &&
+                                our_sizes[i] == their_sizes[i];
+                    CHECK(same);
+                    if (!same) {
+                        printf("  case %u sub %u: ours %llu %d %ux%ux%u pitch %u rows %u size %llu; desktop "
+                               "%llu %d %ux%ux%u pitch %u rows %u size %llu\n",
+                               c, first + i, (unsigned long long)ours[i].Offset, o.Format, o.Width, o.Height,
+                               o.Depth, o.RowPitch, our_rows[i], (unsigned long long)our_sizes[i],
+                               (unsigned long long)theirs[i].Offset, t.Format, t.Width, t.Height, t.Depth,
+                               t.RowPitch, their_rows[i], (unsigned long long)their_sizes[i]);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    device->Release();
+}
+
 void test_command_args() {
     test_copy_flags();
     test_quad_sample_mask();
@@ -161,4 +260,5 @@ void test_command_args() {
     test_shading_rate_settings();
     test_sample_positions();
     test_copyable_footprints();
+    test_copyable_footprints_match_desktop();
 }

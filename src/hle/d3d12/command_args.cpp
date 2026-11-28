@@ -89,7 +89,8 @@ u32 console_sample_positions(const ConsoleSampleLocations& in, u32 samples, D3D1
     return pixels;
 }
 
-// Depth-stencil formats copy as two planes: depth, then stencil.
+// Depth-stencil formats copy as two planes: depth (32 bits per texel, whatever the depth format), then
+// stencil.
 static bool depth_stencil_planes(DXGI_FORMAT f, DXGI_FORMAT* depth) {
     switch (f) {
     case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
@@ -98,7 +99,7 @@ static bool depth_stencil_planes(DXGI_FORMAT f, DXGI_FORMAT* depth) {
         return true;
     case DXGI_FORMAT_D24_UNORM_S8_UINT:
     case DXGI_FORMAT_R24G8_TYPELESS:
-        *depth = DXGI_FORMAT_R24G8_TYPELESS;
+        *depth = DXGI_FORMAT_R32_TYPELESS;
         return true;
     default:
         return false;
@@ -166,7 +167,9 @@ bool console_copyable_footprints(const D3D12_RESOURCE_DESC1& d, u32 first, u32 c
             depth = d.DepthOrArraySize >> mip ? d.DepthOrArraySize >> mip : 1;
         u64 row_size = (w + bw - 1) / bw * bpe;
         u32 row_count = (h + bh - 1) / bh;
-        u64 pitch = ALIGN_UP(row_size, (u64)D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        // Rows of planar formats align to the pitch alignment once per plane, as the D3D12 runtime lays
+        // them out (test_copyable_footprints_match_desktop compares with it).
+        u64 pitch = ALIGN_UP(row_size, (u64)D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * planes);
         offset = ALIGN_UP(base + offset, (u64)D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) - base;
         if (layouts)
             layouts[i] = {

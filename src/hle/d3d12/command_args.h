@@ -78,7 +78,8 @@ u32 console_sample_positions(const ConsoleSampleLocations& in, u32 samples, D3D1
 // Where subresources [first, first + count) of a resource go in a buffer for copies, by the D3D12 rules
 // (rows 256-byte aligned, subresources 512-byte aligned from `base`), in the resource's own (console)
 // format: titles fill those buffers with console data, so a desktop stand-in format's sizes would be
-// wrong. Depth-stencil formats have a depth plane (4 bytes per texel) and a stencil plane (1 byte).
+// wrong. Depth-stencil formats have a depth plane (4 bytes per texel) and a stencil plane (1 byte),
+// whose rows align to twice the pitch alignment.
 // Any output may be null. False for a description without a valid format or subresource range.
 bool console_copyable_footprints(const D3D12_RESOURCE_DESC1& desc, u32 first, u32 count, u64 base,
                                  D3D12_PLACED_SUBRESOURCE_FOOTPRINT* layouts, u32* rows, u64* row_sizes,
