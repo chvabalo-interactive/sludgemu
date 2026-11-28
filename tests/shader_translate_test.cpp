@@ -1535,6 +1535,24 @@ static void test_lds_size() {
     info.lds_bytes = 65536;
     CHECK(!translate(a, info));
     CHECK(error_has("65536 bytes of LDS"));
+    {
+        // Permutes alone use no LDS memory: a program that allocates none (the size 0 the default
+        // stands in for) translates, and its waves count themselves in a variable of their own.
+        static const u32 k_permute[] = {
+            0x34020082,             // v_lshlrev_b32 v1, 2, v0
+            0xdacc0000, 0x02000001, // ds_bpermute_b32 v2, v1, v0
+            0xbf8cc07f,             // s_waitcnt lgkmcnt(0)
+            0x7e060302,             // v_mov_b32 v3, v2
+            0xbf810000,             // s_endpgm
+        };
+        ShaderInfo permute = compute_info();
+        permute.threads[0] = 128;
+        Asm b = {};
+        put_words(b, k_permute, ARRAY_COUNT(k_permute));
+        CHECK(translate(b, permute));
+        CHECK(!hlsl_has("g_lds"));
+        CHECK(hlsl_has("groupshared uint g_wave_counter;"));
+    }
 }
 
 void test_shader_translate() {

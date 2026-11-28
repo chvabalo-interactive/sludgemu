@@ -2037,7 +2037,10 @@ static bool emit_lds(Translator& t, const RdnaInst& in) {
         translator_fail(t, "GDS access at 0x%x", in.offset);
         return false;
     }
-    t.uses_lds = true;
+    // ds_bpermute_b32 goes through the LDS hardware but not the group's LDS memory: programs that only
+    // permute allocate none, and declaring the default 64 KiB for them would fail translation.
+    if (in.op != OP_DS_BPERMUTE_B32)
+        t.uses_lds = true;
     const char* addr = vgpr(t, in.src[0].reg);
     u32 off0 = (u32)in.mem.offset, off1 = in.mem.offset1;
     u32 offset = off0 | (off1 << 8);
