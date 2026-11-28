@@ -321,7 +321,7 @@ static int translate_all(const char* dir, const char* out_dir) {
             u8* code = read_file(path, &size);
             if (!code)
                 continue;
-            u64 h = hash_bytes(code, size) ^ (stage ? 0x9e3779b97f4a7c15ull : 0) | 1;
+            u64 h = (hash_bytes(code, size) ^ (stage ? 0x9e3779b97f4a7c15ull : 0)) | 1;
             u32 slot = (u32)h & 0xFFFF;
             bool fresh = true;
             while (seen[slot]) {

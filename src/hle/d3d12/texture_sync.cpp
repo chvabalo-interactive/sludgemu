@@ -130,7 +130,7 @@ bool texture_sync_tracks(const D3D12_RESOURCE_DESC1& desc) {
 
 // Console layouts store a swizzle mode; mode 0 is linear.
 static bool linear_layout(const D3D12_RESOURCE_DESC1& desc) {
-    return desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR || desc.Layout == CONSOLE_LAYOUT_SWIZZLE;
+    return desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR || (u32)desc.Layout == CONSOLE_LAYOUT_SWIZZLE;
 }
 
 bool texture_sync_tiles(const D3D12_RESOURCE_DESC1& desc) {

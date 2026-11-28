@@ -338,7 +338,7 @@ static bool iid_in(REFIID iid, const GUID* const* list, u32 count) {
 
 static const GUID* const k_file_iids[] = {&IID_ConsoleFile};
 
-class ConsoleFile : public IUnknown {
+class ConsoleFile final : public IUnknown {
   public:
     REFCOUNTED_IUNKNOWN(k_file_iids)
 
@@ -373,7 +373,7 @@ class ConsoleFile : public IUnknown {
 
 static const GUID* const k_status_iids[] = {&IID_ConsoleStatusArray};
 
-class ConsoleStatusArray : public IUnknown {
+class ConsoleStatusArray final : public IUnknown {
   public:
     REFCOUNTED_IUNKNOWN(k_status_iids)
 
@@ -413,7 +413,7 @@ struct PendingCommand {
 // when it is half full (unless the title disabled automatic submission; then a full queue stalls the
 // enqueuing thread until another one submits). What a request points at is read then: titles fill in
 // requests' page arrays between enqueueing and submitting them.
-class ConsoleQueue : public IUnknown {
+class ConsoleQueue final : public IUnknown {
   public:
     REFCOUNTED_IUNKNOWN(k_queue_iids)
 

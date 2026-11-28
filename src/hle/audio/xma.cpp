@@ -32,11 +32,12 @@ static const Field SIZE_READ0 = {0, 0, 12}, NUM_LOOPS = {0, 12, 8}, VALID_BUFFER
                    LOOP_SUBFRAME_END = {1, 12, 2}, LOOP_SUBFRAME_SKIP = {1, 17, 3},
                    SUBFRAMES_TO_DECODE = {1, 20, 4}, SUBFRAMES_TO_SKIP = {1, 24, 3}, SAMPLE_RATE = {1, 27, 2},
                    NUM_CHANNELS = {1, 29, 1}, VALID_WRITE = {1, 31, 1}, OFFSET_READ = {2, 0, 26},
-                   ERROR_STATUS = {2, 26, 5}, ERROR_SET = {2, 31, 1}, LOOP_START = {3, 0, 26},
-                   PARSER_ERROR_STATUS = {3, 26, 5}, PARSER_ERROR_SET = {3, 31, 1}, LOOP_END = {4, 0, 26},
-                   PACKET_METADATA = {4, 26, 5}, CURRENT_BUFFER = {4, 31, 1}, PTR_READ0 = {5, 0, 32},
-                   PTR_READ1 = {6, 0, 32}, PTR_WRITE = {7, 0, 32}, PTR_OVERLAP_ADD = {8, 0, 32},
-                   WRITE_BUFFER_OFFSET_READ = {9, 0, 5};
+                   LOOP_START = {3, 0, 26}, PARSER_ERROR_STATUS = {3, 26, 5}, PARSER_ERROR_SET = {3, 31, 1},
+                   LOOP_END = {4, 0, 26}, PACKET_METADATA = {4, 26, 5}, CURRENT_BUFFER = {4, 31, 1},
+                   PTR_READ0 = {5, 0, 32}, PTR_READ1 = {6, 0, 32}, PTR_WRITE = {7, 0, 32},
+                   PTR_OVERLAP_ADD = {8, 0, 32}, WRITE_BUFFER_OFFSET_READ = {9, 0, 5};
+// Word 2 bits 26..31 hold the decoder's error status (5 bits) and error set flag; decoder errors
+// are never raised, so they are not listed.
 
 static u32 get(const u32* c, Field f) {
     u32 mask = f.bits == 32 ? 0xFFFFFFFFu : (1u << f.bits) - 1;

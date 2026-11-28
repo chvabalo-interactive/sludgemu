@@ -170,9 +170,9 @@ static void image_descriptor(const D3D12_RESOURCE_DESC1& r, u64 address, const I
     u32 width = (u32)r.Width - 1;
     u32 height = r.Height ? r.Height - 1 : 0;
     out[0] = (u32)(address >> 8);
-    out[1] = (u32)(address >> 40) & 0xFFu | fixed_4_8(v.min_lod) << 8 | (f.format & 0x1FFu) << 20 |
+    out[1] = ((u32)(address >> 40) & 0xFFu) | fixed_4_8(v.min_lod) << 8 | (f.format & 0x1FFu) << 20 |
              (width & 3u) << 30;
-    out[2] = (width >> 2) & 0x3FFFu | (height & 0xFFFFu) << 14 | 1u << 31;
+    out[2] = ((width >> 2) & 0x3FFFu) | (height & 0xFFFFu) << 14 | 1u << 31;
     out[3] = (u32)select[0] | (u32)select[1] << 3 | (u32)select[2] << 6 | (u32)select[3] << 9 |
              (base_level & 15u) << 12 | (last_level & 15u) << 16 |
              (console_swizzle_mode(layout) & 0x1Fu) << 20 | border_swizzle(select) << 25 | v.type << 28;

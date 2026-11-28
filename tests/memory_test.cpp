@@ -20,7 +20,7 @@ static volatile u32 g_notifications = 0;
 static const u8* volatile g_last_notified = nullptr;
 
 static void on_mapping_changed(const u8* base, u64) {
-    g_notifications++;
+    g_notifications = g_notifications + 1;
     g_last_notified = base;
 }
 
@@ -390,10 +390,10 @@ static volatile u32 g_dropped_reports; // watches ended by other memory mapped w
 
 static void on_write(u64 base, u64 size, MemWriteKind kind) {
     if (kind == MEM_WATCH_DROPPED) {
-        g_dropped_reports++;
+        g_dropped_reports = g_dropped_reports + 1;
         return;
     }
-    g_write_reports++;
+    g_write_reports = g_write_reports + 1;
     g_write_base = base;
     g_write_size = size;
 }
@@ -554,7 +554,7 @@ static volatile u32 g_store_reports = 0;
 static volatile u64 g_store_base = 0, g_store_value = 0;
 
 static void on_store(u64 base, u64) {
-    g_store_reports++;
+    g_store_reports = g_store_reports + 1;
     g_store_base = base;
     g_store_value = *(volatile u64*)base; // the store is done when it is reported
 }
@@ -580,7 +580,7 @@ static const void* volatile g_taken_addr = nullptr;
 static volatile u8 g_taken_value = 0;
 
 static void on_taken(const void* addr) {
-    g_taken_calls++;
+    g_taken_calls = g_taken_calls + 1;
     g_taken_addr = addr;
     MemBlock block;
     if (mem_backing_block(addr, &block)) {

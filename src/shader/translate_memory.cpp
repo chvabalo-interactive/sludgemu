@@ -1029,7 +1029,7 @@ static bool emit_buffer(Translator& t, const RdnaInst& in) {
                                                                  : 1);
     bool sub_dword = (in.op >= OP_BUFFER_LOAD_UBYTE && in.op <= OP_BUFFER_LOAD_SSHORT) ||
                      (in.op >= OP_BUFFER_STORE_BYTE && in.op <= OP_BUFFER_STORE_SHORT_D16_HI) ||
-                     in.op >= OP_BUFFER_LOAD_UBYTE_D16 && in.op <= OP_BUFFER_LOAD_SHORT_D16_HI;
+                     (in.op >= OP_BUFFER_LOAD_UBYTE_D16 && in.op <= OP_BUFFER_LOAD_SHORT_D16_HI);
     if (sub_dword || (in.op >= OP_BUFFER_ATOMIC_FCMPSWAP && in.op <= OP_BUFFER_ATOMIC_FMAX)) {
         translator_fail(t, "unsupported %s", rdna_op_name(in.op));
         return false;
