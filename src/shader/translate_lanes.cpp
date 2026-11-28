@@ -495,12 +495,11 @@ static bool loads_whole_destination(const RdnaInst& in) {
     }
 }
 
-static VectorWrite vector_write(const Translator& t, const RdnaInst& in) {
+// How an instruction writes its vector destination, whatever register it is.
+static VectorWrite destination_write(const RdnaInst& in) {
     const RdnaOperand& d = in.dst[0];
     if (d.kind != OPND_VGPR)
         return WRITE_NONE;
-    if (t.spill_slot[d.reg & 255] != 0xFF)
-        return WRITE_OTHER;
     if (!is_vector_alu(in))
         return loads_whole_destination(in) ? WRITE_REPLACE : WRITE_OTHER;
     if (in.has_dpp)
@@ -528,6 +527,12 @@ static VectorWrite vector_write(const Translator& t, const RdnaInst& in) {
     if (in.has_sdwa && in.sdwa.dst_sel != SDWA_DWORD && in.sdwa.dst_unused == 2)
         return WRITE_KEEP;
     return WRITE_REPLACE;
+}
+
+static VectorWrite vector_write(const Translator& t, const RdnaInst& in) {
+    if (in.dst[0].kind == OPND_VGPR && t.spill_slot[in.dst[0].reg & 255] != 0xFF)
+        return WRITE_OTHER;
+    return destination_write(in);
 }
 
 // Reads that may see other lanes than the reader's own, or lanes outside EXEC: DPP, lane reads and
@@ -581,6 +586,10 @@ static void vector_reads(const RdnaInst& in, VectorWrite write, u8* regs) {
         mark_range(regs, in.dst[0].reg, in.dst[0].count ? in.dst[0].count : 1u);
     if (in.dst[1].kind == OPND_VGPR)
         mark_range(regs, in.dst[1].reg, in.dst[1].count ? in.dst[1].count : 1u);
+}
+
+void vector_registers_read(const RdnaInst& in, u8* regs) {
+    vector_reads(in, destination_write(in), regs);
 }
 
 // --- the analysis ------------------------------------------------------------------------------------

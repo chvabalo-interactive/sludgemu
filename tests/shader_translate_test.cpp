@@ -1385,6 +1385,205 @@ static void test_wave64_emission() {
     }
 }
 
+// --- 16-bit interpolation ------------------------------------------------------------------------------
+
+// A pixel shader with perspective center barycentrics (v0 = I, v1 = J).
+static ShaderInfo pixel_info() {
+    ShaderInfo info = {};
+    info.stage = SHADER_PIXEL;
+    info.resource_heap_sgpr = NO_HEAP_SGPR;
+    info.sampler_heap_sgpr = NO_HEAP_SGPR;
+    info.ps_input_addr = 1u << 1;
+    return info;
+}
+
+static void put_words(Asm& a, const u32* w, u32 count) {
+    for (u32 i = 0; i < count; i++)
+        a.put(w[i]);
+}
+
+// Attributes holding two 16-bit values per dword: each half is interpolated from the vertices' values
+// (the attribute is declared flat), next to an attribute interpolated as 32-bit floats as declared.
+static void test_half_interpolation() {
+    static const u32 k_program[] = {
+        0xd7420002, 0x02020043, // v_interp_p1ll_f16 v2, v0, attr3.y
+        0xd75a0002, 0x040a0243, // v_interp_p2_f16 v2, v1, attr3.y, v2
+        0xd7420003, 0x02020143, // v_interp_p1ll_f16 v3, v0, attr3.y high
+        0xd75a8003, 0x040e0343, // v_interp_p2_f16 v3, v1, attr3.y, v3 high clamp
+        0xc8101000,             // v_interp_p1_f32 v4, v0, attr4.x
+        0xc8111001,             // v_interp_p2_f32 v4, v1, attr4.x
+        0xf800180f, 0x04040302, // exp mrt0, v2, v3, v4, v4 done vm
+        0xbf810000,             // s_endpgm
+    };
+    ShaderInfo info = pixel_info();
+    {
+        Asm a = {};
+        put_words(a, k_program, ARRAY_COUNT(k_program));
+        CHECK(translate(a, info));
+        CHECK(g_out.ps_attribute_mask == ((1u << 3) | (1u << 4)));
+        CHECK(g_out.ps_mixed_mask == 1u << 3);
+        CHECK(hlsl_has("    nointerpolation float4 p3 : P3;"));
+        CHECK(hlsl_has("    float4 p4 : P4;"));
+        CHECK(hlsl_has("    float3 barycentrics : SV_Barycentrics;"));
+        CHECK(hlsl_has("#define attr3_center_half(c, s) ("
+                       "f16tof32(asuint(GetAttributeAtVertex(input.p3, 0).c) >> s) * input.barycentrics.x + "));
+        CHECK(hlsl_has("#define attr4_center input.p4"));
+        // The low half written, the high half kept; the clamp saturates.
+        CHECK(hlsl_has("((v2 & 0xffff0000u) | f32tof16(attr3_center_half(y, 0)))"));
+        CHECK(hlsl_has("((v3 & 0xffff0000u) | f32tof16(saturate(attr3_center_half(y, 16))))"));
+        CHECK(hlsl_has("asuint(attr4_center.x)"));
+    }
+    {
+        // The decoder takes the attribute from the src0 field.
+        RdnaInst in;
+        CHECK(rdna_decode(k_program, ARRAY_COUNT(k_program), 0x18, &in));
+        CHECK(in.op == OP_V_INTERP_P2_F16 && in.attr == 3 && in.attr_chan == 1 && in.attr_high && in.clamp);
+        CHECK(in.num_src == 2 && in.src[0].kind == OPND_VGPR && in.src[0].reg == 1 && in.src[1].reg == 3);
+        char text[128];
+        rdna_disassemble(in, text, sizeof(text));
+        CHECK(strstr(text, "v3, v1, attr3.y, v3 high clamp") != nullptr);
+    }
+    {
+        // P0 from a VGPR (16-bank LDS) is not folded into the second step.
+        static const u32 k_p1lv[] = {
+            0xd7430002, 0x04160043, // v_interp_p1lv_f16 v2, v0, attr3.y, v5
+            0xd75a0002, 0x040a0243, // v_interp_p2_f16 v2, v1, attr3.y, v2
+            0xf800180f, 0x02020202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xbf810000,             // s_endpgm
+        };
+        Asm a = {};
+        put_words(a, k_p1lv, ARRAY_COUNT(k_p1lv));
+        CHECK(!translate(a, info));
+        CHECK(error_has("v_interp_p1lv_f16"));
+    }
+    {
+        // A negated J changes the arithmetic the desktop interpolation does.
+        static const u32 k_negated[] = {
+            0xd7420002, 0x02020043, // v_interp_p1ll_f16 v2, v0, attr3.y
+            0xd75a0002, 0x440a0243, // v_interp_p2_f16 v2, -v1, attr3.y, v2
+            0xf800180f, 0x02020202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xbf810000,             // s_endpgm
+        };
+        Asm a = {};
+        put_words(a, k_negated, ARRAY_COUNT(k_negated));
+        CHECK(!translate(a, info));
+        CHECK(error_has("source modifiers"));
+    }
+}
+
+// --- spill VGPRs with other uses ---------------------------------------------------------------------
+
+// A wave64 pixel shader (lanes are not exact: lane writes and reads must be spills) whose spill VGPRs
+// also hold ordinary values before the first spill (v2) or after the last reload (v4).
+static void test_spills_apart() {
+    ShaderInfo info = pixel_info();
+    {
+        static const u32 k_program[] = {
+            0xbe8403f2,             // s_mov_b32 s4, 1.0
+            0xc8080000,             // v_interp_p1_f32 v2, v0, attr0.x
+            0xc8090001,             // v_interp_p2_f32 v2, v1, attr0.x
+            0x7e060302,             // v_mov_b32 v3, v2
+            0xd7610002, 0x02010a04, // v_writelane_b32 v2, s4, 5
+            0xd7610004, 0x02010e04, // v_writelane_b32 v4, s4, 7
+            0xd7600005, 0x02010b02, // v_readlane_b32 s5, v2, 5
+            0xd7600006, 0x02010f04, // v_readlane_b32 s6, v4, 7
+            0x7e080205,             // v_mov_b32 v4, s5
+            0x060a0806,             // v_add_f32 v5, s6, v4
+            0xf800180f, 0x05050403, // exp mrt0, v3, v4, v5, v5 done vm
+            0xbf810000,             // s_endpgm
+        };
+        Asm a = {};
+        put_words(a, k_program, ARRAY_COUNT(k_program));
+        CHECK(translate(a, info));
+        CHECK(hlsl_has("spill0_5 = s4;"));
+        CHECK(hlsl_has("spill1_7 = s4;"));
+        CHECK(hlsl_has("s5 = spill0_5;"));
+        CHECK(hlsl_has("s6 = spill1_7;"));
+        CHECK(hlsl_has("v3 = v2;"));
+    }
+    {
+        // Lanes a v_writelane_b32 wrote read as an ordinary value: not a spill.
+        static const u32 k_program[] = {
+            0xbe8403f2,             // s_mov_b32 s4, 1.0
+            0xd7610006, 0x02010604, // v_writelane_b32 v6, s4, 3
+            0x7e0e0306,             // v_mov_b32 v7, v6
+            0xf800180f, 0x07070707, // exp mrt0, v7, v7, v7, v7 done vm
+            0xbf810000,             // s_endpgm
+        };
+        Asm a = {};
+        put_words(a, k_program, ARRAY_COUNT(k_program));
+        CHECK(!translate(a, info));
+        CHECK(error_has("v_writelane_b32 in a wave64 program"));
+    }
+    {
+        // Sixteen registers (all slots) only lane accesses touch, and v10, a lower one with an ordinary
+        // value before its spill: the sixteen keep the slots (v35 the last), v10 goes without.
+        Asm a = {};
+        a.put(0xbe840387); // s_mov_b32 s4, 7
+        a.put(0x7e140300); // v_mov_b32 v10, v0
+        a.put(0x7e16030a); // v_mov_b32 v11, v10
+        a.put(0xd761000a); // v_writelane_b32 v10, s4, 3
+        a.put(0x02010604);
+        for (u32 r = 20; r < 36; r++) {
+            a.put(0xd7610000 | r); // v_writelane_b32 v<r>, s4, 3
+            a.put(0x02010604);
+        }
+        a.put(0xd7600005); // v_readlane_b32 s5, v10, 3
+        a.put(0x0201070a);
+        for (u32 r = 20; r < 36; r++) {
+            a.put(0xd7600005); // v_readlane_b32 s5, v<r>, 3
+            a.put(0x02010700 | r);
+        }
+        a.put(0x7e180205); // v_mov_b32 v12, s5
+        a.put(0xbf810000); // s_endpgm
+        ShaderInfo cs = compute_info();
+        cs.wave_size = 64;
+        CHECK(translate(a, cs));
+        CHECK(hlsl_has("spill15_3 = s4;"));
+        CHECK(hlsl_has("s5 = spill15_3;"));
+        CHECK(hlsl_has("s5 = WaveReadLaneAt(v10_0, 3u);")); // compute: an exact lane read instead
+        CHECK(!hlsl_has("WaveReadLaneAt(v35_0"));
+    }
+}
+
+// --- LDS ---------------------------------------------------------------------------------------------
+
+// Console groups may allocate up to 64 KiB of LDS, desktop ones 32 KiB.
+static void test_lds_size() {
+    static const u32 k_program[] = {
+        0x7e020280,             // v_mov_b32 v1, 0
+        0xd8340000, 0x00000001, // ds_write_b32 v1, v0
+        0xbf810000,             // s_endpgm
+    };
+    ShaderInfo info = compute_info();
+    Asm a = {};
+    put_words(a, k_program, ARRAY_COUNT(k_program));
+    info.lds_bytes = 32768;
+    CHECK(translate(a, info));
+    CHECK(hlsl_has("groupshared uint g_lds[8192];"));
+    info.lds_bytes = 65536;
+    CHECK(!translate(a, info));
+    CHECK(error_has("65536 bytes of LDS"));
+    {
+        // Permutes alone use no LDS memory: a program that allocates none (the size 0 the default
+        // stands in for) translates, and its waves count themselves in a variable of their own.
+        static const u32 k_permute[] = {
+            0x34020082,             // v_lshlrev_b32 v1, 2, v0
+            0xdacc0000, 0x02000001, // ds_bpermute_b32 v2, v1, v0
+            0xbf8cc07f,             // s_waitcnt lgkmcnt(0)
+            0x7e060302,             // v_mov_b32 v3, v2
+            0xbf810000,             // s_endpgm
+        };
+        ShaderInfo permute = compute_info();
+        permute.threads[0] = 128;
+        Asm b = {};
+        put_words(b, k_permute, ARRAY_COUNT(k_permute));
+        CHECK(translate(b, permute));
+        CHECK(!hlsl_has("g_lds"));
+        CHECK(hlsl_has("groupshared uint g_wave_counter;"));
+    }
+}
+
 void test_shader_translate() {
     rdna_init();
     test_constant_sampler_in_vcc();
@@ -1402,5 +1601,8 @@ void test_shader_translate() {
     test_descriptors_on_paths();
     test_descriptor_shadow_records();
     test_wave64_emission();
+    test_half_interpolation();
+    test_spills_apart();
+    test_lds_size();
     g_out.hlsl.release();
 }

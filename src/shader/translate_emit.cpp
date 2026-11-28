@@ -454,10 +454,33 @@ static Interpolation interpolation_of(const Translator& t, u32 reg) {
 static const char* const k_mode_names[8] = {"none",   "center",          "centroid",      "sample",
                                             "linear", "linear_centroid", "linear_sample", "flat"};
 
+// Attribute interpolation. The desktop interpolates the attributes as declared (see
+// write_attribute_declarations), so the first step (P1: P0 + I * P10) is folded into the second (P2:
+// + J * P20): only the final value is observable. The 16-bit forms interpolate one half of each
+// attribute dword, which holds two 16-bit values: the vertex shader packed them.
 static bool emit_interpolation(Translator& t, const RdnaInst& in) {
     if (t.info->stage != SHADER_PIXEL) {
         translator_fail(t, "interpolation outside a pixel shader");
         return false;
+    }
+    bool half = in.enc == ENC_VOP3;
+    if (half) {
+        // The P1LV form takes P0 from a VGPR (16-bank LDS): not what folding the first step assumes.
+        if (in.op == OP_V_INTERP_P1LV_F16) {
+            translator_fail(t, "v_interp_p1lv_f16 at 0x%x", in.offset);
+            return false;
+        }
+        for (u32 i = 0; i < in.num_src; i++) {
+            if (in.src[i].abs || in.src[i].neg) {
+                translator_fail(t, "%s with source modifiers at 0x%x", rdna_op_name(in.op), in.offset);
+                return false;
+            }
+        }
+        if (in.omod || in.op_sel) {
+            translator_fail(t, "%s with an output modifier or op_sel at 0x%x", rdna_op_name(in.op),
+                            in.offset);
+            return false;
+        }
     }
     Interpolation mode = INTERP_FLAT;
     if (in.op != OP_V_INTERP_MOV_F32) {
@@ -475,13 +498,24 @@ static bool emit_interpolation(Translator& t, const RdnaInst& in) {
     if (slot >= 32)
         slot = attr;
     t.attribute_modes[slot] |= (u8)(1u << mode);
+    if (half)
+        t.attribute_halves |= 1u << slot;
     t.out->ps_attribute_mask |= 1u << slot;
-    // The P1 step is folded into P2: only the final value is observable.
-    if (in.op == OP_V_INTERP_P1_F32)
+    if (in.op == OP_V_INTERP_P1_F32 || in.op == OP_V_INTERP_P1LL_F16)
         return true;
+    char chan = "xyzw"[in.attr_chan & 3];
+    if (half) {
+        // The result goes to the low half; the high half is kept.
+        const char* v =
+            fmt(t, "attr%u_%s_half(%c, %u)", slot, k_mode_names[mode], chan, in.attr_high ? 16u : 0u);
+        if (in.clamp)
+            v = fmt(t, "saturate(%s)", v);
+        const char* d = vgpr(t, in.dst[0].reg);
+        write_vgpr(t, in, in.dst[0].reg, fmt(t, "((%s & 0xffff0000u) | f32tof16(%s))", d, v));
+        return true;
+    }
     // Read through a per-mode name the declarations define (see write_attribute_declarations).
-    write_vgpr(t, in, in.dst[0].reg,
-               fmt(t, "asuint(attr%u_%s.%c)", slot, k_mode_names[mode], "xyzw"[in.attr_chan & 3]));
+    write_vgpr(t, in, in.dst[0].reg, fmt(t, "asuint(attr%u_%s.%c)", slot, k_mode_names[mode], chan));
     return true;
 }
 
@@ -602,6 +636,10 @@ static bool emit_instruction(Translator& t, const RdnaInst& in) {
         return emit_alu(t, in);
     case ENC_VINTRP:
         return emit_interpolation(t, in);
+    case ENC_VOP3:
+        if (in.op == OP_V_INTERP_P1LL_F16 || in.op == OP_V_INTERP_P1LV_F16 || in.op == OP_V_INTERP_P2_F16)
+            return emit_interpolation(t, in);
+        return emit_alu(t, in);
     case ENC_EXP:
         return emit_export(t, in);
     case ENC_SMEM:
@@ -905,7 +943,8 @@ static u32 raw_element_format(u32 components) {
 
 // Pixel shader inputs. An attribute read with one interpolation is declared with it. Console
 // shaders may also read some components flat and others interpolated (the hardware interpolates
-// per instruction); such attributes are declared flat and interpolated with the barycentrics.
+// per instruction); such attributes are declared flat and interpolated with the barycentrics. So are
+// attributes holding pairs of 16-bit values: each half is interpolated on its own.
 static bool write_attribute_declarations(Translator& t, Text& h) {
     static const PsInput k_untranslated[] = {PS_PERSP_PULL_MODEL, PS_LINE_STIPPLE, PS_ANCILLARY};
     static const char* const k_untranslated_names[] = {"pull-model interpolation", "line stipple",
@@ -920,7 +959,7 @@ static bool write_attribute_declarations(Translator& t, Text& h) {
     u8 interpolated_modes = 0; // modes mixed attributes need barycentrics for
     for (u32 i = 0; i < 32; i++) {
         u8 modes = t.attribute_modes[i];
-        if (modes & (modes - 1)) {
+        if ((modes & (modes - 1)) || (t.attribute_halves & (1u << i))) {
             t.out->ps_mixed_mask |= 1u << i;
             interpolated_modes |= (u8)(modes & ~(1u << INTERP_FLAT));
         }
@@ -938,7 +977,7 @@ static bool write_attribute_declarations(Translator& t, Text& h) {
         u8 modes = t.attribute_modes[i];
         if (!modes)
             continue;
-        bool mixed = (modes & (modes - 1)) != 0;
+        bool mixed = (t.out->ps_mixed_mask & (1u << i)) != 0;
         Interpolation single = INTERP_NONE;
         for (u32 m = 0; m < 8; m++)
             if (modes & (1u << m))
@@ -952,10 +991,17 @@ static bool write_attribute_declarations(Translator& t, Text& h) {
     h.put("    bool front_face : SV_IsFrontFace;\n};\n");
     for (u32 i = 0; i < 32; i++) {
         u8 modes = t.attribute_modes[i];
-        bool mixed = (modes & (modes - 1)) != 0;
+        bool mixed = (t.out->ps_mixed_mask & (1u << i)) != 0;
         for (u32 m = 1; m < 8; m++) {
             if (!(modes & (1u << m)))
                 continue;
+            // A 16-bit value: the half of channel c starting at bit s, as a float.
+            if ((t.attribute_halves & (1u << i)) && m != INTERP_FLAT)
+                h.put("#define attr%u_%s_half(c, s) ("
+                      "f16tof32(asuint(GetAttributeAtVertex(input.p%u, 0).c) >> s) * input.barycentrics.x + "
+                      "f16tof32(asuint(GetAttributeAtVertex(input.p%u, 1).c) >> s) * input.barycentrics.y + "
+                      "f16tof32(asuint(GetAttributeAtVertex(input.p%u, 2).c) >> s) * input.barycentrics.z)\n",
+                      i, k_mode_names[m], i, i, i);
             if (!mixed)
                 h.put("#define attr%u_%s input.p%u\n", i, k_mode_names[m], i);
             else if (m == INTERP_FLAT)
@@ -987,14 +1033,22 @@ static const char* thread_id(Translator& t, u32 axis, u32 half) {
     return tz == 1 ? "0u" : fmt(t, "(%s / %uu)", c, tx * ty);
 }
 
+// Desktop groups get 32 KiB of LDS, console ones up to 64 KiB.
 #define DESKTOP_MAX_LDS_BYTES 32768
+
+// The LDS the program's group allocates (all of it where the pipeline doesn't say), or 0 without LDS
+// accesses.
+static u32 program_lds_bytes(const Translator& t) {
+    if (!t.uses_lds)
+        return 0;
+    return t.info->lds_bytes ? t.info->lds_bytes : 65536;
+}
 
 // Compute with exact lanes (see translate.h): desktop groups of whole desktop waves of 32, one console
 // wave each. Which threads a driver puts in a wave is its business, so waves take console wave numbers
 // from a counter, and console thread IDs follow from the wave and lane.
 static void write_compute_head(Translator& t, Text& h) {
-    const ShaderInfo& info = *t.info;
-    u32 lds_bytes = t.uses_lds ? (info.lds_bytes ? info.lds_bytes : 65536) : 0;
+    u32 lds_bytes = program_lds_bytes(t);
     // Without room for the counter next to the program's LDS, its first dword holds it at the start:
     // console LDS starts undefined.
     bool borrow = lds_bytes + 4 > DESKTOP_MAX_LDS_BYTES;
@@ -1059,7 +1113,7 @@ static void write_declarations(Translator& t, Text& h) {
               t.sampler_compare & (1u << i) ? "SamplerComparisonState" : "SamplerState", i, i,
               SHADER_INLINE_SAMPLER_SPACE);
     if (t.uses_lds)
-        h.put("groupshared uint g_lds[%u];\n", (info.lds_bytes ? info.lds_bytes : 65536) / 4);
+        h.put("groupshared uint g_lds[%u];\n", program_lds_bytes(t) / 4);
     h.put("struct CbArray { uint4 c[4096]; };\n");
 
     if (info.stage == SHADER_VERTEX) {
@@ -1223,6 +1277,10 @@ void emit_program(Translator& t) {
         return;
     if (t.info->stage == SHADER_VERTEX && !t.position_exported) {
         translator_fail(t, "vertex shader without a position export");
+        return;
+    }
+    if (program_lds_bytes(t) > DESKTOP_MAX_LDS_BYTES) {
+        translator_fail(t, "%u bytes of LDS, more than a desktop group has", program_lds_bytes(t));
         return;
     }
     // Desktop input formats for the fetched elements.
