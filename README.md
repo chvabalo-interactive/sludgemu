@@ -117,31 +117,38 @@ flowchart LR
 | | |
 |---|---|
 | **Operating system** | Windows 10 or 11, x64 |
-| **Compiler** | Visual Studio 2022 with the *Desktop development with C++* workload. Only MSVC is supported, as the title ABI is MSVC x64. |
-| **Build system** | CMake 3.24 or later. Ninja is optional. |
+| **Compiler** | Visual Studio 2026 (version 18) with the *Desktop development with C++* workload and the *C++ Clang Compiler for Windows* component. sludgemu is built with clang-cl and lld-link, which target the MSVC x64 ABI that titles use. |
+| **Build system** | CMake 3.25 or later and Ninja. The Visual Studio 2026 solution preset needs CMake 4.2 or later. |
 | **Network access** | Required for the initial configure step, during which dependencies are downloaded. No dependencies are vendored. |
 
 ### Build steps
 
-```powershell
-cmake --preset vs2022
-cmake --build --preset vs2022-release     # or vs2022-debug
-```
-
-Binaries are written to `build/vs2022/bin/<Config>/`. The release preset builds the
-`RelWithDebInfo` configuration.
-
-<details>
-<summary><b>Building with Ninja</b></summary>
-
-<br>
-
-Run the following from an *x64 Native Tools* or *Developer PowerShell for VS 2022* prompt:
+From any shell (no developer prompt needed: the toolchain file finds Visual Studio with
+`vswhere` and hands clang-cl and lld-link the MSVC libraries and Windows SDK itself):
 
 ```powershell
 cmake --preset ninja-release              # or ninja-debug
 cmake --build --preset ninja-release
 ```
+
+Binaries are written to `build/ninja-<config>/bin/`. The release preset builds the
+`RelWithDebInfo` configuration with ThinLTO. `-DSLUDGE_LTO_JOBS=N` limits the link-time
+optimization threads (default: one per hardware thread).
+
+<details>
+<summary><b>Building in the Visual Studio IDE</b></summary>
+
+<br>
+
+The `vs2026` preset generates a Visual Studio 2026 solution using the ClangCL toolset, for
+debugging in the IDE:
+
+```powershell
+cmake --preset vs2026
+cmake --build --preset vs2026-release     # or vs2026-debug; or open build/vs2026/sludgemu.sln
+```
+
+Binaries are written to `build/vs2026/bin/<Config>/`.
 
 </details>
 
@@ -170,9 +177,10 @@ alongside `sludgemu.exe`: `dstorage.dll`, `dstoragecore.dll`, `dxcompiler.dll`, 
 
 <br>
 
-- C++20, compiled **without exceptions or RTTI** (`/EHs-c- /GR-`).
+- C++20 with clang-cl, compiled **without exceptions or RTTI** (`/EHs-c- /GR-`) and without
+  type-based alias analysis (`-fno-strict-aliasing`), as console data is reinterpreted freely.
 - **Static CRT**, so that sludgemu's CRT state is never shared with the title's CRT DLLs.
-- **No implicit TLS in `sludgemu.exe`** (no `thread_local`, no `/Zc:threadSafeInit`, no
+- **No implicit TLS in `sludgemu.exe`** (no `thread_local`, no thread-safe statics, no
   incremental linking), because the title must own TLS slot 0. Use `TlsAlloc` slots instead. This
   is enforced by a startup check; see [the TLS notes](docs/ARCHITECTURE.md#tls) for details.
 - Diagnostic code paths must never acquire the loader lock.
@@ -440,7 +448,7 @@ paths to the package directory and normalise path separators, since titles const
 BCPack, XMA decoding, XApu and the DSP.
 
 ```powershell
-ctest --test-dir build/vs2022 -C RelWithDebInfo
+ctest --preset ninja-release
 ```
 
 **`shader_tool`** analyses console shader code, typically from a `SLUDGE_SHADER_DUMP` directory:

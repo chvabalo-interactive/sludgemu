@@ -203,7 +203,8 @@ add_custom_command(TARGET sludgemu POST_BUILD
 
 # sludgemu.exe's implicit TLS slot (index 0) belongs to the title exe (see loader/tls_reserve.h),
 # so nothing else may use implicit TLS: no thread_local in our code, and no thread-safe static
-# initialization (the CRT implements it with a thread_local epoch counter).
+# initialization (the CRT implements it with a thread_local epoch counter). /Zc:threadSafeInit- is
+# clang-cl's spelling of -fno-threadsafe-statics.
 target_compile_options(sludgemu PRIVATE /Zc:threadSafeInit-)
 
 # Keep our own image far away from where titles want to live (0x140000000 and up), so the title
